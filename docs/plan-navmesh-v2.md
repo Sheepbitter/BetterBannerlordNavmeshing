@@ -81,7 +81,9 @@ collision triangles readable, the primary pipeline is true voxelization; raycast
 
 **Building block:** a C# port of Recast/Detour exists (`ikpil/DotRecast`) — running the real stages
 in-process would cut implementation time massively; check its license terms before adopting (or port the
-needed stages ourselves, as we did for the NMG8 writer). Decision deferred to Phase 2 kickoff.
+needed stages ourselves, as we did for the NMG8 writer). **DECIDED 2026-09-26: vendor a source subset of
+DotRecast (pinned commit `5841f99e9881c05ca105079b25bb8faecf8b65a1`, ZLib license) into
+`ThirdParty/DotRecast` and backport it to C# 7.3/net472 — see `docs/dotrecast-evaluation.md`.**
 
 **Determinism & contract guardrails (apply throughout):**
 fixed world origin for coarse/fine grids at power-of-two ratios; dilate the fine mask so seams are refined on
@@ -151,7 +153,8 @@ totals, `GetBodyShape` validity (incl. batched statics), `GetTriangle` coordinat
 
 **Phase 2 — Tiled voxel core (terrain-only first).** Span columns, filters, connectivity, erosion,
 **Monotone/Chunky-Monotone** regions, contours → tri/quad polys → NMG8; **tile-parallel with sorted merge**;
-validated against Phase 0 output on the same scenes. Decide DotRecast vs in-house port at kickoff.
+validated against Phase 0 output on the same scenes. Kickoff decision: vendor the DotRecast source subset +
+C# 7.3 backport (`docs/dotrecast-evaluation.md`).
 
 **Phase 3 — Assets.** Collision triangles with BVH culling; flora excluded, dynamic skipped or static-snapped;
 buildings block by absence of faces, walkable to agent-radius edges; stairs via `HasSteps` + climb.
@@ -183,7 +186,7 @@ speedup for huge open maps.
   physics queries / raycast probing).
 - **Large scenes**: mitigated by tiling, coarse base cells, adaptive refinement, monotone partitioning and
   empty-tile rejection; the hybrid CDT path is the stretch goal.
-- **DotRecast adoption**: license and API-fit check before Phase 2 kicks off.
+- **DotRecast adoption**: DONE 2026-09-26 — ZLib license and API fit verified; vendoring + C# 7.3 backport is the first Phase 2 task (`docs/dotrecast-evaluation.md`).
 - **Tile seams / adaptive seams**: fixed origin + border overlap + dilated fine mask; validated in Phase 2.
 
 ## 6. References
