@@ -30,6 +30,12 @@ namespace BetterBannerlordNavmeshing
         public bool NavMeshImportIntoScene = true;
         public bool NavMeshWriteObj = false;
 
+        // Voxel core (navmesh v2, experimental). When enabled the Export button
+        // runs the tiled voxel pipeline (TiledNavMeshBuilder) instead of the v1
+        // adaptive terrain mesher. Terrain-only for now.
+        public bool NavMeshUseVoxelCore = false;
+        public float NavMeshVoxelCellSize = 0.5f;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -196,12 +202,15 @@ namespace BetterBannerlordNavmeshing
 
             RunPipeline(Scene, "editor-button", settings, NavMeshPrefabName, NavMeshExportFolder,
                 NavMeshClearExistingFaces, NavMeshImportIntoScene,
-                NavMeshWriteLogFile, NavMeshLogFolder);
+                NavMeshWriteLogFile, NavMeshLogFolder,
+                NavMeshUseVoxelCore, NavMeshVoxelCellSize);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
         // is one atomic single line (to the log file and the console); never throws
         // into the caller.
+        //
+        // v1 path (in-game hotkey and any caller that does not opt in).
         public static TerrainNavMeshGenerator.ExportResult RunPipeline(
             Scene scene,
             string trigger,
@@ -212,6 +221,24 @@ namespace BetterBannerlordNavmeshing
             bool importIntoScene,
             bool writeLogFile,
             string logFolder)
+        {
+            return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f);
+        }
+
+        // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
+        public static TerrainNavMeshGenerator.ExportResult RunPipeline(
+            Scene scene,
+            string trigger,
+            TerrainNavMeshBuilder.Settings settings,
+            string prefabNameOverride,
+            string folderOverride,
+            bool clearExistingFaces,
+            bool importIntoScene,
+            bool writeLogFile,
+            string logFolder,
+            bool useVoxelCore,
+            float voxelCellSizeMeters)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -241,6 +268,8 @@ namespace BetterBannerlordNavmeshing
                     + " clearExisting=" + clearExistingFaces
                     + " importIntoScene=" + importIntoScene
                     + " writeObj=" + settings.WriteObj
+                    + " useVoxelCore=" + useVoxelCore
+                    + " voxelCellSize=" + F(voxelCellSizeMeters) + "m"
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -255,18 +284,42 @@ namespace BetterBannerlordNavmeshing
                     + "m fallback=" + grid.UsedPointFallback
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
 
-                TerrainNavMeshGenerator.ExportResult result = TerrainNavMeshGenerator.ExportAndImport(
-                    scene,
-                    grid.Heights,
-                    grid.Width,
-                    grid.Height,
-                    grid.Spacing,
-                    settings,
-                    prefabNameOverride,
-                    folderOverride,
-                    clearExistingFaces,
-                    importIntoScene,
-                    log);
+                TerrainNavMeshGenerator.ExportResult result;
+                if (useVoxelCore)
+                {
+                    // v2 tiled voxel pipeline. The write-bin + import + verify
+                    // half is the shared, unchanged WriteAndImport path.
+                    var voxel = new TiledNavMeshBuilder.TiledNavMeshSettings();
+                    voxel.TileWorldSizeMeters = settings.CoarsestSpacingMeters;
+                    voxel.VoxelCellSizeMeters = voxelCellSizeMeters;
+                    voxel.MaxSlopeDegrees = settings.MaxSlopeDegrees;
+                    voxel.MaxErrorMeters = settings.MaxErrorMeters;
+                    voxel.HeightOffsetMeters = settings.HeightOffsetMeters;
+
+                    long voxelBuildMs;
+                    TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
+                        grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
+                        voxel, settings.WriteObj, Environment.ProcessorCount, log, out voxelBuildMs);
+
+                    result = TerrainNavMeshGenerator.WriteAndImport(scene, voxelMesh, settings.WriteObj,
+                        prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, log,
+                        voxelBuildMs);
+                }
+                else
+                {
+                    result = TerrainNavMeshGenerator.ExportAndImport(
+                        scene,
+                        grid.Heights,
+                        grid.Width,
+                        grid.Height,
+                        grid.Spacing,
+                        settings,
+                        prefabNameOverride,
+                        folderOverride,
+                        clearExistingFaces,
+                        importIntoScene,
+                        log);
+                }
 
                 int facesAfterRun = SafeFaceCount(scene);
 

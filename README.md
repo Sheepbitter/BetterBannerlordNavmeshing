@@ -11,6 +11,9 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | File | Role |
 |---|---|
 | `TerrainNavMeshGenerator.cs` | Error-bounded adaptive mesher + NMG8 prefab writer/importer (imported from `Procedural_Bannerlord_Scenes`, Build 3; namespace renamed only). Input `(heights, width, height, spacing)`; output `NavMeshPrefabs\<name>.bin` + `Scene.ImportNavigationMeshPrefab` (static faces). |
+| `Nmg8Writer.cs` | Shared NMG8 prefab serializer (extracted verbatim from `TerrainNavMeshGenerator`); used by both the v1 adaptive mesher and the v2 voxel core. Output bytes are unchanged for v1. |
+| `TiledNavMeshBuilder.cs` | **Voxel core (navmesh v2, experimental).** Tiled + parallel Recast pipeline via the vendored DotRecast subset; terrain-only. Pure data-in/data-out (no TaleWorlds types). |
+| `VoxelNavMeshGenerator.cs` | Adapter: terrain sampler grid -> voxel core -> engine-space mesh, then the shared write/import path. |
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
@@ -49,7 +52,7 @@ singleplayer mission.
 
 ### Editor (primary)
 
-1. Compile all four `.cs` files into your module.
+1. Build the module (see **Build & install**) and enable it in the launcher.
 2. In a scene that has terrain, add the **Scene Nav Mesh Exporter** script component to any entity.
 3. Adjust the settings if you like (table below) and click **Export NavMesh**.
 4. Read the session **log file** (see Logs) - in-editor console output is not visible. On success the prefab is written to
@@ -254,12 +257,70 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
+| `NavMeshUseVoxelCore` | `false` | **Experimental:** run the v2 tiled voxel core instead of the v1 adaptive terrain mesher (terrain-only). See *Voxel core (experimental)*. |
+| `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
 Mesher cost (default 3584x3584 m terrain, stride 1, coarsest 16, slope 65, Release, seed 12345): at
 `MaxErrorMeters = 0.25` ≈ 1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
 `2.0` ≈ 411 k faces / 35 MB / ~0.5 s; at `4.0` ≈ 121 k faces / 10 MB / ~0.3 s.
+
+## Voxel core (experimental)
+
+`NavMeshUseVoxelCore = true` swaps the v1 adaptive terrain mesher for the **v2 tiled voxel core**
+(`TiledNavMeshBuilder`, backed by the vendored DotRecast subset in `ThirdParty/DotRecast`). Everything after
+the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *same* code path as v1
+(`TerrainNavMeshGenerator.WriteAndImport`), so the prefab format and import behaviour are identical.
+
+- **Terrain-only so far.** It voxelizes the terrain triangle soup; collision triangles (buildings, stairs)
+  are a later phase.
+- **Tiled + parallel.** The world is split into 16 m tiles (`NavMeshCoarsestSpacing`) with a Recast border,
+  built on a bounded worker pool (`Parallel.For`, `MaxDegreeOfParallelism = #processors`), then merged in
+  sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
+- **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
+  (0.25 m -> contour simplification `0.25/cs` voxels and the detail-mesh tolerance), `NavMeshCoarsestSpacing`
+  (tile size), `NavMeshHeightOffsetMeters`. Agent radius/height/climb are fixed at 0.35 / 1.8 / 0.4 m.
+
+### How to read the v2 log lines
+
+Every run also logs the terrain read (see above), then the voxel core:
+
+```
+NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
+NavMesh: v2: soup verts=... tris=... stride=... spacing=...m
+NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
+NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=0.4m walkable(r,h,c)=1/9/2 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=False
+NavMesh: v2: contour maxError=0.5vox (= 0.25m at cs=0.5m); plan's ~1.3vox heuristic not used, metre budget honoured
+NavMesh: v2: workers=12 (requested 12, tileCount=100)
+NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
+NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
+NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
+NavMesh: v2: mesh V=... E=... F=... degenerate=... binBytes=... buildMs=...
+NavMesh: v2 timings: tilesMs=... mergeMs=... totalMs=...
+NavMesh: v2: tileMs min/avg/max=.../.../...
+```
+
+- `v2: tris input=... culledByAabb=...` - input triangles, ones outside every tile, and the number actually
+  rasterized (higher than `input` near tile borders because each tile sees its neighbours' geometry).
+- `v2: tiles=... built=... failed=...` - failed tiles are also logged individually as `v2: FAILED tile#...`
+  with the first exception message; they are never silently dropped.
+- `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.
+- After that the normal `build done` / import lines appear (the shared path).
+
+### A/B against v1
+
+Toggle `NavMeshUseVoxelCore` and press Export again; both write the same `<scene>_navmesh.bin` and import the
+same way. Face counts are **not** directly comparable: v1 emits an adaptive quadtree (large mixed-size
+quads/triangles), v2 emits triangulated convex Recast polys at a uniform `NavMeshVoxelCellSize`.
+
+### Known limitation: max climb caps traversable slope
+
+Recast couples `agentMaxClimb` to slope traversability (its ledge filter rejects spans whose neighbour height
+spread exceeds `walkableClimb`). With the current fixed defaults (`climb=0.4 m`, `ch=0.2 m`, `cs=0.5 m`) the
+**effective walkable-slope limit is ~22-28 deg**, not `NavMeshMaxSlopeDegrees` (65): a 45 deg hill produces
+no faces. Raise `climb` (~1.0 m at `cs=0.5` allows 45 deg) or lower `NavMeshVoxelCellSize` to walk steeper
+terrain. The values are currently fixed in `TiledNavMeshBuilder.TiledNavMeshSettings`.
 
 ## First-run questions this milestone must answer
 
