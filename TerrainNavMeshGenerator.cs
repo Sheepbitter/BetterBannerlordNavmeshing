@@ -1216,6 +1216,12 @@ namespace BetterBannerlordNavmeshing
             if (scene == null)
                 throw new ArgumentNullException("scene");
 
+            long writeMs = 0;
+            long objMs = 0;
+            long clearMs = 0;
+            long importMs = 0;
+            long facesAfterMs = 0;
+
             var buildWatch = System.Diagnostics.Stopwatch.StartNew();
             TerrainNavMeshBuilder.Result mesh = TerrainNavMeshBuilder.Build(
                 stitchedHeights, width, height, terrainVertexSpacing, settings);
@@ -1247,13 +1253,19 @@ namespace BetterBannerlordNavmeshing
             string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
             if (log != null)
                 log("writing bin: " + binPath);
+            var writeWatch = System.Diagnostics.Stopwatch.StartNew();
             File.WriteAllBytes(binPath, mesh.Bin);
+            writeWatch.Stop();
+            writeMs = writeWatch.ElapsedMilliseconds;
 
             string objPath = null;
             if (settings != null && settings.WriteObj && mesh.ObjText != null)
             {
                 objPath = System.IO.Path.Combine(folder, prefabName + ".obj");
+                var objWatch = System.Diagnostics.Stopwatch.StartNew();
                 File.WriteAllText(objPath, mesh.ObjText, System.Text.Encoding.UTF8);
+                objWatch.Stop();
+                objMs = objWatch.ElapsedMilliseconds;
             }
 
             var result = new ExportResult();
@@ -1296,7 +1308,10 @@ namespace BetterBannerlordNavmeshing
 
                     try
                     {
+                        var clearWatch = System.Diagnostics.Stopwatch.StartNew();
                         scene.ClearNavMesh();
+                        clearWatch.Stop();
+                        clearMs = clearWatch.ElapsedMilliseconds;
 
                         if (log != null)
                             log("cleared.");
@@ -1324,7 +1339,10 @@ namespace BetterBannerlordNavmeshing
                 if (log != null)
                     log("importing prefab '" + prefabName + "' (shift 0)...");
 
+                var importWatch = System.Diagnostics.Stopwatch.StartNew();
                 scene.ImportNavigationMeshPrefab(prefabName, 0);
+                importWatch.Stop();
+                importMs = importWatch.ElapsedMilliseconds;
 
                 if (log != null)
                     log("import call returned.");
@@ -1332,8 +1350,13 @@ namespace BetterBannerlordNavmeshing
                 // The key evidence for whether the import actually added faces.
                 try
                 {
+                    var facesAfterWatch = System.Diagnostics.Stopwatch.StartNew();
+                    int facesAfter = scene.GetNavMeshFaceCount();
+                    facesAfterWatch.Stop();
+                    facesAfterMs = facesAfterWatch.ElapsedMilliseconds;
+
                     if (log != null)
-                        log("faces after import: " + scene.GetNavMeshFaceCount());
+                        log("faces after import: " + facesAfter);
                 }
                 catch (Exception ex)
                 {
@@ -1347,11 +1370,21 @@ namespace BetterBannerlordNavmeshing
                 result.ImportAttempted = true;
             }
 
+            if (log != null)
+            {
+                log("timings: buildMs=" + buildWatch.ElapsedMilliseconds
+                    + " writeMs=" + writeMs
+                    + " objMs=" + objMs
+                    + " clearMs=" + clearMs
+                    + " importMs=" + importMs
+                    + " facesAfterMs=" + facesAfterMs);
+            }
+
             return result;
         }
 
         // prefabNameOverride wins; otherwise the scene name plus "_navmesh".
-        private static string ResolvePrefabName(Scene scene, string prefabNameOverride, System.Action<string> log)
+        public static string ResolvePrefabName(Scene scene, string prefabNameOverride, System.Action<string> log)
         {
             if (!string.IsNullOrEmpty(prefabNameOverride))
             {
@@ -1376,7 +1409,7 @@ namespace BetterBannerlordNavmeshing
         // then the scene's own (verified) module path, then the module that
         // contains this script's assembly. Anything unverifiable is rejected
         // and logged rather than guessed at.
-        private static string ResolveFolder(Scene scene, string folderOverride, System.Action<string> log)
+        public static string ResolveFolder(Scene scene, string folderOverride, System.Action<string> log)
         {
             if (!string.IsNullOrEmpty(folderOverride))
             {

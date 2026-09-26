@@ -59,6 +59,16 @@ The read reflects the **live in-memory terrain** (including unsaved/uncommitted 
 per-node grid is cross-checked against `GetTerrainHeight` at sample vertices (see log lines below), so the
 validation lines are the proof that the mesh matches what is currently in the editor.
 
+Buttons: **Export NavMesh** (full pipeline), **Import Only** (imports the already-written prefab - no sampling
+or build), **Probe Geometry** (collision-geometry diagnostic, see Probe Geometry).
+
+**Freshly written prefab workflow.** The engine builds its navmesh-prefab list at **startup**, so the first
+Export cannot find the prefab it just wrote (the log shows `import warning`). Then either:
+
+1. Export (writes the bin) -> **restart the editor** -> **Import Only** (fast; imports the existing prefab,
+   no rebuild), or
+2. Export -> restart -> **Export** again (also works - it just rebuilds and rewrites the same bin).
+
 ### In-game (experimental, secondary)
 
 `SceneNavMeshMissionLogic` is a `MissionLogic`: register it on a mission (e.g. from a mission-behaviour
@@ -134,6 +144,7 @@ NavMesh: bin written: ...\<scene>_navmesh.bin
 NavMesh: faces imported into scene as '<scene>_navmesh' (static).
 NavMesh: import check: existing=<before> afterImport=<after> clearExisting=<bool> increased=<bool>
 NavMesh: import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).
+NavMesh: timings: buildMs=<n> writeMs=<n> objMs=<n|0> clearMs=<n> importMs=<n> facesAfterMs=<n>
 NavMesh: done: totalMs=<n> bin=<n> bytes V=<v> E=<e> F=<f>
 ```
 
@@ -141,6 +152,20 @@ NavMesh: done: totalMs=<n> bin=<n> bytes V=<v> E=<e> F=<f>
 `existing=<before>` is read before anything runs, `afterImport=<after>` after the import call. When clearing is
 enabled, a successful import always leaves `afterImport > 0`; the `import warning:` line is emitted whenever the
 import appears to have added nothing (the startup prefab-list issue - see Troubleshooting).
+
+`timings:` breaks the run into the native/IO steps, one Stopwatch each, so you can see where the wall time
+actually goes (the editor felt slower than `totalMs`, which only covers our code):
+
+- `buildMs` - the adaptive mesher (same value as `elapsedMs` on the `build done:` line).
+- `writeMs` - writing the `.bin` to disk.
+- `objMs` - writing the `.obj` when `NavMeshWriteObj` is on, else `0`.
+- `clearMs` - the `ClearNavMesh()` call, only when it ran, else `0`.
+- `importMs` - the `ImportNavigationMeshPrefab()` call (how long the engine spends reading the prefab).
+- `facesAfterMs` - the post-import `GetNavMeshFaceCount()` call.
+
+**Not included:** everything the editor does around/after the import call - viewport refresh, scene
+save/compile, and any engine-side prefab-list rebuild. If `timings:` is small but the editor still feels slow,
+the cost is outside this pipeline (startup prefab list, viewport, or save).
 
 `faces after import` is the ground truth for whether the import added faces. Failures log `ERROR: <type>:
 <message>` plus a flattened `ERROR stack:` line; the pipeline never throws into the caller.
@@ -215,7 +240,8 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 
 | Field | Default | Notes |
 |---|---|---|
-| `ExportNavMesh` | button | Runs the export on the scene's live terrain. |
+| `ExportNavMesh` | button | Full pipeline: reads terrain, builds, writes the bin, imports. |
+| `ImportNavMeshOnly` | button | Imports the already-written prefab: no sampling/build. Use after a restart (see workflow). |
 | `ProbeGeometry` | button | Phase 1 diagnostic: dumps scene collision geometry to the log (see Probe Geometry). |
 | `NavMeshSampleStride` | `1` | **Finest** sampling: 1 = every terrain vertex. Refinement decides the coarser cells. |
 | `NavMeshMaxErrorMeters` | `0.25` | Fidelity guarantee: mesh surface stays within this of the ground. |
@@ -252,9 +278,9 @@ Mesher cost (default 3584x3584 m terrain, stride 1, coarsest 16, slope 65, Relea
 
 - **First `Export` after writing a new prefab imports nothing** (the log shows the `import warning:` line and
   `import check: ... increased=False`). The engine builds its navmesh-prefab list at **startup**, so a prefab
-  written in the current session is not found on the first attempt. **Restart the editor and press Export
-  again** - verified behaviour: the second attempt after a restart imports the whole map in ~2-3 s.
-  Alternatively: navmesh panel -> *Import faces from prefabs*.
+  written in the current session is not found on the first attempt. **Restart the editor**, then press
+  **Import Only** (no rebuild) or **Export** again - verified behaviour: the second attempt after a restart
+  imports the whole map in ~2-3 s. Alternatively: navmesh panel -> *Import faces from prefabs*.
 - `fallback=True` in `grid ready`: the bulk per-node read failed validation (look for `bulk read failed:` /
   `NEITHER order matches` above it). The point-sampled grid is still correct, just slower.
 - **No log file**: check `NavMeshWriteLogFile` is `true`; the `log file:` path is printed at the top of the run

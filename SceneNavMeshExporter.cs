@@ -15,6 +15,7 @@ namespace BetterBannerlordNavmeshing
 
         // ---------------- Settings (same names as the terrain script) ----------------
         public SimpleButton ExportNavMesh;
+        public SimpleButton ImportNavMeshOnly;
         public SimpleButton ProbeGeometry;
         public int NavMeshSampleStride = 1;
         public float NavMeshMaxErrorMeters = 0.25f;
@@ -53,8 +54,99 @@ namespace BetterBannerlordNavmeshing
             base.OnEditorVariableChanged(variableName);
             if (variableName == nameof(ExportNavMesh))
                 ExportFromEditor();
+            else if (variableName == nameof(ImportNavMeshOnly))
+                ImportOnlyFromEditor();
             else if (variableName == nameof(ProbeGeometry))
                 ProbeFromEditor();
+        }
+
+        // Imports an already-written prefab without sampling or building. This is
+        // the cheap second half of the startup-prefab-list workflow: Export once
+        // (writes the bin), restart the editor, then press Import Only.
+        private void ImportOnlyFromEditor()
+        {
+            try
+            {
+                NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
+                System.Action<string> log = NavMeshLog.Write;
+
+                Scene scene = Scene;
+                if (scene == null)
+                {
+                    log("ERROR: no scene.");
+                    return;
+                }
+
+                log("run: build=" + BuildTag + " trigger=editor-import-only scene=" + SafeName(scene)
+                    + " machine=" + Environment.MachineName
+                    + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                    + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
+                log("settings: importOnly=True clearExisting=" + NavMeshClearExistingFaces
+                    + " prefabName='" + (NavMeshPrefabName ?? "") + "'"
+                    + " exportFolder='" + (NavMeshExportFolder ?? "") + "'"
+                    + " writeLogFile=" + NavMeshWriteLogFile
+                    + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
+
+                string prefabName = TerrainNavMeshGenerator.ResolvePrefabName(scene, NavMeshPrefabName, log);
+                string folder = TerrainNavMeshGenerator.ResolveFolder(scene, NavMeshExportFolder, log);
+                log("import only: prefab='" + prefabName + "' folder=" + folder);
+
+                int facesBeforeRun = SafeFaceCount(scene);
+                log("faces before run: " + (facesBeforeRun < 0 ? "unavailable" : facesBeforeRun.ToString()));
+
+                if (NavMeshClearExistingFaces && facesBeforeRun > 0)
+                {
+                    log("clearing existing navmesh faces...");
+                    try
+                    {
+                        scene.ClearNavMesh();
+                        log("cleared.");
+                    }
+                    catch (Exception ex)
+                    {
+                        log("clear failed (continuing): " + ex.Message);
+                    }
+                }
+
+                log("importing prefab '" + prefabName + "' (shift 0)...");
+                scene.ImportNavigationMeshPrefab(prefabName, 0);
+                log("import call returned.");
+
+                int facesAfterRun = SafeFaceCount(scene);
+                log("faces after import: " + (facesAfterRun < 0 ? "unavailable" : facesAfterRun.ToString()));
+                LogImportCheck(log, facesBeforeRun, facesAfterRun, NavMeshClearExistingFaces);
+
+                log("done: importOnly=true prefab='" + prefabName + "'");
+            }
+            catch (Exception ex)
+            {
+                NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
+                NavMeshLog.Write("ERROR stack: " + Flat(ex.StackTrace));
+            }
+        }
+
+        // Shared post-import diagnosis for both the full run and Import Only. The
+        // engine builds its prefab list at startup, so a prefab written this
+        // session is not found on the first attempt.
+        private static void LogImportCheck(System.Action<string> log, int facesBeforeRun, int facesAfterRun, bool clearExistingFaces)
+        {
+            bool increased;
+            if (facesBeforeRun < 0 || facesAfterRun < 0)
+                increased = true; // unknown count: do not warn
+            else if (clearExistingFaces)
+                increased = facesAfterRun > 0;
+            else
+                increased = facesAfterRun > facesBeforeRun;
+
+            log("import check: existing=" + (facesBeforeRun < 0 ? "?" : facesBeforeRun.ToString())
+                + " afterImport=" + (facesAfterRun < 0 ? "?" : facesAfterRun.ToString())
+                + " clearExisting=" + clearExistingFaces
+                + " increased=" + increased);
+
+            if (!increased)
+            {
+                log("import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).");
+            }
         }
 
         // Phase 1 diagnostic: dump the scene's collision-geometry capabilities to
@@ -189,26 +281,7 @@ namespace BetterBannerlordNavmeshing
                 if (result.ImportAttempted)
                 {
                     log("faces imported into scene as '" + result.PrefabName + "' (static).");
-
-                    // The engine builds its prefab list at startup, so a prefab
-                    // written in this session is not found on the first attempt.
-                    bool increased;
-                    if (facesBeforeRun < 0 || facesAfterRun < 0)
-                        increased = true; // unknown count: do not warn
-                    else if (clearExistingFaces)
-                        increased = facesAfterRun > 0;
-                    else
-                        increased = facesAfterRun > facesBeforeRun;
-
-                    log("import check: existing=" + (facesBeforeRun < 0 ? "?" : facesBeforeRun.ToString())
-                        + " afterImport=" + (facesAfterRun < 0 ? "?" : facesAfterRun.ToString())
-                        + " clearExisting=" + clearExistingFaces
-                        + " increased=" + increased);
-
-                    if (!increased)
-                    {
-                        log("import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).");
-                    }
+                    LogImportCheck(log, facesBeforeRun, facesAfterRun, clearExistingFaces);
                 }
                 else
                 {
