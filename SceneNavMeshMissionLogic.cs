@@ -67,7 +67,7 @@ namespace BetterBannerlordNavmeshing
             settings.HeightOffsetMeters = 0.5f;
             settings.WriteObj = false;
 
-            SceneNavMeshExporter.RunPipeline(scene, "mission-hotkey (~)", settings, "", "", true, true);
+            SceneNavMeshExporter.RunPipeline(scene, "mission-hotkey (~)", settings, "", "", true, true, true, "");
         }
     }
 }

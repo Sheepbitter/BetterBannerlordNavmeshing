@@ -14,6 +14,7 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
+| `NavMeshLog.cs` | Per-session **log file** (+ console mirror). In-editor console output is invisible; this is the real trace. See Logs. |
 
 ## Build & install
 
@@ -51,7 +52,7 @@ singleplayer mission.
 1. Compile all four `.cs` files into your module.
 2. In a scene that has terrain, add the **Scene Nav Mesh Exporter** script component to any entity.
 3. Adjust the settings if you like (table below) and click **Export NavMesh**.
-4. Read the `NavMesh: ...` lines in the editor log. On success the prefab is written to
+4. Read the session **log file** (see Logs) - in-editor console output is not visible. On success the prefab is written to
    `<module>\NavMeshPrefabs\<scene>_navmesh.bin` and its faces are imported into the scene.
 
 The read reflects the **live in-memory terrain** (including unsaved/uncommitted terrain edits): the bulk
@@ -85,13 +86,16 @@ world `(x, y) = (stitchedX*quadLen, stitchedY*quadLen)`.
 The node array's in-memory **index order is discovered empirically** (`node[ix*verts+iy]` vs
 `node[iy*verts+ix]`) by comparing both against `GetTerrainHeight`; the chosen order is logged.
 
-## Expected log lines (editor / rgl log)
+## Expected log lines (log file; also mirrored to the console as `NavMesh: ...`)
 
 Terrain read + validation (one atomic line each):
 
 ```
-NavMesh: run: build=Build 3 (adaptive navmesh) trigger=editor-button scene=<scene>
-NavMesh: settings: stride=1 maxSlope=65deg maxError=0.25m coarsest=16m cullBelowHeight=False minHeight=0 heightOffset=0.5m prefabName='' exportFolder='' clearExisting=True importIntoScene=True writeObj=False
+[HH:mm:ss.fff] ===== run @ yyyy-MM-dd HH:mm:ss =====
+[HH:mm:ss.fff] log file: C:\Users\<you>\Documents\Mount and Blade II Bannerlord\BetterBannerlordNavmeshing\Logs\NavMesh_yyyyMMdd_HHmmss.log
+NavMesh: run: build=Build 3 (adaptive navmesh) trigger=editor-button scene=<scene> machine=<host> time=yyyy-MM-dd HH:mm:ss logFile=...\NavMesh_yyyyMMdd_HHmmss.log
+NavMesh: settings: stride=1 maxSlope=65deg maxError=0.25m coarsest=16m cullBelowHeight=False minHeight=0 heightOffset=0.5m prefabName='' exportFolder='' clearExisting=True importIntoScene=True writeObj=False writeLogFile=True logFolder=''
+NavMesh: faces before run: 0
 NavMesh: terrain: nodes=7x7 nodeSize=512 layers=1 layerVersion=1 extent=3584x3584m
 NavMesh: node(0,0): verts=129 quadLen=4 expectedQuad=4 minHeight=-10.02 maxHeight=99.87
 NavMesh: grid: 897x897 spacing=4m
@@ -128,11 +132,44 @@ NavMesh: faces after import: N
 NavMesh: <F> faces, <V> vertices, <E> edges (culled: <S> slope, <H> height)
 NavMesh: bin written: ...\<scene>_navmesh.bin
 NavMesh: faces imported into scene as '<scene>_navmesh' (static).
-NavMesh: done: bin=<n> bytes, V=<v> E=<e> F=<f>
+NavMesh: import check: existing=<before> afterImport=<after> clearExisting=<bool> increased=<bool>
+NavMesh: import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).
+NavMesh: done: totalMs=<n> bin=<n> bytes V=<v> E=<e> F=<f>
 ```
+
+`import check` compares the face count before the run with the count after the import:
+`existing=<before>` is read before anything runs, `afterImport=<after>` after the import call. When clearing is
+enabled, a successful import always leaves `afterImport > 0`; the `import warning:` line is emitted whenever the
+import appears to have added nothing (the startup prefab-list issue - see Troubleshooting).
 
 `faces after import` is the ground truth for whether the import added faces. Failures log `ERROR: <type>:
 <message>` plus a flattened `ERROR stack:` line; the pipeline never throws into the caller.
+
+## Logs
+
+In-editor `Console.WriteLine` is invisible (it appears in neither the editor console nor `rgl_log`), so every
+run writes a full trace to a **session log file**:
+
+```
+%USERPROFILE%\Documents\Mount and Blade II Bannerlord\BetterBannerlordNavmeshing\Logs\NavMesh_yyyyMMdd_HHmmss.log
+```
+
+- **One file per editor session** (created on the first run; later runs in the same session append with a new
+  `===== run @ ... =====` banner plus a `log file:` line).
+- **One line per message**, timestamped `[HH:mm:ss.fff]`; CR/LF are flattened to ` | ` so nothing spans lines.
+- If the default Documents folder cannot be created it falls back to `%TEMP%`.
+- Logging never throws and never interrupts a run, and it is flushed after every line (`AutoFlush`) - safe to
+  open or send while the editor is running.
+
+Controls (Scene NavMesh Exporter fields):
+
+| Field | Default | Notes |
+|---|---|---|
+| `NavMeshWriteLogFile` | `true` | Write the session log file (every line is also mirrored to the console). |
+| `NavMeshLogFolder` | `""` | Log folder override. Empty = the default path above. |
+
+The log contains the scene and machine name, timings, all sampler validation lines, the mesher stats and the
+import result - safe to attach to a bug report.
 
 ## Settings (Scene NavMesh Exporter fields)
 
@@ -150,6 +187,8 @@ NavMesh: done: bin=<n> bytes, V=<v> E=<e> F=<f>
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
+| `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
+| `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
 Mesher cost (default 3584x3584 m terrain, stride 1, coarsest 16, slope 65, Release, seed 12345): at
 `MaxErrorMeters = 0.25` ≈ 1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
@@ -167,6 +206,19 @@ Mesher cost (default 3584x3584 m terrain, stride 1, coarsest 16, slope 65, Relea
    be added if it is slow).
 5. Editor import visibility: whether the freshly written prefab imports in the same session (may need a
    second click / manual *Import faces from prefabs*).
+
+## Troubleshooting
+
+- **First `Export` after writing a new prefab imports nothing** (the log shows the `import warning:` line and
+  `import check: ... increased=False`). The engine builds its navmesh-prefab list at **startup**, so a prefab
+  written in the current session is not found on the first attempt. **Restart the editor and press Export
+  again** - verified behaviour: the second attempt after a restart imports the whole map in ~2-3 s.
+  Alternatively: navmesh panel -> *Import faces from prefabs*.
+- `fallback=True` in `grid ready`: the bulk per-node read failed validation (look for `bulk read failed:` /
+  `NEITHER order matches` above it). The point-sampled grid is still correct, just slower.
+- **No log file**: check `NavMeshWriteLogFile` is `true`; the `log file:` path is printed at the top of the run
+  (and mirrored to the console). If `Documents` is not writable it falls back to `%TEMP%`.
+- Bin too heavy / import slow: raise `NavMeshMaxErrorMeters` (0.25 -> 1.0 -> 2.0) or lower the terrain size.
 
 ## Roadmap
 

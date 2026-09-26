@@ -27,6 +27,12 @@ namespace BetterBannerlordNavmeshing
         public bool NavMeshImportIntoScene = true;
         public bool NavMeshWriteObj = false;
 
+        // ---------------- Logging ----------------
+        // In-editor Console.WriteLine is invisible, so every run is also written
+        // to a per-session log file (see NavMeshLog).
+        public bool NavMeshWriteLogFile = true;
+        public string NavMeshLogFolder = "";
+
         public override TickRequirement GetTickRequirement()
             => TickRequirement.Tick | base.GetTickRequirement();
 
@@ -49,13 +55,6 @@ namespace BetterBannerlordNavmeshing
 
         private void ExportFromEditor()
         {
-            Scene scene = Scene;
-            if (scene == null)
-            {
-                Console.WriteLine("NavMesh: ERROR: no scene.");
-                return;
-            }
-
             var settings = new TerrainNavMeshBuilder.Settings();
             settings.SampleStride = NavMeshSampleStride;
             settings.MaxErrorMeters = NavMeshMaxErrorMeters;
@@ -66,12 +65,14 @@ namespace BetterBannerlordNavmeshing
             settings.HeightOffsetMeters = NavMeshHeightOffsetMeters;
             settings.WriteObj = NavMeshWriteObj;
 
-            RunPipeline(scene, "editor-button", settings, NavMeshPrefabName, NavMeshExportFolder,
-                NavMeshClearExistingFaces, NavMeshImportIntoScene);
+            RunPipeline(Scene, "editor-button", settings, NavMeshPrefabName, NavMeshExportFolder,
+                NavMeshClearExistingFaces, NavMeshImportIntoScene,
+                NavMeshWriteLogFile, NavMeshLogFolder);
         }
 
-        // Shared by the editor button and the in-game mission logic. Console-only,
-        // single-line logging; never throws into the caller.
+        // Shared by the editor button and the in-game mission logic. Every message
+        // is one atomic single line (to the log file and the console); never throws
+        // into the caller.
         public static TerrainNavMeshGenerator.ExportResult RunPipeline(
             Scene scene,
             string trigger,
@@ -79,9 +80,13 @@ namespace BetterBannerlordNavmeshing
             string prefabNameOverride,
             string folderOverride,
             bool clearExistingFaces,
-            bool importIntoScene)
+            bool importIntoScene,
+            bool writeLogFile,
+            string logFolder)
         {
-            System.Action<string> log = message => Console.WriteLine("NavMesh: " + Flat(message));
+            var runWatch = System.Diagnostics.Stopwatch.StartNew();
+            NavMeshLog.Initialize(writeLogFile, logFolder);
+            System.Action<string> log = NavMeshLog.Write;
 
             try
             {
@@ -91,7 +96,10 @@ namespace BetterBannerlordNavmeshing
                     return null;
                 }
 
-                log("run: build=" + BuildTag + " trigger=" + trigger + " scene=" + SafeName(scene));
+                log("run: build=" + BuildTag + " trigger=" + trigger + " scene=" + SafeName(scene)
+                    + " machine=" + Environment.MachineName
+                    + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                    + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
                 log("settings: stride=" + settings.SampleStride
                     + " maxSlope=" + F(settings.MaxSlopeDegrees) + "deg"
                     + " maxError=" + F(settings.MaxErrorMeters) + "m"
@@ -103,7 +111,12 @@ namespace BetterBannerlordNavmeshing
                     + " exportFolder='" + (folderOverride ?? "") + "'"
                     + " clearExisting=" + clearExistingFaces
                     + " importIntoScene=" + importIntoScene
-                    + " writeObj=" + settings.WriteObj);
+                    + " writeObj=" + settings.WriteObj
+                    + " writeLogFile=" + writeLogFile
+                    + " logFolder='" + (logFolder ?? "") + "'");
+
+                int facesBeforeRun = SafeFaceCount(scene);
+                log("faces before run: " + (facesBeforeRun < 0 ? "unavailable" : facesBeforeRun.ToString()));
 
                 // Reads the scene's live in-memory terrain (including unsaved edits);
                 // the sampler's per-node min/max + GetTerrainHeight cross-check lines
@@ -126,6 +139,8 @@ namespace BetterBannerlordNavmeshing
                     importIntoScene,
                     log);
 
+                int facesAfterRun = SafeFaceCount(scene);
+
                 log(result.FaceCount + " faces, " + result.VertexCount + " vertices, "
                     + result.EdgeCount + " edges (culled: " + result.CulledBySlope + " slope, "
                     + result.CulledByHeight + " height)");
@@ -135,20 +150,60 @@ namespace BetterBannerlordNavmeshing
                     log("OBJ written: " + result.ObjPath);
 
                 if (result.ImportAttempted)
+                {
                     log("faces imported into scene as '" + result.PrefabName + "' (static).");
+
+                    // The engine builds its prefab list at startup, so a prefab
+                    // written in this session is not found on the first attempt.
+                    bool increased;
+                    if (facesBeforeRun < 0 || facesAfterRun < 0)
+                        increased = true; // unknown count: do not warn
+                    else if (clearExistingFaces)
+                        increased = facesAfterRun > 0;
+                    else
+                        increased = facesAfterRun > facesBeforeRun;
+
+                    log("import check: existing=" + (facesBeforeRun < 0 ? "?" : facesBeforeRun.ToString())
+                        + " afterImport=" + (facesAfterRun < 0 ? "?" : facesAfterRun.ToString())
+                        + " clearExisting=" + clearExistingFaces
+                        + " increased=" + increased);
+
+                    if (!increased)
+                    {
+                        log("import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).");
+                    }
+                }
                 else
+                {
                     log("import skipped; import '" + result.PrefabName
                         + "' manually from the editor's navmesh prefab panel.");
+                }
 
-                log("done: bin=" + result.BinByteCount + " bytes, V=" + result.VertexCount
-                    + " E=" + result.EdgeCount + " F=" + result.FaceCount);
+                log("done: totalMs=" + runWatch.ElapsedMilliseconds
+                    + " bin=" + result.BinByteCount
+                    + " V=" + result.VertexCount
+                    + " E=" + result.EdgeCount
+                    + " F=" + result.FaceCount);
                 return result;
             }
             catch (Exception ex)
             {
                 log("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
                 log("ERROR stack: " + Flat(ex.StackTrace));
+                log("done: totalMs=" + runWatch.ElapsedMilliseconds + " failed=true");
                 return null;
+            }
+        }
+
+        private static int SafeFaceCount(Scene scene)
+        {
+            try
+            {
+                return scene.GetNavMeshFaceCount();
+            }
+            catch (Exception)
+            {
+                return -1;
             }
         }
 
