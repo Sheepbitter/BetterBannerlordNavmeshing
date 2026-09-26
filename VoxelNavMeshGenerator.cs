@@ -18,12 +18,38 @@ namespace BetterBannerlordNavmeshing
     {
         public static TerrainNavMeshBuilder.Result BuildExportMesh(
             float[] stitchedHeights, int width, int height, float terrainVertexSpacing, int sampleStride,
-            TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj, int maxWorkers,
+            TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj,
+            float agentClimbOverrideMeters, int maxWorkers,
             System.Action<string> log, out long buildMs)
         {
             if (log != null)
                 log("v2: core engaged (tiled voxel). cellSize=" + F(voxelSettings.VoxelCellSizeMeters)
                     + "m tile=" + F(voxelSettings.TileWorldSizeMeters) + "m");
+
+            // Resolve the agent climb that actually honours MaxSlopeDegrees (0 = auto). Recast's ledge
+            // filter needs walkableClimb >= 2*cs*tan(slope)/ch, so the naive cs*tan(slope) is too small.
+            float cs = voxelSettings.VoxelCellSizeMeters;
+            float ch = voxelSettings.CellHeightMeters;
+            float slopeDeg = voxelSettings.MaxSlopeDegrees;
+            bool autoClimb = agentClimbOverrideMeters <= 0f;
+            float agentClimb = autoClimb
+                ? TiledNavMeshBuilder.ResolveAgentClimbMeters(cs, ch, slopeDeg, 0.4f)
+                : agentClimbOverrideMeters;
+            voxelSettings.AgentMaxClimbMeters = agentClimb;
+
+            int walkableClimb = TiledNavMeshBuilder.WalkableClimbVoxels(agentClimb, ch);
+            double effectiveMaxSlope = Math.Atan((double)walkableClimb * ch / (2.0 * cs)) * 180.0 / Math.PI;
+
+            if (log != null)
+            {
+                log("v2: agentClimb=" + F(agentClimb) + "m (" + (autoClimb ? "auto" : "override") + ")"
+                    + " walkableClimb=" + walkableClimb + " voxels"
+                    + " effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=" + F((float)effectiveMaxSlope) + "deg"
+                    + " (setting=" + F(slopeDeg) + "deg)");
+                if (effectiveMaxSlope < slopeDeg - 1.0)
+                    log("v2: WARNING effectiveMaxSlope=" + F((float)effectiveMaxSlope) + "deg < setting="
+                        + F(slopeDeg) + "deg-1; increase NavMeshVoxelAgentClimbMeters or reduce NavMeshVoxelCellSize");
+            }
 
             var watch = Stopwatch.StartNew();
 

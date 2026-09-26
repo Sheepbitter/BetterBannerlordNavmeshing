@@ -36,6 +36,11 @@ namespace BetterBannerlordNavmeshing
         public bool NavMeshUseVoxelCore = false;
         public float NavMeshVoxelCellSize = 0.5f;
 
+        // Agent max climb (m) for the v2 voxel core. 0 = auto-derive so that
+        // NavMeshMaxSlopeDegrees is actually traversable (Recast's ledge filter
+        // needs walkableClimb >= 2*cs*tan(slope)/ch). See the README.
+        public float NavMeshVoxelAgentClimbMeters = 0f;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -203,7 +208,7 @@ namespace BetterBannerlordNavmeshing
             RunPipeline(Scene, "editor-button", settings, NavMeshPrefabName, NavMeshExportFolder,
                 NavMeshClearExistingFaces, NavMeshImportIntoScene,
                 NavMeshWriteLogFile, NavMeshLogFolder,
-                NavMeshUseVoxelCore, NavMeshVoxelCellSize);
+                NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -223,7 +228,7 @@ namespace BetterBannerlordNavmeshing
             string logFolder)
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
-                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f);
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -238,7 +243,8 @@ namespace BetterBannerlordNavmeshing
             bool writeLogFile,
             string logFolder,
             bool useVoxelCore,
-            float voxelCellSizeMeters)
+            float voxelCellSizeMeters,
+            float voxelAgentClimbMeters)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -270,6 +276,7 @@ namespace BetterBannerlordNavmeshing
                     + " writeObj=" + settings.WriteObj
                     + " useVoxelCore=" + useVoxelCore
                     + " voxelCellSize=" + F(voxelCellSizeMeters) + "m"
+                    + " voxelAgentClimb=" + F(voxelAgentClimbMeters) + "m"
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -299,7 +306,8 @@ namespace BetterBannerlordNavmeshing
                     long voxelBuildMs;
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
-                        voxel, settings.WriteObj, Environment.ProcessorCount, log, out voxelBuildMs);
+                        voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount, log,
+                        out voxelBuildMs);
 
                     result = TerrainNavMeshGenerator.WriteAndImport(scene, voxelMesh, settings.WriteObj,
                         prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, log,

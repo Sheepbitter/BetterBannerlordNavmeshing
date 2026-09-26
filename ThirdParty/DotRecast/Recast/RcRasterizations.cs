@@ -19,6 +19,8 @@ freely, subject to the following restrictions:
 */
 
 // BACKPORTED for net472/C# 7.3 - see ThirdParty/DotRecast/NOTICE.md
+// LOCAL EDIT (BetterBannerlordNavmeshing): per-thread reusable scratch buffers in RasterizeTri/DividePoly,
+// replacing the per-call `new float[84]` / `new float[12]` introduced by the span backport. See NOTICE.
 
 using System;
 using DotRecast.Core;
@@ -31,6 +33,13 @@ namespace DotRecast.Recast
 
     public static class RcRasterizations
     {
+        // LOCAL EDIT (BetterBannerlordNavmeshing): allocate-on-demand, per-thread scratch buffers.
+        // RasterizeTri/DividePoly are called once per triangle, so allocating here instead of per call
+        // removes the GC pressure introduced by the span backport. Each thread gets its own buffer and
+        // the calls are not nested, so reuse is safe. Sizes are fixed by the algorithm.
+        [ThreadStatic] private static float[] _rasterizeTriangleBuf;
+        [ThreadStatic] private static float[] _dividePolyAxisDelta;
+
         /// Check whether two bounding boxes overlap
         ///
         /// @param[in]	aMin	Min axis extents of bounding box A
@@ -261,7 +270,11 @@ namespace DotRecast.Recast
             float axisOffset, int axis)
         {
             // How far positive or negative away from the separating axis is each vertex.
-            float[] inVertAxisDelta = new float[12];
+            float[] inVertAxisDelta = _dividePolyAxisDelta;
+            if (inVertAxisDelta == null || inVertAxisDelta.Length < 12)
+            {
+                inVertAxisDelta = _dividePolyAxisDelta = new float[12];
+            }
             for (int inVert = 0; inVert < inVertsCount; ++inVert)
             {
                 inVertAxisDelta[inVert] = axisOffset - inVerts[inVertsOffset + inVert * 3 + axis];
@@ -368,7 +381,11 @@ namespace DotRecast.Recast
             z1 = RcBackport.Clamp(z1, 0, h - 1);
 
             // Clip the triangle into all grid cells it touches.
-            float[] buf = new float[7 * 3 * 4];
+            float[] buf = _rasterizeTriangleBuf;
+            if (buf == null || buf.Length < 7 * 3 * 4)
+            {
+                buf = _rasterizeTriangleBuf = new float[7 * 3 * 4];
+            }
             int @in = 0;
             int inRow = 7 * 3;
             int p1 = inRow + 7 * 3;

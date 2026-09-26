@@ -293,7 +293,7 @@ namespace BetterBannerlordNavmeshing
             float pad = border * cs;
 
             int walkableHeight = (int)Math.Ceiling(s.AgentHeightMeters / ch);
-            int walkableClimb = (int)Math.Floor(s.AgentMaxClimbMeters / ch);
+            int walkableClimb = (int)Math.Floor(s.AgentMaxClimbMeters / ch + 1e-4f);
             int walkableRadius = (int)Math.Ceiling(s.AgentRadiusMeters / cs);
             float maxSimplificationError = s.MaxErrorMeters / cs;
             int minRegionArea = s.RegionMinSize * s.RegionMinSize;
@@ -862,6 +862,38 @@ namespace BetterBannerlordNavmeshing
                     return (int)x;
                 }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // Agent climb derivation (pure; used by VoxelNavMeshGenerator and the harness)
+        // ------------------------------------------------------------------
+        // Recast rejects a span when the spread of its traversable neighbours' floors exceeds
+        // walkableClimb. On a uniform slope the rise per cell is cs*tan(slope)/ch voxels and the
+        // spread is twice that, so walkableClimb must be >= 2*cs*tan(slope)/ch for the slope to
+        // survive the ledge filter. Derive the climb in whole ch steps, clamped to minClimb.
+        // (A larger climb also connects single vertical steps up to that height; the trade-off is
+        // documented in the README. Lowering VoxelCellSizeMeters also lowers the required climb.)
+        public static float ResolveAgentClimbMeters(float cs, float ch, float slopeDegrees, float minClimb)
+        {
+            if (cs <= 0f || ch <= 0f)
+                return minClimb;
+
+            double slopeRad = slopeDegrees * Math.PI / 180.0;
+            int climbCells = (int)Math.Ceiling(2.0 * cs * Math.Tan(slopeRad) / ch);
+            if (climbCells < 1)
+                climbCells = 1;
+
+            float climb = climbCells * ch;
+            return climb < minClimb ? minClimb : climb;
+        }
+
+        // walkableClimb in voxel steps for a resolved climb. Mirrors the build's derivation,
+        // including the float-roundoff epsilon so e.g. 2.4/0.2 is 12, not 11.
+        public static int WalkableClimbVoxels(float climbMeters, float ch)
+        {
+            if (ch <= 0f)
+                return 0;
+            return (int)Math.Floor(climbMeters / ch + 1e-4f);
         }
 
         private static void Log(Action<string> log, string message)

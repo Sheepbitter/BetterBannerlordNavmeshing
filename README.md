@@ -259,6 +259,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
 | `NavMeshUseVoxelCore` | `false` | **Experimental:** run the v2 tiled voxel core instead of the v1 adaptive terrain mesher (terrain-only). See *Voxel core (experimental)*. |
 | `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
+| `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
@@ -280,7 +281,8 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
 - **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
   (0.25 m -> contour simplification `0.25/cs` voxels and the detail-mesh tolerance), `NavMeshCoarsestSpacing`
-  (tile size), `NavMeshHeightOffsetMeters`. Agent radius/height/climb are fixed at 0.35 / 1.8 / 0.4 m.
+  (tile size), `NavMeshHeightOffsetMeters`, `NavMeshVoxelAgentClimbMeters` (0 = auto). Agent radius/height are
+  fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually walkable (see below).
 
 ### How to read the v2 log lines
 
@@ -290,7 +292,8 @@ Every run also logs the terrain read (see above), then the voxel core:
 NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
 NavMesh: v2: soup verts=... tris=... stride=... spacing=...m
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
-NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=0.4m walkable(r,h,c)=1/9/2 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=False
+NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
+NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=False
 NavMesh: v2: contour maxError=0.5vox (= 0.25m at cs=0.5m); plan's ~1.3vox heuristic not used, metre budget honoured
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
@@ -314,13 +317,25 @@ Toggle `NavMeshUseVoxelCore` and press Export again; both write the same `<scene
 same way. Face counts are **not** directly comparable: v1 emits an adaptive quadtree (large mixed-size
 quads/triangles), v2 emits triangulated convex Recast polys at a uniform `NavMeshVoxelCellSize`.
 
-### Known limitation: max climb caps traversable slope
+### Agent climb is auto-derived to honour `NavMeshMaxSlopeDegrees`
 
-Recast couples `agentMaxClimb` to slope traversability (its ledge filter rejects spans whose neighbour height
-spread exceeds `walkableClimb`). With the current fixed defaults (`climb=0.4 m`, `ch=0.2 m`, `cs=0.5 m`) the
-**effective walkable-slope limit is ~22-28 deg**, not `NavMeshMaxSlopeDegrees` (65): a 45 deg hill produces
-no faces. Raise `climb` (~1.0 m at `cs=0.5` allows 45 deg) or lower `NavMeshVoxelCellSize` to walk steeper
-terrain. The values are currently fixed in `TiledNavMeshBuilder.TiledNavMeshSettings`.
+Recast couples `agentMaxClimb` to slope traversability: its ledge filter rejects a span when the *spread* of
+its traversable neighbours' floors exceeds `walkableClimb`, and on a uniform slope that spread is twice the
+per-cell rise `cs*tan(slope)/ch`. The setting is therefore only honoured when
+`walkableClimb >= 2*cs*tan(slope)/ch`.
+
+`NavMeshVoxelAgentClimbMeters = 0` (the default) derives the smallest whole-voxel climb that satisfies this
+(`ceil(2*cs*tan(slope)/ch)*ch`; for 0.5 m cells / 0.2 m height / 65 deg this is **2.2 m**), clamped to a 0.4 m
+minimum. The log shows the result and warns when the effective slope is more than 1 deg below the setting:
+
+```
+NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
+```
+
+**Trade-off:** a larger climb also connects single vertical steps (curbs, low walls) up to that height, so the
+agent can walk up them. Set `NavMeshVoxelAgentClimbMeters` explicitly to cap that, or reduce
+`NavMeshVoxelCellSize` (halving `cs` halves the required climb). A `v2: WARNING ...` line is logged when the
+effective walkable slope falls short of `NavMeshMaxSlopeDegrees`.
 
 ## First-run questions this milestone must answer
 

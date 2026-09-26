@@ -72,7 +72,7 @@ Three netstandard2.1-only BCL APIs are replaced by the shim in `DotRecastBackpor
 | `Recast/RcLayers.cs` | 1× `using var`; 4× `Span<byte>/Span<int>` + 4× `stackalloc` → arrays; 1× `Array.Fill` + 2× `Span.Fill` → `RcBackport.Fill`. |
 | `Recast/RcMeshDetails.cs` | 2× `using var`; 14× `MathF`; 2× `Math.Clamp`; 3× `Array.Fill`. |
 | `Recast/RcMeshs.cs` | 2× `using var`; 5× `MathF`; 7× `Array.Fill`. |
-| `Recast/RcRasterizations.cs` | 3× `using var`; `DividePoly`/`RasterizeTri` `Span<float>` params + `stackalloc` scratch → arrays; 3× `MathF`; 6× `Math.Clamp`. |
+| `Recast/RcRasterizations.cs` | 3× `using var`; `DividePoly`/`RasterizeTri` `Span<float>` params + `stackalloc` scratch → arrays; 3× `MathF`; 6× `Math.Clamp`. **Local edit (BetterBannerlordNavmeshing):** `RasterizeTri`'s 84-float and `DividePoly`'s 12-float scratch arrays are now allocate-on-demand `[ThreadStatic]` reusable buffers (per-thread, non-nested calls) instead of per-call allocations — the span backport's per-triangle `new float[84]` was a GC hotspot at map scale. No behaviour change. |
 | `Recast/RcRegions.cs` | 4× `using var`; 2× `Array.Fill`; 2× `list[^1]` → `list[list.Count - 1]`. |
 | `Recast/Geom/IRcInputGeomProvider.cs` | Removed the C# 8 explicit `public` modifiers on the three off-mesh interface members. |
 
