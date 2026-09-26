@@ -1,0 +1,2 @@
+# Keep bytes exactly as written (CRLF is part of our shipping checks)
+* -text
