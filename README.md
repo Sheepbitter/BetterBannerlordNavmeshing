@@ -15,6 +15,35 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
 
+## Build & install
+
+Prerequisites: the Bannerlord **modding kit** (so `bin\Win64_Shipping_wEditor` exists) and the .NET SDK.
+
+From the repo root:
+
+```powershell
+.\build.ps1
+```
+
+`build.ps1` builds the editor (`Win64_Shipping_wEditor`) and client (`Win64_Shipping_Client`) variants in
+Release and deploys them, then copies this repo's `SubModule.xml` into the module:
+
+```
+<Bannerlord>\Modules\BetterBannerlordNavmeshing\
+  SubModule.xml
+  bin\Win64_Shipping_wEditor\BetterBannerlordNavmeshing.dll
+  bin\Win64_Shipping_Client\BetterBannerlordNavmeshing.dll
+```
+
+Override the game path if needed: `.\build.ps1 -GameDir 'D:\...\Mount & Blade II Bannerlord'`.
+
+The module must be **enabled** in the launcher. The editor loads the `Win64_Shipping_wEditor` assembly; the
+campaign/battle runtime loads `Win64_Shipping_Client`.
+
+Usage (see Quick start): (1) **editor** - add the `Scene Nav Mesh Exporter` component to an entity in a scene
+that has terrain and click **Export NavMesh**; (2) **in-game (experimental)** - press `~` during a `Continuing`
+singleplayer mission.
+
 ## Quick start
 
 ### Editor (primary)
