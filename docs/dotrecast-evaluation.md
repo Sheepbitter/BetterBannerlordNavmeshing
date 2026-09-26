@@ -378,3 +378,21 @@ parity, with watershed/detail correctness being the risky parts. That is the tru
 
 This preserves our TFM, our single-DLL deploy, our licence obligations, and gives us the real Recast stages
 rather than the 4.5k–6k LOC in-house fallback.
+
+---
+
+## Backport deviations observed (2026-09-26, vendoring pass)
+
+1. **`sampleDist = 0` is broken upstream.** `RcMeshDetails.BuildPolyMeshDetail(..., 0, ...)` throws
+   `IndexOutOfRangeException` in `TriangulateHull` (confirmed on a pristine net8 harness against the
+   untouched clone — not a backport artefact). Pass `>= 0.9f` (world units) instead.
+2. **Additional C# 8 / net472 gaps** beyond the lists above: `readonly struct` members (6), explicit
+   `public` interface members (3), `readonly ref struct` disposal (`RcScopedTimer`), `float.IsFinite`,
+   `HashCode.Combine`, `Array.AsSpan` — all resolved in the vendored copy (`ThirdParty/DotRecast/NOTICE.md`
+   has the per-file table).
+3. **Mechanical backport consequence:** `RcRasterizations.RasterizeTri`'s `stackalloc float[84]` and
+   `DividePoly`'s 12-float scratch are now per-call heap allocations. Per-tile triangle volumes make this
+   acceptable (a 16 m terrain tile rasterizes a few hundred triangles), but the integration pass should
+   hoist/pool them (and record the change in NOTICE) if profiling shows GC pressure.
+4. `RcFilledVolumeRasterization` / `RcPolyMeshRaycast` are dead code and were dropped; `RcHashCodes` and
+   `RcCollectionExtensions.InsertSort` were hidden dependencies found via compiler errors.

@@ -63,6 +63,14 @@
     </Reference>
   </ItemGroup>
 
+  <!-- Vendored DotRecast subset (net472 / C# 7.3 backport), shipped inside this single DLL.
+       The SDK default glob would already pick these up; the explicit Remove/Include pair makes the
+       vendoring obvious and keeps a single source of truth. See ThirdParty/DotRecast/NOTICE.md. -->
+  <ItemGroup>
+    <Compile Remove="ThirdParty\DotRecast\**\*.cs" />
+    <Compile Include="ThirdParty\DotRecast\**\*.cs" />
+  </ItemGroup>
+
   <!-- Deploy the built assembly into the module's bin folder for this variant. -->
   <Target Name="DeployToModule" AfterTargets="Build">
     <PropertyGroup>
