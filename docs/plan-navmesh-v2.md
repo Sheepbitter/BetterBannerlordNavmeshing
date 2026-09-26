@@ -89,6 +89,16 @@ both sides; deterministic tile merge order; stable ordering for layer ids; conve
 tri/quad for NMG8; global union-find for islands; post-filter polys violating the ≥ 1.5 m stacking rule;
 carry level masks through both meshing paths.
 
+### 1.6 Verified API notes (from the Phase 1 implementation)
+- Physics flag checks: `HasBatchedKinematicPhysicsFlag()` exists only on `WeakGameEntity`; `GameEntity.GetMobility()`
+  returns the nested enum `GameEntity.Mobility { Stationary, Dynamic, DynamicForced }`.
+- `BoundingBox` is `TaleWorlds.Engine.BoundingBox` with public `min`/`max` `Vec3` fields.
+- Ground queries require an explicit `BodyFlags excludeFlags` (pass `BodyFlags.None` to include barriers too).
+- `Scene.GetNavigationMeshForPosition(in Vec3, out int faceGroupId, float heightDifferenceLimit, bool excludeDynamicNavMesh)`.
+- Raycast with entity: `Scene.RayCastForClosestEntityOrTerrain(Vec3 source, Vec3 target, out float distance, out Vec3 point, out WeakGameEntity entity, float thickness, BodyFlags excludeFlags)` — no normal out param (use the ground-query overload for normals).
+- Whole-scene enumeration: `Scene.GetEntities(ref List<GameEntity>)`.
+- A script's own `GameEntity` is a `WeakGameEntity` (no `GetGlobalFrame()`); use its bounding-box centre and `WeakEntity` members.
+
 ---
 
 ## 2. Architecture (v2-fast)

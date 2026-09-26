@@ -171,11 +171,52 @@ Controls (Scene NavMesh Exporter fields):
 The log contains the scene and machine name, timings, all sampler validation lines, the mesher stats and the
 import result - safe to attach to a bug report.
 
+## Probe Geometry
+
+Phase 1 diagnostic for navmesh v2 (see `docs/plan-navmesh-v2.md`). The **Probe Geometry** button on the
+Scene Nav Mesh Exporter dumps what geometry the scene actually exposes into the run log. It reports:
+
+- **Entity scan & classification** - every entity, classified from `BodyFlags` / `GetMobility()` / prefab / tags
+  as terrain / flora / stairs / ladder / barrier / dynamic / static; how many report physics; how many
+  `GetBodyShape()` results are usable (`shapesOk`), null, empty, or throw; batched/kinematic counts; total
+  collision triangles. One `shape entity='...'` line per entity (capped at 60), then a summary + class histogram.
+- **Coordinate space** - for the ~8 largest triangle-count entities (plus one with `HasSteps`), a `coords:` line
+  comparing the raw `GetTriangle` AABB against `GetGlobalBoundingBox`, `GetLocalBoundingBox`,
+  `GetLocalPhysicsBoundingBox(true)`/`(false)` and the raw AABB run through `GetGlobalFrame`. Whichever box
+  matches `triRaw` is the coordinate space of the physics triangles.
+- **Column probe** - a top-down march of raycasts at the **attached entity's X/Y** (place the entity at the spot
+  of interest, e.g. under a bridge). Logs each hit and the vertical gaps, then compares
+  `GetGroundHeightAtPosition` (and its `out normal` form), `GetTerrainHeight`, and the navmesh face group at
+  that X/Y - i.e. topmost surface vs ground.
+- **Scene levels** - `GetUpgradeLevelCount` / `GetUpgradeLevelNameOfIndex` / `GetUpgradeLevelMaskOfLevelName` /
+  `GetUpgradeLevelMask`: one line per declared level plus the combined mask (used to choose face level masks).
+
+Example lines:
+
+```
+[..] probe: entities=812 physics=430 shapesOk=398 shapesNull=30 shapesEmpty=2 shapeExceptions=0 batchedKinematic=0 trisTotal=914233 scanMs=142
+[..] probe classes: terrain=1 flora=210 stairs=64 ladder=0 barrier=38 dynamic=12 static=487
+[..] coords: entity='building_a' prefab='building_a' trisSampled=512 triRaw=[..] globalBox=[..] localBox=[..] physBoxIncChildren=[..] physBoxExcChildren=[..] triRaw*globalFrame=[..]
+[..] column: x=12.5 y=-40.25 fromZ=200 toZ=-200
+[..] column hit 0: z=14.02 entity='bridge_deck' flags=0x00000000 distance=185.98
+[..] column: hits=3 gaps=[0.02,7.4]
+[..] ground query: GetGroundHeightAtPosition=6.61 (normal=0,0,1) GetTerrainHeight=6.58 navMeshFaceGroup=none
+[..] level 0: name='level_1' mask=0x0000000F
+[..] levels: count=1 combinedMask=0x000000FF
+[..] probe done: totalMs=820
+```
+
+Reading it: `shapesNull`/`shapesEmpty` on batched statics are the "visuals without collision" risk (plan S5);
+`triRaw` matching one particular box settles the coordinate-space question; column `gaps` reveal stacked
+surfaces (anything < 1.5 m apart is a stacking problem, plan S1.3); the `level` masks feed the emitted face
+masks. The attached entity's X/Y **is** the probed column - move the entity to probe a different spot.
+
 ## Settings (Scene NavMesh Exporter fields)
 
 | Field | Default | Notes |
 |---|---|---|
 | `ExportNavMesh` | button | Runs the export on the scene's live terrain. |
+| `ProbeGeometry` | button | Phase 1 diagnostic: dumps scene collision geometry to the log (see Probe Geometry). |
 | `NavMeshSampleStride` | `1` | **Finest** sampling: 1 = every terrain vertex. Refinement decides the coarser cells. |
 | `NavMeshMaxErrorMeters` | `0.25` | Fidelity guarantee: mesh surface stays within this of the ground. |
 | `NavMeshCoarsestSpacing` | `16` | Largest cell size (m). Smaller = tighter bound, more faces. |

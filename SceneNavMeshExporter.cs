@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using TaleWorlds.Engine;
+using TaleWorlds.Library;
 
 namespace BetterBannerlordNavmeshing
 {
@@ -14,6 +15,7 @@ namespace BetterBannerlordNavmeshing
 
         // ---------------- Settings (same names as the terrain script) ----------------
         public SimpleButton ExportNavMesh;
+        public SimpleButton ProbeGeometry;
         public int NavMeshSampleStride = 1;
         public float NavMeshMaxErrorMeters = 0.25f;
         public float NavMeshCoarsestSpacing = 16f;
@@ -51,6 +53,41 @@ namespace BetterBannerlordNavmeshing
             base.OnEditorVariableChanged(variableName);
             if (variableName == nameof(ExportNavMesh))
                 ExportFromEditor();
+            else if (variableName == nameof(ProbeGeometry))
+                ProbeFromEditor();
+        }
+
+        // Phase 1 diagnostic: dump the scene's collision-geometry capabilities to
+        // the log file. Never throws.
+        private void ProbeFromEditor()
+        {
+            try
+            {
+                NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
+                NavMeshLog.Write("===== probe run @ "
+                    + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " =====");
+
+                Vec3 column = Vec3.Zero;
+                try
+                {
+                    WeakGameEntity entity = GameEntity;
+                    BoundingBox bb = entity.GetGlobalBoundingBox();
+                    column = new Vec3((bb.min.x + bb.max.x) * 0.5f,
+                        (bb.min.y + bb.max.y) * 0.5f,
+                        (bb.min.z + bb.max.z) * 0.5f);
+                }
+                catch (Exception)
+                {
+                }
+
+                NavMeshLog.Write("probe: scene=" + SafeName(Scene) + " column=("
+                    + F(column.x) + "," + F(column.y) + "," + F(column.z) + ")");
+                SceneGeometryProbe.Run(Scene, column, NavMeshLog.Write);
+            }
+            catch (Exception ex)
+            {
+                NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
+            }
         }
 
         private void ExportFromEditor()

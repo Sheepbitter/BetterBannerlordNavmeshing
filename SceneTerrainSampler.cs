@@ -97,6 +97,8 @@ namespace BetterBannerlordNavmeshing
             int order = 0;              // 0 = unknown, 1 = ix-major, 2 = iy-major, -1 = unresolved
             int nodesChecked = 0;
             int minMaxBad = 0;
+            float worstMinMaxDeltaMin = 0f;
+            float worstMinMaxDeltaMax = 0f;
             int sampleMatches = 0;
             int sampleTotal = 0;
             int sampleBadNodes = 0;
@@ -137,12 +139,18 @@ namespace BetterBannerlordNavmeshing
                         if (v > arrayMax) arrayMax = v;
                     }
 
+                    // The reported node min/max is informational: it can differ
+                    // slightly from the live array (observed up to ~1 m on
+                    // edited terrain), while the point cross-check below is the
+                    // authoritative test. Keep worst-case deltas instead of one
+                    // log line per node.
                     if (Math.Abs(arrayMin - nmin) > 0.05f || Math.Abs(arrayMax - nmax) > 0.05f)
                     {
                         minMaxBad++;
-                        Emit(log, "node(" + nx + "," + ny + ") min/max mismatch: array=["
-                            + F(arrayMin) + ".." + F(arrayMax) + "] reported=["
-                            + F(nmin) + ".." + F(nmax) + "]");
+                        float dMin = Math.Abs(arrayMin - nmin);
+                        float dMax = Math.Abs(arrayMax - nmax);
+                        if (dMin > worstMinMaxDeltaMin) worstMinMaxDeltaMin = dMin;
+                        if (dMax > worstMinMaxDeltaMax) worstMinMaxDeltaMax = dMax;
                     }
 
                     // Discover the index order once, from the first node.
@@ -190,6 +198,8 @@ namespace BetterBannerlordNavmeshing
 
             Emit(log, "bulk validation: nodes=" + nodesChecked
                 + " arraysOk=yes minMaxMismatchNodes=" + minMaxBad
+                + " worstMinMaxDelta=[" + F(worstMinMaxDeltaMin) + ".." + F(worstMinMaxDeltaMax)
+                + "] (informational)"
                 + " pointCrossCheck=" + sampleMatches + "/" + sampleTotal
                 + " (tol " + F(SampleTolerance) + "m, mismatchedNodes=" + sampleBadNodes + ")");
 
