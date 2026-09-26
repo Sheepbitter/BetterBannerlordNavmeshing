@@ -41,6 +41,11 @@ namespace BetterBannerlordNavmeshing
         // needs walkableClimb >= 2*cs*tan(slope)/ch). See the README.
         public float NavMeshVoxelAgentClimbMeters = 0f;
 
+        // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
+        // the terrain surface instead of chording under hills/knolls; bounded by
+        // NavMeshMaxErrorMeters. Disable for a leaner bin (flat/plateau scenes only).
+        public bool NavMeshVoxelDetailMesh = true;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -208,7 +213,8 @@ namespace BetterBannerlordNavmeshing
             RunPipeline(Scene, "editor-button", settings, NavMeshPrefabName, NavMeshExportFolder,
                 NavMeshClearExistingFaces, NavMeshImportIntoScene,
                 NavMeshWriteLogFile, NavMeshLogFolder,
-                NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters);
+                NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters,
+                NavMeshVoxelDetailMesh);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -228,7 +234,7 @@ namespace BetterBannerlordNavmeshing
             string logFolder)
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
-                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f);
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -244,7 +250,8 @@ namespace BetterBannerlordNavmeshing
             string logFolder,
             bool useVoxelCore,
             float voxelCellSizeMeters,
-            float voxelAgentClimbMeters)
+            float voxelAgentClimbMeters,
+            bool voxelDetailMesh)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -277,6 +284,7 @@ namespace BetterBannerlordNavmeshing
                     + " useVoxelCore=" + useVoxelCore
                     + " voxelCellSize=" + F(voxelCellSizeMeters) + "m"
                     + " voxelAgentClimb=" + F(voxelAgentClimbMeters) + "m"
+                    + " detail=" + voxelDetailMesh
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -302,6 +310,7 @@ namespace BetterBannerlordNavmeshing
                     voxel.MaxSlopeDegrees = settings.MaxSlopeDegrees;
                     voxel.MaxErrorMeters = settings.MaxErrorMeters;
                     voxel.HeightOffsetMeters = settings.HeightOffsetMeters;
+                    voxel.UseDetailMesh = voxelDetailMesh;
 
                     long voxelBuildMs;
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(

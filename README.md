@@ -260,6 +260,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshUseVoxelCore` | `false` | **Experimental:** run the v2 tiled voxel core instead of the v1 adaptive terrain mesher (terrain-only). See *Voxel core (experimental)*. |
 | `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
+| `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
@@ -281,8 +282,19 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
 - **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
   (0.25 m -> contour simplification `0.25/cs` voxels and the detail-mesh tolerance), `NavMeshCoarsestSpacing`
-  (tile size), `NavMeshHeightOffsetMeters`, `NavMeshVoxelAgentClimbMeters` (0 = auto). Agent radius/height are
-  fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually walkable (see below).
+  (tile size), `NavMeshHeightOffsetMeters`, `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh`
+  (default true). Agent radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting
+  is actually walkable (see below).
+
+### Detail mesh (on by default)
+
+A Recast **polygon mesh alone has boundary vertices only**, so a face spanning a knoll is a flat chord that
+cuts *through* the hill (this was the reported v2 behaviour: the navmesh clipped through hills, and smaller
+tiles / coarser cells only reduced it). The **detail phase** adds interior vertices so the emitted triangles
+follow the surface, bounded by `NavMeshMaxErrorMeters` (0.25 m). It costs more faces and a larger bin, so it
+can be turned off (`NavMeshVoxelDetailMesh = false`) for flat/plateau scenes; on rolling terrain it is what
+keeps the mesh on the ground. Detail vertices are seam-welded across tiles/polys deterministically (see
+`TiledNavMeshBuilder.MergeDetailTiles`).
 
 ### How to read the v2 log lines
 
@@ -293,7 +305,7 @@ NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
 NavMesh: v2: soup verts=... tris=... stride=... spacing=...m
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
 NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
-NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=False
+NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=True
 NavMesh: v2: contour maxError=0.5vox (= 0.25m at cs=0.5m); plan's ~1.3vox heuristic not used, metre budget honoured
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)

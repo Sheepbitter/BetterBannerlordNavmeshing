@@ -27,12 +27,6 @@ namespace BetterBannerlordNavmeshing
     // serializing with Nmg8Writer.
     public static class TiledNavMeshBuilder
     {
-        // Weld lattice for the optional detail mesh: detail vertices are not on
-        // the voxel lattice, so they are welded by rounding world coordinates to
-        // this step (sub-millimetre). The default fan path welds exactly using
-        // integer voxel-lattice indices instead.
-        private const double DetailWeldStep = 1e-3;
-
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -72,8 +66,16 @@ namespace BetterBannerlordNavmeshing
 
             public int VertsPerPoly = 6;
 
-            // Optional detail mesh (default off: fan-triangulated polys only).
+            // Optional detail mesh. Adds interior vertices so faces follow the surface instead of
+            // chording under knolls; bounded by MaxErrorMeters. Default off here (the exporter
+            // enables it); can be disabled for a leaner bin.
             public bool UseDetailMesh = false;
+
+            // Cluster radius (m) for the detail-path seam weld. Cross-tile/cross-poly coincident
+            // detail samples differ only by float lerp error (~1e-4 m), so a small radius welds
+            // them; it must stay well below the smallest real stacked-surface separation (6.7 cm in
+            // probe data) so distinct levels are never merged.
+            public float DetailWeldToleranceMeters = 0.01f;
         }
 
         public sealed class VoxelTileResult
@@ -90,7 +92,7 @@ namespace BetterBannerlordNavmeshing
             public int[] Tris;
 
             // Global weld key per vertex: fan path = integer voxel-lattice triple
-            // (gx, gy, gz); detail path = world coordinates rounded to DetailWeldStep.
+            // (gx, gy, gz); null for the detail path (which is clustered by position).
             public int[] WeldLattice;
 
             public int PolyCount;
@@ -424,16 +426,74 @@ namespace BetterBannerlordNavmeshing
 
             // --- merge in sorted order (deterministic) ---
             var mergeWatch = Stopwatch.StartNew();
-            bool detail = s.UseDetailMesh;
-            var weld = new Dictionary<VertexKey, int>();
-            var outX = new List<float>();
-            var outY = new List<float>();
-            var outZ = new List<float>();
-            var outTris = new List<int>();
-            int mergedVertices = 0;
-            int degenerate = 0;
-            float outMinY = float.MaxValue, outMaxY = float.MinValue;
+            MergeOutput merged = s.UseDetailMesh
+                ? MergeDetailTiles(results, tilesX, tilesZ, s.DetailWeldToleranceMeters)
+                : MergeFanTiles(results, tilesX, tilesZ);
+            mergeWatch.Stop();
 
+            int mergedVertices = merged.X.Count;
+            var result = new VoxelMeshResult();
+            result.VertexCount = mergedVertices;
+            result.FaceCount = merged.Tris.Count / 3;
+            result.DegenerateFaces = merged.Degenerate;
+            result.WeldMergedVertices = SumTileVertices(results) - mergedVertices;
+            result.TileCount = tileCount;
+            result.BuiltTiles = builtTiles;
+            result.FailedTiles = failedTiles;
+            result.Workers = workers;
+            result.InputTriangles = inputTris;
+            result.CulledByAabb = culledByAabb;
+            result.RasterizedTriangles = rasterizedTris;
+            result.TilesMs = tilesWatch.ElapsedMilliseconds;
+            result.MergeMs = mergeWatch.ElapsedMilliseconds;
+            result.TileMsMin = tileMsMin;
+            result.TileMsAvg = tileMsAvg;
+            result.TileMsMax = tileMsMax;
+            result.MinZ = mergedVertices > 0 ? merged.MinY : 0f;
+            result.MaxZ = mergedVertices > 0 ? merged.MaxY : 0f;
+
+            result.VertsXyz = new float[mergedVertices * 3];
+            for (int i = 0; i < mergedVertices; i++)
+            {
+                result.VertsXyz[i * 3 + 0] = merged.X[i];
+                result.VertsXyz[i * 3 + 1] = merged.Y[i];
+                result.VertsXyz[i * 3 + 2] = merged.Z[i];
+            }
+            result.Tris = merged.Tris.ToArray();
+
+            // --- topology count ---
+            result.EdgeCount = CountUniqueEdges(result.Tris, result.FaceCount);
+
+            Log(log, "v2: weld verts=" + SumTileVertices(results) + " -> " + mergedVertices
+                + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
+                + " degenerate=" + merged.Degenerate + " (weldMerged=" + result.WeldMergedVertices + ")");
+
+            total.Stop();
+            result.TotalMs = total.ElapsedMilliseconds;
+            Log(log, "v2 timings: tilesMs=" + result.TilesMs + " mergeMs=" + result.MergeMs
+                + " totalMs=" + result.TotalMs);
+            Log(log, "v2: tileMs min/avg/max=" + result.TileMsMin + "/" + result.TileMsAvg + "/" + result.TileMsMax);
+
+            return result;
+        }
+
+        private sealed class MergeOutput
+        {
+            public readonly List<float> X = new List<float>();
+            public readonly List<float> Y = new List<float>();
+            public readonly List<float> Z = new List<float>();
+            public readonly List<int> Tris = new List<int>();
+            public int Degenerate;
+            public float MinY = float.MaxValue;
+            public float MaxY = float.MinValue;
+        }
+
+        // Fan path: exact integer voxel-lattice weld (behaviour unchanged).
+        private static MergeOutput MergeFanTiles(VoxelTileResult[] results, int tilesX, int tilesZ)
+        {
+            var o = new MergeOutput();
+            var weld = new Dictionary<VertexKey, int>();
+            int mergedVertices = 0;
             for (int ty = 0; ty < tilesZ; ty++)
             {
                 for (int tx = 0; tx < tilesX; tx++)
@@ -449,20 +509,9 @@ namespace BetterBannerlordNavmeshing
                         float x = r.VertsXyz[k * 3 + 0];
                         float y = r.VertsXyz[k * 3 + 1];
                         float z = r.VertsXyz[k * 3 + 2];
-
-                        int qx, qy, qz;
-                        if (r.WeldLattice != null)
-                        {
-                            qx = r.WeldLattice[k * 3 + 0];
-                            qy = r.WeldLattice[k * 3 + 1];
-                            qz = r.WeldLattice[k * 3 + 2];
-                        }
-                        else
-                        {
-                            qx = (int)Math.Round(x / DetailWeldStep);
-                            qy = (int)Math.Round(y / DetailWeldStep);
-                            qz = (int)Math.Round(z / DetailWeldStep);
-                        }
+                        int qx = r.WeldLattice[k * 3 + 0];
+                        int qy = r.WeldLattice[k * 3 + 1];
+                        int qz = r.WeldLattice[k * 3 + 2];
 
                         var key = new VertexKey(qx, qy, qz);
                         int mapped;
@@ -470,78 +519,167 @@ namespace BetterBannerlordNavmeshing
                         {
                             mapped = mergedVertices;
                             weld[key] = mapped;
-                            outX.Add(x);
-                            outY.Add(y);
-                            outZ.Add(z);
+                            o.X.Add(x);
+                            o.Y.Add(y);
+                            o.Z.Add(z);
                             mergedVertices++;
-                            if (y < outMinY) outMinY = y;
-                            if (y > outMaxY) outMaxY = y;
+                            if (y < o.MinY) o.MinY = y;
+                            if (y > o.MaxY) o.MaxY = y;
                         }
                         remap[k] = mapped;
                     }
 
-                    int faceCount = r.FaceCount;
-                    for (int f = 0; f < faceCount; f++)
-                    {
-                        int a = remap[r.Tris[f * 3 + 0]];
-                        int b = remap[r.Tris[f * 3 + 1]];
-                        int c = remap[r.Tris[f * 3 + 2]];
-                        if (a == b || b == c || a == c || Math.Abs(Area2(outX, outY, outZ, a, b, c)) < 1e-6f)
-                        {
-                            degenerate++;
-                            continue;
-                        }
-                        outTris.Add(a);
-                        outTris.Add(b);
-                        outTris.Add(c);
-                    }
+                    AppendFaces(o, r, remap);
                 }
             }
-            mergeWatch.Stop();
+            return o;
+        }
 
-            var result = new VoxelMeshResult();
-            result.VertexCount = mergedVertices;
-            result.FaceCount = outTris.Count / 3;
-            result.DegenerateFaces = degenerate;
-            result.WeldMergedVertices = SumTileVertices(results) - mergedVertices;
-            result.TileCount = tileCount;
-            result.BuiltTiles = builtTiles;
-            result.FailedTiles = failedTiles;
-            result.Workers = workers;
-            result.InputTriangles = inputTris;
-            result.CulledByAabb = culledByAabb;
-            result.RasterizedTriangles = rasterizedTris;
-            result.TilesMs = tilesWatch.ElapsedMilliseconds;
-            result.MergeMs = mergeWatch.ElapsedMilliseconds;
-            result.TileMsMin = tileMsMin;
-            result.TileMsAvg = tileMsAvg;
-            result.TileMsMax = tileMsMax;
-            result.MinZ = mergedVertices > 0 ? outMinY : 0f;
-            result.MaxZ = mergedVertices > 0 ? outMaxY : 0f;
+        // Detail path: robust deterministic weld. Vertices are gathered from every tile in sorted
+        // tile order, then clustered by a lexicographic sweep: the sorted vertices are visited in
+        // order and each is merged into the first existing cluster anchor within DetailWeldTolerance
+        // (3D). The first vertex of a cluster (in lexicographic order) is the canonical
+        // representative. This is stable regardless of which side of a rounding boundary a float
+        // lerp lands on, and it only merges points that are genuinely co-located (so distinct
+        // stacked surfaces stay distinct).
+        private static MergeOutput MergeDetailTiles(VoxelTileResult[] results, int tilesX, int tilesZ, float tol)
+        {
+            var o = new MergeOutput();
+            int tileCount = results.Length;
+            var tileStart = new int[tileCount];
+            var gx = new List<float>();
+            var gy = new List<float>();
+            var gz = new List<float>();
 
-            result.VertsXyz = new float[mergedVertices * 3];
-            for (int i = 0; i < mergedVertices; i++)
+            for (int i = 0; i < tileCount; i++)
             {
-                result.VertsXyz[i * 3 + 0] = outX[i];
-                result.VertsXyz[i * 3 + 1] = outY[i];
-                result.VertsXyz[i * 3 + 2] = outZ[i];
+                VoxelTileResult r = results[i];
+                tileStart[i] = -1;
+                if (r == null || r.Failed || r.VertsXyz == null || r.Tris == null || r.Tris.Length == 0)
+                    continue;
+                tileStart[i] = gx.Count;
+                for (int k = 0; k < r.VertexCount; k++)
+                {
+                    gx.Add(r.VertsXyz[k * 3 + 0]);
+                    gy.Add(r.VertsXyz[k * 3 + 1]);
+                    gz.Add(r.VertsXyz[k * 3 + 2]);
+                }
             }
-            result.Tris = outTris.ToArray();
 
-            // --- topology count ---
-            result.EdgeCount = CountUniqueEdges(result.Tris, result.FaceCount);
+            int n = gx.Count;
+            var order = new int[n];
+            for (int i = 0; i < n; i++) order[i] = i;
+            Array.Sort(order, new LexicographicVertexComparer(gx, gy, gz));
 
-            Log(log, "v2: weld verts=" + SumTileVertices(results) + " -> " + mergedVertices
-                + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
-                + " degenerate=" + degenerate + " (weldMerged=" + result.WeldMergedVertices + ")");
+            float tol2 = tol * tol;
+            var clusterOf = new int[n];
+            var anchors = new List<int>();
+            int windowStart = 0;
+            for (int s = 0; s < n; s++)
+            {
+                int p = order[s];
+                float x = gx[p], y = gy[p], z = gz[p];
 
-            total.Stop();
-            result.TotalMs = total.ElapsedMilliseconds;
-            Log(log, "v2 timings: tilesMs=" + result.TilesMs + " mergeMs=" + result.MergeMs
-                + " totalMs=" + result.TotalMs);
-            Log(log, "v2: tileMs min/avg/max=" + result.TileMsMin + "/" + result.TileMsAvg + "/" + result.TileMsMax);
+                // Anchors are created in ascending x order, so drop the ones that can no longer match.
+                while (windowStart < anchors.Count && gx[anchors[windowStart]] < x - tol)
+                    windowStart++;
 
-            return result;
+                int found = -1;
+                for (int a = windowStart; a < anchors.Count; a++)
+                {
+                    int q = anchors[a];
+                    float dx = gx[q] - x, dy = gy[q] - y, dz = gz[q] - z;
+                    if (dx * dx + dy * dy + dz * dz <= tol2)
+                    {
+                        found = a;
+                        break;
+                    }
+                }
+
+                if (found >= 0)
+                {
+                    clusterOf[p] = found;
+                }
+                else
+                {
+                    clusterOf[p] = anchors.Count;
+                    anchors.Add(p);
+                }
+            }
+
+            for (int c = 0; c < anchors.Count; c++)
+            {
+                int p = anchors[c];
+                float y = gy[p];
+                o.X.Add(gx[p]);
+                o.Y.Add(y);
+                o.Z.Add(gz[p]);
+                if (y < o.MinY) o.MinY = y;
+                if (y > o.MaxY) o.MaxY = y;
+            }
+
+            for (int ty = 0; ty < tilesZ; ty++)
+            {
+                for (int tx = 0; tx < tilesX; tx++)
+                {
+                    int ti = ty * tilesX + tx;
+                    if (tileStart[ti] < 0)
+                        continue;
+                    VoxelTileResult r = results[ti];
+                    int baseIndex = tileStart[ti];
+                    int vCount = r.VertexCount;
+                    var remap = new int[vCount];
+                    for (int k = 0; k < vCount; k++)
+                        remap[k] = clusterOf[baseIndex + k];
+                    AppendFaces(o, r, remap);
+                }
+            }
+            return o;
+        }
+
+        private static void AppendFaces(MergeOutput o, VoxelTileResult r, int[] remap)
+        {
+            int faceCount = r.FaceCount;
+            for (int f = 0; f < faceCount; f++)
+            {
+                int a = remap[r.Tris[f * 3 + 0]];
+                int b = remap[r.Tris[f * 3 + 1]];
+                int c = remap[r.Tris[f * 3 + 2]];
+                if (a == b || b == c || a == c || Math.Abs(Area2(o.X, o.Y, o.Z, a, b, c)) < 1e-6f)
+                {
+                    o.Degenerate++;
+                    continue;
+                }
+                o.Tris.Add(a);
+                o.Tris.Add(b);
+                o.Tris.Add(c);
+            }
+        }
+
+        // Total order on vertex indices by (x, y, z, index) -- deterministic under Array.Sort.
+        private sealed class LexicographicVertexComparer : IComparer<int>
+        {
+            private readonly List<float> _x;
+            private readonly List<float> _y;
+            private readonly List<float> _z;
+
+            public LexicographicVertexComparer(List<float> x, List<float> y, List<float> z)
+            {
+                _x = x;
+                _y = y;
+                _z = z;
+            }
+
+            public int Compare(int a, int b)
+            {
+                int c = _x[a].CompareTo(_x[b]);
+                if (c != 0) return c;
+                c = _y[a].CompareTo(_y[b]);
+                if (c != 0) return c;
+                c = _z[a].CompareTo(_z[b]);
+                if (c != 0) return c;
+                return a.CompareTo(b);
+            }
         }
 
         private static int SumTileVertices(VoxelTileResult[] results)
@@ -736,8 +874,8 @@ namespace BetterBannerlordNavmeshing
             return outIndex;
         }
 
-        // Optional detail mesh: Recast emits world-space detail triangles. Weld
-        // key is the world position rounded to DetailWeldStep.
+        // Optional detail mesh: Recast emits world-space (Y-up) detail triangles, including the
+        // upstream +chf.ch nudge. WeldLattice is left null; MergeDetailTiles clusters by position.
         private static void BuildDetailOutput(VoxelTileResult r, RcPolyMesh pmesh, RcCompactHeightfield chf,
             RcContext ctx, TiledNavMeshSettings s)
         {
