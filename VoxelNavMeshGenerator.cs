@@ -20,6 +20,7 @@ namespace BetterBannerlordNavmeshing
             float[] stitchedHeights, int width, int height, float terrainVertexSpacing, int sampleStride,
             TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj,
             float agentClimbOverrideMeters, int maxWorkers,
+            float[] assetVertsEngineXyz, int[] assetTris,
             System.Action<string> log, out long buildMs)
         {
             if (log != null)
@@ -57,9 +58,29 @@ namespace BetterBannerlordNavmeshing
             int[] tris;
             TiledNavMeshBuilder.BuildTerrainSoup(stitchedHeights, width, height, terrainVertexSpacing,
                 sampleStride, out vertsXyz, out tris);
-            if (log != null)
-                log("v2: soup verts=" + (vertsXyz.Length / 3) + " tris=" + (tris.Length / 3)
-                    + " stride=" + sampleStride + " spacing=" + F(terrainVertexSpacing) + "m");
+            int terrainSoupVerts = vertsXyz.Length / 3;
+            int terrainSoupTris = tris.Length / 3;
+            int assetTriCount = assetTris != null ? assetTris.Length / 3 : 0;
+            if (assetTriCount > 0)
+            {
+                // Mix assets into the same Recast-space soup. The terrain and the asset geometry are
+                // merged first, then the builder lifts the WHOLE mesh by HeightOffsetMeters -- one
+                // uniform anti-intersection offset for terrain and structures alike (a mesh that
+                // intersected the terrain/assets would make units lose it). The mixer also reverses
+                // the asset winding (the Z-up -> Y-up swap is orientation-reversing).
+                TiledNavMeshBuilder.BuildCombinedSoup(vertsXyz, tris, assetVertsEngineXyz, assetTris,
+                    out vertsXyz, out tris);
+                if (log != null)
+                    log("v2: soup terrain=" + terrainSoupVerts + "v/" + terrainSoupTris + "t + assets="
+                        + (assetVertsEngineXyz != null ? assetVertsEngineXyz.Length / 3 : 0) + "v/" + assetTriCount
+                        + "t -> " + (vertsXyz.Length / 3) + "v/" + (tris.Length / 3) + "t"
+                        + " (merged; lifted uniformly by +" + F(voxelSettings.HeightOffsetMeters) + "m)");
+            }
+            else if (log != null)
+            {
+                log("v2: soup verts=" + terrainSoupVerts + " tris=" + terrainSoupTris
+                    + " (terrain only) stride=" + sampleStride + " spacing=" + F(terrainVertexSpacing) + "m");
+            }
 
             TiledNavMeshBuilder.VoxelMeshResult vres =
                 TiledNavMeshBuilder.Build(vertsXyz, tris, voxelSettings, maxWorkers, log);

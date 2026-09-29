@@ -12,8 +12,9 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 |---|---|
 | `TerrainNavMeshGenerator.cs` | Error-bounded adaptive mesher + NMG8 prefab writer/importer (imported from `Procedural_Bannerlord_Scenes`, Build 3; namespace renamed only). Input `(heights, width, height, spacing)`; output `NavMeshPrefabs\<name>.bin` + `Scene.ImportNavigationMeshPrefab` (static faces). |
 | `Nmg8Writer.cs` | Shared NMG8 prefab serializer (extracted verbatim from `TerrainNavMeshGenerator`); used by both the v1 adaptive mesher and the v2 voxel core. Output bytes are unchanged for v1. |
-| `TiledNavMeshBuilder.cs` | **Voxel core (navmesh v2, experimental).** Tiled + parallel Recast pipeline via the vendored DotRecast subset; terrain-only. Pure data-in/data-out (no TaleWorlds types). |
-| `VoxelNavMeshGenerator.cs` | Adapter: terrain sampler grid -> voxel core -> engine-space mesh, then the shared write/import path. |
+| `TiledNavMeshBuilder.cs` | **Voxel core (navmesh v2, experimental).** Tiled + parallel Recast pipeline via the vendored DotRecast subset; terrain **+ static asset collision** geometry (one soup). Pure data-in/data-out (no TaleWorlds types). |
+| `VoxelNavMeshGenerator.cs` | Adapter: terrain sampler grid (+ optional engine-space asset triangles) -> voxel core -> engine-space mesh, then the shared write/import path. Merges both into one soup; `NavMeshHeightOffsetMeters` lifts the whole merged mesh uniformly. |
+| `SceneCollisionGeometry.cs` | **Main-thread asset collector (phase 3).** Enumerates scene entities, classifies by `BodyFlags`/mobility, reads `GetBodyShape()` triangles and transforms them by the entity global frame into engine-space world triangles (plain arrays for the background build). |
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
@@ -252,18 +253,21 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshCoarsestSpacing` | `16` | Largest cell size (m). Smaller = tighter bound, more faces. |
 | `NavMeshMaxSlopeDegrees` | `50` | Faces steeper than this are dropped; the v2 core auto-derives the agent climb so the configured slope is actually traversable. |
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
-| `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the emitted mesh. 0 = flush with the terrain. |
+| `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the whole emitted mesh (terrain **and** structures), so it does not intersect either. 0 = as flush as the voxel lattice allows. |
 | `NavMeshPrefabName` | `""` | Defaults to `<scene name>_navmesh`. |
 | `NavMeshExportFolder` | `""` | Override for the output folder (must be a loaded module's `NavMeshPrefabs` for the import to find it). |
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
-| `NavMeshUseVoxelCore` | `true` | Run the v2 tiled voxel core (terrain-only; the default since 2026-09-29). Set false for the v1 adaptive terrain mesher. See *Voxel core (experimental)*. |
+| `NavMeshUseVoxelCore` | `true` | Run the v2 tiled voxel core (terrain + ingested static asset collision; the default since 2026-09-29). Set false for the v1 adaptive terrain mesher. See *Voxel core (experimental)*. |
 | `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
 | `NavMeshVoxelDetailSampleDist` | `2` | v2 detail-mesh sampling distance (m). `0` = auto (`max(0.9, cellSize)`). The default cuts the tight/sliver faces Recast's detail edge tessellation makes along walkable boundaries. Lower = more surface detail (more faces). |
 | `NavMeshVoxelContourMaxError` | `1.3` | v2 contour simplification error (voxels). `0` = auto (`NavMeshMaxErrorMeters / cellSize`, i.e. 0.5). A simpler walkable boundary removes most remaining boundary slivers on boundary-rich maps, with no change to the surface-error budget. |
+| `NavMeshVoxelIncludeAssets` | `true` | v2: ingest static asset collision geometry (interiors, stairs, decks, bridges) into the voxel soup so structures are navigable. Terrain-only when false. See *Assets (structures)*. |
+| `NavMeshVoxelIncludeDynamic` | `true` | v2 assets: include movable/dynamic physics props (e.g. Birtu's merlons) at their placed pose. Set false to build only from static geometry. |
+| `NavMeshVoxelIncludeFlora` | `false` | v2 assets: include flora collision (trees/bushes). Off by default - flora is usually visual and its many small shapes add faces without being reliably navigable. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
@@ -279,15 +283,18 @@ Mesher cost (v1 path, measured on 3584x3584 m terrain at stride 1, coarsest 16, 
 the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *same* code path as v1
 (`TerrainNavMeshGenerator.WriteAndImport`), so the prefab format and import behaviour are identical.
 
-- **Terrain-only so far.** It voxelizes the terrain triangle soup; collision triangles (buildings, stairs)
-  are a later phase.
+- **Terrain + static assets.** It voxelizes one triangle soup built from the terrain heightfield *and*
+  (by default) every physics entity's collision geometry, so interiors, stairs, decks and bridges over
+  terrain become navigable. See *Assets (structures)* below.
 - **Tiled + parallel.** The world is split into 16 m tiles (`NavMeshCoarsestSpacing`) with a Recast border,
   built on a bounded worker pool (`Parallel.For`, `MaxDegreeOfParallelism = #processors`), then merged in
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
 - **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
   (0.25 m -> detail-mesh tolerance), `NavMeshCoarsestSpacing` (tile size), `NavMeshHeightOffsetMeters`,
   `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh` (default true),
-  `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox). Agent
+  `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox),
+  `NavMeshVoxelIncludeAssets` / `NavMeshVoxelIncludeDynamic` / `NavMeshVoxelIncludeFlora` (asset ingestion;
+  see *Assets (structures)*). Agent
   radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually
   walkable (see below).
 
@@ -297,7 +304,8 @@ With `NavMeshUseVoxelCore = true` and `NavMeshAsyncBuild = true` (the default), 
 pipeline in two halves:
 
 - **Main thread:** run header + settings, `faces before run`, the live terrain read (`SceneTerrainSampler`),
-  and prefab/folder resolution.
+  the asset collision scan (`SceneCollisionGeometry`, when `NavMeshVoxelIncludeAssets`), and prefab/folder
+  resolution.
 - **Background thread:** `VoxelNavMeshGenerator.BuildExportMesh` only - the pure-managed build (terrain soup
   -> `TiledNavMeshBuilder.Build` -> NMG8 serialization). It never touches `Scene`/game objects.
 - **Main thread (completion):** the **unchanged** `TerrainNavMeshGenerator.WriteAndImport` half - bin write,
@@ -318,15 +326,15 @@ NavMesh: v2: async build started on a background thread; the editor stays respon
 NavMesh: v2: progress tiles=<done>/<total> (<pct>%) elapsedMs=<n>          <- every ~5% of tiles, >=2 s apart
 NavMesh: v2: async build finished on the background thread.
 NavMesh: v2: perf: ticksDuringBuild=<n> maxTickMs=<n>                      <- editor stayed alive during the build
-NavMesh: v2: perf: clickToDoneMs=<n> sampleMs=<n> buildMs=<n> writeMs=<n> importMs=<n>
+NavMesh: v2: perf: clickToDoneMs=<n> sampleMs=<n> assetsMs=<n> buildMs=<n> writeMs=<n> importMs=<n>
 NavMesh: v2: perf: postImportTickMs min=<a> avg=<b> max=<c> over 30 ticks  <- viewport cost of the new mesh
 ```
 
 - `ticksDuringBuild` / `maxTickMs` - editor ticks observed while the build ran and the slowest frame; evidence
   the UI stayed responsive. The frame time is the wall-clock gap between `OnEditorTick` calls (not the engine
   `dt`), so a real hitch shows up.
-- `clickToDoneMs` - button press to import done; `sampleMs` is the terrain read, `buildMs` the background
-  build, `writeMs` the `.bin` write and `importMs` the native import.
+- `clickToDoneMs` - button press to import done; `sampleMs` is the terrain read, `assetsMs` the asset scan,
+  `buildMs` the background build, `writeMs` the `.bin` write and `importMs` the native import.
 - `postImportTickMs` - the editor frame time sampled over the 30 ticks right after the import; this is the
   first viewport-render measurement of a large imported navmesh (the `timings:` line excludes it).
 
@@ -353,13 +361,66 @@ fewer boundary slivers). On the harness hill scene the tight-face count (min edg
 fidelity budget unchanged. Raise `NavMeshVoxelDetailSampleDist` up to ~2x the smallest polygon extent for
 fewer faces; go beyond that and Recast skips interior sampling (the detail mesh degenerates to the fan).
 
+### Assets (structures)
+
+With `NavMeshVoxelIncludeAssets = true` (the default) the v2 core ingests **static asset collision geometry**
+so buildings, stairs, decks and bridges over terrain become navigable, not just the ground. The geometry is
+read on the **main thread** (`SceneCollisionGeometry.Collect`) as engine-space world triangles and handed to
+the background build as plain `float[]`/`int[]`, then mixed into the same Recast-space soup as the terrain
+before a single tiled voxel build - so terrain and structures voxelize and weld together (a stair connects to
+the ground; a deck connects to the banks it spans).
+
+**Include/exclude policy** (classified by `BodyFlags | PhysicsDescBodyFlag` + `GetMobility()`, never by prefab
+name):
+
+| Geometry | Default | Why |
+|---|---|---|
+| Static structure collision (walls, floors, stairs, decks, bridges) | **included** | This is the point of the phase: these become walkable. |
+| `HasSteps` stairs | included | Voxelized like any floor; steps <= agent climb are traversable. |
+| Dynamic / movable props (`Dynamic`/`Moveable`, dynamic mobility, dynamic rigid body) | included (`NavMeshVoxelIncludeDynamic`) | Captured at their placed pose - e.g. Birtu's merlons are static-in-practice props. Set false for static-only. |
+| Flora (`BodyOwnerFlora`) | **excluded** (`NavMeshVoxelIncludeFlora = false`) | Usually visual; many small shapes add faces without being reliably navigable. |
+| Barriers (`Barrier` / `Barrier3D`) | excluded | Invisible blocker volumes; walkable faces must not sit on them. |
+| Ladders (`Ladder`) | excluded | Not a walkable surface; the engine handles ladders separately. |
+| Terrain-owner bodies (`BodyOwnerTerrain`) | excluded | The terrain is already meshed from the heightfield; reading it again would double up. |
+| Non-physics / empty / no-shape entities | excluded | Nothing to voxelize. |
+
+Per-shape triangle reads are capped at 200k with a `assets: WARNING shape '...' capped at ...` line; entity and
+shape access is per-entity `try/catch`, so one bad entity (logged, counted under `exceptions`) never aborts the
+collection.
+
+**Height offset mechanics.** `NavMeshHeightOffsetMeters` (+0.5 m) is a **single uniform lift applied to the
+whole merged mesh** - terrain and structures alike. It exists so the navmesh sits just above the collision
+surface rather than intersecting it: if the navmesh cut through the terrain/assets, units would lose the mesh
+and get confused. `VoxelNavMeshGenerator` therefore mixes the terrain soup and the asset soup untouched, and
+the builder's one offset lifts both. `TiledNavMeshBuilder.BuildCombinedSoup` **reverses asset triangle
+winding**, because the engine (Z-up) -> Recast (Y-up) axis swap is orientation-reversing: without it every
+engine-up floor would get a Recast-down normal and be rejected by the slope filter. The offset is adjustable
+(`0` = as close to the surface as the voxel lattice allows). Terrain-only scenes skip the mixer entirely, so
+their output is byte-identical to before (harness `RESULT: DETERMINISM PASS`, unchanged hashes).
+
+**Caveats.**
+
+- **Small isolated surfaces are pruned.** Recast discards walkable regions smaller than `RegionMinSize^2`
+  cells (default `8` -> 64 cells ~= 16 m^2 at `NavMeshVoxelCellSize = 0.5`), *after* agent-radius erosion, so
+  an isolated platform only survives once its walkable core reaches ~64 cells - measured: a 4x4 m platform
+  keeps only 25-35 cells after erosion and is pruned, and an isolated square needs to be ~6x6 m to survive.
+  Surfaces that connect to larger navmesh (the usual in-scene case: a deck bridges two banks, stairs reach
+  the ground) are unaffected. The harness asserts both behaviours and the exact survival floor.
+- **Asset fidelity** is `NavMeshMaxErrorMeters`-bounded like the terrain, plus the same uniform
+  `NavMeshHeightOffsetMeters` lift and the detail phase's upstream `+ch` nudge; the whole mesh is lifted
+  together, so structures do not sit lower than the terrain around them.
+
 ### How to read the v2 log lines
 
 Every run also logs the terrain read (see above), then the voxel core:
 
 ```
 NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
-NavMesh: v2: soup verts=... tris=... stride=... spacing=...m
+NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=..] tris=... cappedShapes=... scanMs=...
+NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
+NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 10 by triangle count)
+NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted uniformly by +0.5m)
+NavMesh: v2: soup verts=... tris=... (terrain only) stride=... spacing=...m      <- only when NavMeshVoxelIncludeAssets=false or no assets found
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
 NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
 NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=True detSampleDist=2m contourSimpErr=1.3vox
@@ -375,6 +436,12 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
 
 - `v2: tris input=... culledByAabb=...` - input triangles, ones outside every tile, and the number actually
   rasterized (higher than `input` near tile borders because each tile sees its neighbours' geometry).
+- `assets: ...` (main thread, before the build) - the collision-geometry scan: entity/physics/included counts,
+  the per-reason exclusion counts, total triangles, any capped shapes and the scan time (`scanMs`); plus a
+  name-heuristic kind histogram and the ten largest shapes. `assetsMs` on the perf/`done:` lines is the same
+  scan's wall time.
+- `v2: soup terrain=... + assets=...` - the merged Recast-space soup size; the uniform lift applied to the
+  whole mesh (`NavMeshHeightOffsetMeters`) is stated in the line.
 - `v2: tiles=... built=... failed=...` - failed tiles are also logged individually as `v2: FAILED tile#...`
   with the first exception message; they are never silently dropped.
 - `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.

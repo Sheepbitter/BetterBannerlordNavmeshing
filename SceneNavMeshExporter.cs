@@ -57,6 +57,13 @@ namespace BetterBannerlordNavmeshing
         // remaining boundary slivers on boundary-rich maps at no fidelity cost.
         public float NavMeshVoxelContourMaxError = 1.3f;
 
+        // Phase 3: ingest static asset collision geometry (interiors, stairs, decks, bridges over
+        // terrain) into the v2 voxel core. Assets land flush on their true geometry; the terrain
+        // keeps its z-fighting lift. Dynamic props (e.g. merlons) and flora are toggled separately.
+        public bool NavMeshVoxelIncludeAssets = true;
+        public bool NavMeshVoxelIncludeDynamic = true;
+        public bool NavMeshVoxelIncludeFlora = false;
+
         // Run the v2 voxel build on a background thread so the editor UI stays alive during the
         // 3-60 s builds. Only the pure-managed voxel build runs off-thread; the terrain read and the
         // bin write + native import stay on the editor main thread (scene access must be there).
@@ -102,6 +109,9 @@ namespace BetterBannerlordNavmeshing
             public TerrainNavMeshBuilder.Settings Settings;
             public TiledNavMeshBuilder.TiledNavMeshSettings Voxel;
             public float AgentClimbMeters;
+            public float[] AssetVertsEngineXyz;
+            public int[] AssetTris;
+            public long AssetsMs;
             public int FacesBefore;
             public long SampleMs;
             public string PrefabNameOverride;
@@ -301,7 +311,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshClearExistingFaces, NavMeshImportIntoScene,
                 NavMeshWriteLogFile, NavMeshLogFolder,
                 NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters,
-                NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError);
+                NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError,
+                NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -321,7 +332,8 @@ namespace BetterBannerlordNavmeshing
             string logFolder)
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
-                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f);
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
+                true, true, false);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -340,7 +352,10 @@ namespace BetterBannerlordNavmeshing
             float voxelAgentClimbMeters,
             bool voxelDetailMesh,
             float voxelDetailSampleDist,
-            float voxelContourMaxError)
+            float voxelContourMaxError,
+            bool voxelIncludeAssets,
+            bool voxelIncludeDynamic,
+            bool voxelIncludeFlora)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -376,6 +391,9 @@ namespace BetterBannerlordNavmeshing
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
+                    + " includeAssets=" + voxelIncludeAssets
+                    + " includeDynamic=" + voxelIncludeDynamic
+                    + " includeFlora=" + voxelIncludeFlora
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -391,6 +409,7 @@ namespace BetterBannerlordNavmeshing
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
 
                 TerrainNavMeshGenerator.ExportResult result;
+                long assetsMs = 0;
                 if (useVoxelCore)
                 {
                     // v2 tiled voxel pipeline. The write-bin + import + verify
@@ -405,10 +424,22 @@ namespace BetterBannerlordNavmeshing
                     voxel.DetailSampleDistMeters = voxelDetailSampleDist;
                     voxel.ContourMaxErrorVoxels = voxelContourMaxError;
 
+                    float[] assetVerts = null;
+                    int[] assetTris = null;
+                    if (voxelIncludeAssets)
+                    {
+                        SceneCollisionGeometry.AssetTriangles assets =
+                            SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora, log);
+                        assetVerts = assets.VertsXyz;
+                        assetTris = assets.Tris;
+                        assetsMs = assets.ScanMs;
+                    }
+
                     long voxelBuildMs;
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
-                        voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount, log,
+                        voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
+                        assetVerts, assetTris, log,
                         out voxelBuildMs);
 
                     if (voxelMesh == null)
@@ -460,6 +491,7 @@ namespace BetterBannerlordNavmeshing
                 }
 
                 log("done: totalMs=" + runWatch.ElapsedMilliseconds
+                    + " assetsMs=" + assetsMs
                     + " bin=" + result.BinByteCount
                     + " V=" + result.VertexCount
                     + " E=" + result.EdgeCount
@@ -525,6 +557,9 @@ namespace BetterBannerlordNavmeshing
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
+                    + " includeAssets=" + NavMeshVoxelIncludeAssets
+                    + " includeDynamic=" + NavMeshVoxelIncludeDynamic
+                    + " includeFlora=" + NavMeshVoxelIncludeFlora
                     + " asyncBuild=True"
                     + " writeLogFile=" + NavMeshWriteLogFile
                     + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
@@ -539,6 +574,26 @@ namespace BetterBannerlordNavmeshing
                 log("grid ready: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m fallback=" + grid.UsedPointFallback
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
+
+                // Phase 3: asset collision geometry is read on the main thread (scene access) and
+                // carried as plain arrays to the background build.
+                long assetsMs = 0;
+                float[] assetVerts = null;
+                int[] assetTris = null;
+                if (NavMeshVoxelIncludeAssets)
+                {
+                    var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
+                    SceneCollisionGeometry.AssetTriangles assets =
+                        SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, log);
+                    assetsWatch.Stop();
+                    assetVerts = assets.VertsXyz;
+                    assetTris = assets.Tris;
+                    assetsMs = assetsWatch.ElapsedMilliseconds;
+                }
+                else
+                {
+                    log("assets: collection disabled (NavMeshVoxelIncludeAssets=false).");
+                }
 
                 var voxel = new TiledNavMeshBuilder.TiledNavMeshSettings();
                 voxel.TileWorldSizeMeters = settings.CoarsestSpacingMeters;
@@ -559,6 +614,9 @@ namespace BetterBannerlordNavmeshing
                 req.Settings = settings;
                 req.Voxel = voxel;
                 req.AgentClimbMeters = NavMeshVoxelAgentClimbMeters;
+                req.AssetVertsEngineXyz = assetVerts;
+                req.AssetTris = assetTris;
+                req.AssetsMs = assetsMs;
                 req.FacesBefore = facesBeforeRun;
                 req.SampleMs = sampleWatch.ElapsedMilliseconds;
                 req.PrefabNameOverride = NavMeshPrefabName;
@@ -599,6 +657,7 @@ namespace BetterBannerlordNavmeshing
                 req.Mesh = VoxelNavMeshGenerator.BuildExportMesh(
                     req.GridHeights, req.GridWidth, req.GridHeight, req.GridSpacing, req.Settings.SampleStride,
                     req.Voxel, req.Settings.WriteObj, req.AgentClimbMeters, Environment.ProcessorCount,
+                    req.AssetVertsEngineXyz, req.AssetTris,
                     req.Log, out buildMs);
                 req.BuildMs = buildMs;
             }
@@ -648,6 +707,7 @@ namespace BetterBannerlordNavmeshing
 
                 log("v2: perf: clickToDoneMs=" + req.RunWatch.ElapsedMilliseconds
                     + " sampleMs=" + req.SampleMs
+                    + " assetsMs=" + req.AssetsMs
                     + " buildMs=" + req.BuildMs
                     + " writeMs=" + result.WriteMs
                     + " importMs=" + result.ImportMs);

@@ -223,6 +223,49 @@ namespace BetterBannerlordNavmeshing
             }
         }
 
+        // Appends engine-space (Z-up) asset triangles to a Recast Y-up terrain soup. Asset
+        // vertices are mapped engine (x,y,z) -> Recast (x, z, y) like BuildTerrainSoup, and each
+        // asset triangle's winding is reversed because that axis swap is orientation-reversing
+        // (without the reversal every engine-up floor would get a Recast-down normal and be
+        // rejected by the slope filter). No height compensation is applied here: the merged soup is
+        // lifted uniformly later by HeightOffsetMeters, so terrain AND structures share the same
+        // anti-intersection offset (a navmesh that intersected the terrain/assets would make units
+        // lose the mesh).
+        public static void BuildCombinedSoup(float[] terrainVertsXyz, int[] terrainTris,
+            float[] assetVertsEngineXyz, int[] assetTris,
+            out float[] vertsXyz, out int[] tris)
+        {
+            int tv = terrainVertsXyz != null ? terrainVertsXyz.Length / 3 : 0;
+            int tt = terrainTris != null ? terrainTris.Length / 3 : 0;
+            int av = assetVertsEngineXyz != null ? assetVertsEngineXyz.Length / 3 : 0;
+            int at = assetTris != null ? assetTris.Length / 3 : 0;
+
+            vertsXyz = new float[(tv + av) * 3];
+            if (tv > 0)
+                Array.Copy(terrainVertsXyz, 0, vertsXyz, 0, tv * 3);
+            for (int i = 0; i < av; i++)
+            {
+                int s = i * 3;
+                int d = (tv + i) * 3;
+                vertsXyz[d + 0] = assetVertsEngineXyz[s + 0];                 // engine X -> Recast X
+                vertsXyz[d + 1] = assetVertsEngineXyz[s + 2];                 // engine Z -> Recast Y (height)
+                vertsXyz[d + 2] = assetVertsEngineXyz[s + 1];                 // engine Y -> Recast Z
+            }
+
+            tris = new int[(tt + at) * 3];
+            if (tt > 0)
+                Array.Copy(terrainTris, 0, tris, 0, tt * 3);
+            for (int i = 0; i < at; i++)
+            {
+                int s = i * 3;
+                int d = (tt + i) * 3;
+                // Reversed winding (see comment above): (b, b+2, b+1).
+                tris[d + 0] = assetTris[s + 0] + tv;
+                tris[d + 1] = assetTris[s + 2] + tv;
+                tris[d + 2] = assetTris[s + 1] + tv;
+            }
+        }
+
         private static int[] BuildSampleAxis(int count, int stride)
         {
             int samples = (count - 1) / stride + 1;

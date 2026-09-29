@@ -156,14 +156,15 @@ totals, `GetBodyShape` validity (incl. batched statics), `GetTriangle` coordinat
 validated against Phase 0 output on the same scenes. Kickoff decision: vendor the DotRecast source subset +
 C# 7.3 backport (`docs/dotrecast-evaluation.md`).
 
-**Status 2026-09-29.** Terrain-only v2 validated in-editor (Birtu + Na'ilu): detail mesh on by default (hill
-chording fixed), hard mesh-invariant gate (no poisoned bins/imports), native import works and is fast
-(linear ~1.0–1.4 M faces/s; see `docs/import-performance-investigation.md`). Open items: (1) detail-mesh
-sliver/tight-face density around interior breaks and the outer perimeter — measurement + knob tuning in
-flight (`sampleDist`/simplification/edge length; sliver cleanup only if needed); (2) output floats up to
-~1 m on steep ground (voxel envelope bias; height-snap post-pass if visible in-editor); (3) generation runs
-synchronously on the editor main thread — off-main-thread + per-phase instrumentation queued from the perf
-report; then Phase 3 (asset collision triangles).
+**Status 2026-09-29.** Terrain-only v2 validated in-editor (Birtu + Na'ilu); detail mesh on by default;
+hard mesh-invariant gate; native import fast (`docs/import-performance-investigation.md`). Closed the same
+day: sliver/tight-face density (`sampleDist` 2 m, contour error 1.3 vox), off-main-thread build + perf
+instrumentation, new defaults (stride 2, slope 50, voxel core on). **Phase 3 (asset collision ingestion)
+landed:** entity classifier + combined terrain/asset soup, uniform +0.5 m anti-intersection lift across
+terrain and assets, asset winding fix; harness multi-level tests (platform/room/stairs/bridge over a gully)
+pass. Open: isolated walkable islands under ~16 m² are pruned by the region minimum (connected structures
+unaffected); the detail mesh can carry locally steeper faces than the poly skeleton; height-snap for steep
+terrain remains a candidate if it shows in-editor; in-editor validation of structures (Birtu) pending.
 
 **Phase 3 — Assets.** Collision triangles with BVH culling; flora excluded, dynamic skipped or static-snapped;
 buildings block by absence of faces, walkable to agent-radius edges; stairs via `HasSteps` + climb.
