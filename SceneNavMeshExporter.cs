@@ -110,6 +110,21 @@ namespace BetterBannerlordNavmeshing
         // in the log names the culprit entity/body. Cheap enough to leave off in normal runs.
         public bool NavMeshVoxelAssetTrace = false;
 
+        // Ramp synthesis for stepped / ladder props (v2 voxel core only, DEFAULT OFF).
+        //
+        // When on: a prop whose body carries HasSteps or Ladder (Birtu: 84 + 2 entities) gets a
+        // synthesized walkable ramp - a chain of <= 1 m-rise quads through the flight's height-layer
+        // anchors, with flat aprons at both ends - appended to the soup and marked walkable even when
+        // its slope exceeds MaxSlopeDegrees. Thin wooden flights are otherwise swallowed by
+        // voxelization. See SteppedPropRamps and the README "Stairs & ladders".
+        //
+        // Why the default is off: the offline validation on the recorded Birtu snapshot found the ramps
+        // 60-93% covered and the mesh within 4 faces of the no-ramp build (so it is SAFE), but the
+        // synthetic ladder cases (harness Test 23) do NOT yet connect a steep ladder's two floors, and
+        // 2 of the 6 wooden flight instances lose native coverage while 4 gain. Enable it to iterate on
+        // real scenes, but read that section before making it the default.
+        public bool NavMeshVoxelPropRamps = false;
+
         // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
         // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance
         // (terrain soup vs asset triangles) in the editor or Blender.
@@ -169,6 +184,7 @@ namespace BetterBannerlordNavmeshing
             public float AgentClimbMeters;
             public float[] AssetVertsEngineXyz;
             public int[] AssetTris;
+            public bool[] AssetForceWalkable;
             public bool[] TerrainHoleMask;
             public VoxelNavMeshGenerator.SoupCapture SoupCapture;
             public long AssetsMs;
@@ -393,7 +409,7 @@ namespace BetterBannerlordNavmeshing
                 var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                 SceneCollisionGeometry.AssetGeometry assets = SceneCollisionGeometry.CollectDetailed(
                     scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, NavMeshVoxelAssetTrace,
-                    true, log);
+                    true, NavMeshVoxelPropRamps, log);
                 assetsWatch.Stop();
 
                 var records = new System.Collections.Generic.List<SceneSnapshot.EntityRecord>();
@@ -435,6 +451,7 @@ namespace BetterBannerlordNavmeshing
                     + " stitch=" + NavMeshVoxelStitchMaxGapCells
                     + " prune=" + (NavMeshVoxelPruneIsolatedIslands
                         ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
+                    + " propRamps=" + NavMeshVoxelPropRamps
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
                     + " includeFlora=" + NavMeshVoxelIncludeFlora);
@@ -507,7 +524,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
-                NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands, NavMeshVoxelPruneMaxIslandFaces);
+                NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
+                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelPropRamps);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -528,7 +546,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400);
+                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -559,7 +577,8 @@ namespace BetterBannerlordNavmeshing
             int voxelGapFillCells,
             int voxelStitchMaxGapCells,
             bool voxelPruneIsolatedIslands,
-            int voxelPruneMaxIslandFaces)
+            int voxelPruneMaxIslandFaces,
+            bool voxelPropRamps)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -597,6 +616,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelGapFillCells=" + voxelGapFillCells
                     + " voxelStitchMaxGapCells=" + voxelStitchMaxGapCells
                     + " voxelPrune=" + (voxelPruneIsolatedIslands ? voxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
+                    + " propRamps=" + voxelPropRamps
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
@@ -644,13 +664,15 @@ namespace BetterBannerlordNavmeshing
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
+                    bool[] assetForceWalkable = null;
                     if (voxelIncludeAssets)
                     {
                         SceneCollisionGeometry.AssetTriangles assets =
                             SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
-                                voxelAssetTrace, log);
+                                voxelAssetTrace, voxelPropRamps, log);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
+                        assetForceWalkable = assets.ForceWalkableTris;
                         assetsMs = assets.ScanMs;
                     }
 
@@ -661,7 +683,7 @@ namespace BetterBannerlordNavmeshing
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
-                        assetVerts, assetTris, grid.HoleMask, soupCapture, log,
+                        assetVerts, assetTris, assetForceWalkable, grid.HoleMask, soupCapture, log,
                         out voxelBuildMs);
 
                     if (voxelMesh == null)
@@ -782,6 +804,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelGapFillCells=" + NavMeshVoxelGapFillCells
                     + " voxelStitchMaxGapCells=" + NavMeshVoxelStitchMaxGapCells
                     + " voxelPrune=" + (NavMeshVoxelPruneIsolatedIslands ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
+                    + " propRamps=" + NavMeshVoxelPropRamps
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
@@ -812,15 +835,17 @@ namespace BetterBannerlordNavmeshing
                 long assetsMs = 0;
                 float[] assetVerts = null;
                 int[] assetTris = null;
+                bool[] assetForceWalkable = null;
                 if (NavMeshVoxelIncludeAssets)
                 {
                     var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                     SceneCollisionGeometry.AssetTriangles assets =
                         SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
-                            NavMeshVoxelAssetTrace, log);
+                            NavMeshVoxelAssetTrace, NavMeshVoxelPropRamps, log);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
                     assetTris = assets.Tris;
+                    assetForceWalkable = assets.ForceWalkableTris;
                     assetsMs = assetsWatch.ElapsedMilliseconds;
                 }
                 else
@@ -855,6 +880,7 @@ namespace BetterBannerlordNavmeshing
                 req.AgentClimbMeters = NavMeshVoxelAgentClimbMeters;
                 req.AssetVertsEngineXyz = assetVerts;
                 req.AssetTris = assetTris;
+                req.AssetForceWalkable = assetForceWalkable;
                 req.TerrainHoleMask = grid.HoleMask;
                 req.SoupCapture = NavMeshVoxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
                 req.AssetsMs = assetsMs;
@@ -898,8 +924,8 @@ namespace BetterBannerlordNavmeshing
                 req.Mesh = VoxelNavMeshGenerator.BuildExportMesh(
                     req.GridHeights, req.GridWidth, req.GridHeight, req.GridSpacing, req.Settings.SampleStride,
                     req.Voxel, req.Settings.WriteObj, req.AgentClimbMeters, Environment.ProcessorCount,
-                    req.AssetVertsEngineXyz, req.AssetTris, req.TerrainHoleMask, req.SoupCapture,
-                    req.Log, out buildMs);
+                    req.AssetVertsEngineXyz, req.AssetTris, req.AssetForceWalkable, req.TerrainHoleMask,
+                    req.SoupCapture, req.Log, out buildMs);
                 req.BuildMs = buildMs;
             }
             catch (Exception ex)

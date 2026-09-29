@@ -421,8 +421,12 @@ namespace BetterBannerlordNavmeshing
         // ------------------------------------------------------------------
         // Tiled build
         // ------------------------------------------------------------------
+        // forceWalkableTriangles (optional, same length as the input triangle count): triangles that
+        // must be marked walkable even when their slope exceeds MaxSlopeDegrees. SteppedPropRamps uses
+        // it for synthesized stair/ladder ramps, which are meant to be traversed. Null (the default)
+        // keeps the input byte-for-byte identical to the pre-ramp behaviour.
         public static VoxelMeshResult Build(float[] vertsXyz, int[] tris, TiledNavMeshSettings s,
-            int maxWorkers, Action<string> log)
+            int maxWorkers, Action<string> log, bool[] forceWalkableTriangles = null)
         {
             if (vertsXyz == null)
                 throw new ArgumentNullException("vertsXyz");
@@ -437,6 +441,8 @@ namespace BetterBannerlordNavmeshing
 
             var total = Stopwatch.StartNew();
             int inputTris = tris.Length / 3;
+            if (forceWalkableTriangles != null && forceWalkableTriangles.Length != inputTris)
+                throw new ArgumentException("forceWalkableTriangles length must match the triangle count.");
 
             float cs = s.VoxelCellSizeMeters;
             float ch = s.CellHeightMeters;
@@ -564,6 +570,14 @@ namespace BetterBannerlordNavmeshing
 
             Log(log, "v2: tris input=" + inputTris + " culledByAabb=" + culledByAabb
                 + " rasterized=" + rasterizedTris + " (rasterized counts per-tile border duplicates)");
+            if (forceWalkableTriangles != null)
+            {
+                int forced = 0;
+                for (int i = 0; i < forceWalkableTriangles.Length; i++)
+                    if (forceWalkableTriangles[i]) forced++;
+                Log(log, "v2: forced-walkable tris=" + forced + "/" + inputTris
+                    + " (synthesized stair/ladder ramps; marked walkable regardless of slope)");
+            }
 
             // --- parallel per-tile build ---
             var results = new VoxelTileResult[tileCount];
@@ -587,7 +601,7 @@ namespace BetterBannerlordNavmeshing
                 results[index] = BuildTile(index, tx, ty, vertsXyz, tris, tileTris[index], s,
                     originX, originZ, tileSpan, cellsPerTile, bminY, bmaxY, width, height, border, pad,
                     walkableHeight, walkableClimb, walkableRadius, maxSimplificationError,
-                    minRegionArea, mergeRegionArea, areaMod);
+                    minRegionArea, mergeRegionArea, areaMod, forceWalkableTriangles);
 
                 if (log != null)
                 {
@@ -1558,7 +1572,8 @@ namespace BetterBannerlordNavmeshing
             float originX, float originZ, float tileSpan, int cellsPerTile, float bminY, float bmaxY,
             int width, int height, int border, float pad,
             int walkableHeight, int walkableClimb, int walkableRadius, float maxSimplificationError,
-            int minRegionArea, int mergeRegionArea, RcAreaModification areaMod)
+            int minRegionArea, int mergeRegionArea, RcAreaModification areaMod,
+            bool[] forceWalkableTriangles)
         {
             var r = new VoxelTileResult();
             r.Index = index;
@@ -1605,6 +1620,17 @@ namespace BetterBannerlordNavmeshing
 
                 int[] areaIds = RcRecast.MarkWalkableTriangles(ctx, s.MaxSlopeDegrees, vertsXyz, subTris,
                     assigned, areaMod);
+                if (forceWalkableTriangles != null)
+                {
+                    // Synthesized ramps are walkable by design even when steeper than MaxSlopeDegrees
+                    // (a ladder or a stair is meant to be traversed). Everything else is untouched.
+                    for (int k = 0; k < assigned; k++)
+                    {
+                        int src = tileList[k];
+                        if (src >= 0 && src < forceWalkableTriangles.Length && forceWalkableTriangles[src])
+                            areaIds[k] = RcRecast.RC_WALKABLE_AREA;
+                    }
+                }
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);

@@ -47,6 +47,9 @@ namespace BetterBannerlordNavmeshing
             public int EntitiesIncluded;
             public int ShapesCapped;
             public long ScanMs;
+            // Same length as Tris/3 when any ramp was synthesized; null otherwise. True = the triangle
+            // is a synthesized stair/ladder ramp and must be walkable regardless of its slope.
+            public bool[] ForceWalkableTris;
         }
 
         // Per-entity view of the same collection, for the scene snapshot (offline test case).
@@ -76,6 +79,10 @@ namespace BetterBannerlordNavmeshing
             public int Count, Physics;
             public int ExFlora, ExBarrier, ExTerrain, ExLadder, ExDynamic, ExNoShape, ExEmpty,
                 ExExceptions, ExUnsolid;
+            // Synthesized stair/ladder ramp triangles (SteppedPropRamps); null when none/disabled.
+            public bool[] ForceWalkableTris;
+            public int RampQuads, RampStairs, RampLadders,
+                RampSkippedFlat, RampSkippedSteep, RampSkippedLong, RampCapped;
         }
 
         // An included entity carried from the classification pass to the triangle-read pass.
@@ -92,9 +99,9 @@ namespace BetterBannerlordNavmeshing
         }
 
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
-            System.Action<string> log)
+            bool propRamps, System.Action<string> log)
         {
-            AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, log);
+            AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, propRamps, log);
             var r = new AssetTriangles();
             r.VertsXyz = g.VertsXyz;
             r.Tris = g.Tris;
@@ -103,13 +110,15 @@ namespace BetterBannerlordNavmeshing
             r.EntitiesIncluded = g.EntitiesIncluded;
             r.ShapesCapped = g.ShapesCapped;
             r.ScanMs = g.ScanMs;
+            r.ForceWalkableTris = g.ForceWalkableTris;
             return r;
         }
 
         // recordEntities: also keep each entity's own vertices/indices (scene snapshot). The merged
         // arrays and every policy/counter are identical either way.
+        // propRamps: synthesize a walkable ramp for HasSteps/Ladder props (SteppedPropRamps).
         public static AssetGeometry CollectDetailed(Scene scene, bool includeDynamic, bool includeFlora,
-            bool trace, bool recordEntities, System.Action<string> log)
+            bool trace, bool recordEntities, bool propRamps, System.Action<string> log)
         {
             var result = new AssetGeometry();
             result.VertsXyz = new float[0];
@@ -274,6 +283,14 @@ namespace BetterBannerlordNavmeshing
             var largestName = new List<string>();
             var tri = new Vec3[3];
 
+            // Synthesized stair/ladder ramps (see SteppedPropRamps). They are collected separately and
+            // appended after every real triangle, so the force-walkable mask is a simple true-tail and
+            // a build without ramps produces byte-identical soup to the pre-ramp code.
+            var rampVerts = new List<float>();
+            var rampTris = new List<int>();
+            int rampQuads = 0, rampStairs = 0, rampLadders = 0;
+            int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
+
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -371,6 +388,58 @@ namespace BetterBannerlordNavmeshing
                         result.Entities.Add(rec);
                     }
 
+                    // -------- synthesized ramp for a stepped / ladder prop
+                    if (propRamps && wrote > 0 && SteppedPropRamps.IsSteppedOrLadder(unchecked((int)c.Flags)))
+                    {
+                        var prop = new SteppedPropRamps.Prop();
+                        prop.Name = c.Name;
+                        prop.Flags = unchecked((int)c.Flags);
+                        int propVerts = verts.Count / 3 - firstVert;
+                        prop.VertsXyz = new float[propVerts * 3];
+                        for (int v = 0; v < propVerts; v++)
+                        {
+                            prop.VertsXyz[v * 3 + 0] = verts[(firstVert + v) * 3 + 0];
+                            prop.VertsXyz[v * 3 + 1] = verts[(firstVert + v) * 3 + 1];
+                            prop.VertsXyz[v * 3 + 2] = verts[(firstVert + v) * 3 + 2];
+                        }
+                        prop.Tris = new int[wrote * 3];
+                        for (int t = 0; t < wrote * 3; t++)
+                            prop.Tris[t] = tris[firstTri * 3 + t] - firstVert;
+
+                        SteppedPropRamps.Result ramps = SteppedPropRamps.Synthesize(
+                            new SteppedPropRamps.Prop[] { prop });
+                        rampQuads += ramps.Ramps;
+                        rampStairs += ramps.Stairs;
+                        rampLadders += ramps.Ladders;
+                        rampSkippedFlat += ramps.SkippedFlat;
+                        rampSkippedSteep += ramps.SkippedSteep;
+                        rampSkippedLong += ramps.SkippedLong;
+                        rampCapped += ramps.Capped;
+
+                        if (ramps.Tris.Count > 0)
+                        {
+                            int rampBase = rampVerts.Count / 3;
+                            for (int k = 0; k < ramps.VertsXyz.Count; k++) rampVerts.Add(ramps.VertsXyz[k]);
+                            for (int k = 0; k < ramps.Tris.Count; k++) rampTris.Add(ramps.Tris[k] + rampBase);
+
+                            if (recordEntities)
+                            {
+                                // Kept as its own record: tooling can then tell a prop's real collision
+                                // surface from the synthesized ramp, and a re-run of the snapshot must
+                                // not synthesize a second ramp on top of this one.
+                                var rr = new AssetEntityRecord();
+                                rr.Name = c.Name + SteppedPropRamps.RampNameSuffix;
+                                rr.Flags = (BodyFlags)0;
+                                rr.Mobility = (int)c.Mobility;
+                                rr.TriCount = ramps.Tris.Count / 3;
+                                rr.Capped = false;
+                                rr.VertsXyz = ramps.VertsXyz.ToArray();
+                                rr.Tris = ramps.Tris.ToArray();
+                                result.Entities.Add(rr);
+                            }
+                        }
+                    }
+
                     if (c.IsStairs) cStairs++;
                     else if (IsWall(c.Name)) cWall++;
                     else if (IsFloor(c.Name)) cFloor++;
@@ -389,6 +458,19 @@ namespace BetterBannerlordNavmeshing
             }
 
             watch.Stop();
+            // Ramps are appended after every real triangle, so the mask is a true-tail and a build with
+            // no ramps leaves ForceWalkableTris null (the builder then takes its unchanged path).
+            int realTris = tris.Count / 3;
+            int rampTriCount = rampTris.Count / 3;
+            if (rampTriCount > 0)
+            {
+                int vBase = verts.Count / 3;
+                for (int k = 0; k < rampVerts.Count; k++) verts.Add(rampVerts[k]);
+                for (int k = 0; k < rampTris.Count; k++) tris.Add(rampTris[k] + vBase);
+                var rampMask = new bool[realTris + rampTriCount];
+                for (int k = realTris; k < rampMask.Length; k++) rampMask[k] = true;
+                result.ForceWalkableTris = rampMask;
+            }
             result.VertsXyz = verts.ToArray();
             result.Tris = tris.ToArray();
             result.VertexCount = verts.Count / 3;
@@ -409,6 +491,13 @@ namespace BetterBannerlordNavmeshing
             result.ExEmpty = exEmpty;
             result.ExExceptions = exceptions;
             result.ExUnsolid = exUnsolid;
+            result.RampQuads = rampQuads;
+            result.RampStairs = rampStairs;
+            result.RampLadders = rampLadders;
+            result.RampSkippedFlat = rampSkippedFlat;
+            result.RampSkippedSteep = rampSkippedSteep;
+            result.RampSkippedLong = rampSkippedLong;
+            result.RampCapped = rampCapped;
 
             if (log != null)
             {
@@ -420,6 +509,21 @@ namespace BetterBannerlordNavmeshing
                     + " scanMs=" + result.ScanMs);
                 log("assets: kinds stairs=" + cStairs + " wall=" + cWall + " floor=" + cFloor
                     + " other=" + cOther + " (name heuristic; log only)");
+                if (propRamps)
+                {
+                    log("assets: ramps: synthesized=" + rampQuads + " stairs=" + rampStairs
+                        + " ladders=" + rampLadders + " skipped="
+                        + (rampSkippedFlat + rampSkippedSteep + rampSkippedLong)
+                        + " (walkable-if-steep)");
+                    if (rampSkippedFlat > 0 || rampSkippedSteep > 0 || rampSkippedLong > 0 || rampCapped > 0)
+                        log("assets: ramps: skipped detail flat=" + rampSkippedFlat + " steep="
+                            + rampSkippedSteep + " long=" + rampSkippedLong + " capped=" + rampCapped
+                            + "; " + SteppedPropRamps.Describe());
+                }
+                else
+                {
+                    log("assets: ramps: disabled (NavMeshVoxelPropRamps=false)");
+                }
                 log("assets: largest shapes: " + LargestString(largestTris, largestName));
             }
             return result;

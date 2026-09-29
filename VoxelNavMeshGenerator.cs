@@ -31,7 +31,8 @@ namespace BetterBannerlordNavmeshing
             float[] stitchedHeights, int width, int height, float terrainVertexSpacing, int sampleStride,
             TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj,
             float agentClimbOverrideMeters, int maxWorkers,
-            float[] assetVertsEngineXyz, int[] assetTris, bool[] terrainHoleMask, SoupCapture soupCapture,
+            float[] assetVertsEngineXyz, int[] assetTris, bool[] assetForceWalkable,
+            bool[] terrainHoleMask, SoupCapture soupCapture,
             System.Action<string> log, out long buildMs)
         {
             if (log != null)
@@ -124,7 +125,8 @@ namespace BetterBannerlordNavmeshing
             }
 
             TiledNavMeshBuilder.VoxelMeshResult vres =
-                TiledNavMeshBuilder.Build(vertsXyz, tris, voxelSettings, maxWorkers, log);
+                TiledNavMeshBuilder.Build(vertsXyz, tris, voxelSettings, maxWorkers, log,
+                    BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetForceWalkable));
 
             watch.Stop();
             buildMs = watch.ElapsedMilliseconds;
@@ -185,6 +187,26 @@ namespace BetterBannerlordNavmeshing
                     + " buildMs=" + buildMs);
 
             return result;
+        }
+
+        // The ramps' force-walkable mask arrives aligned with the asset triangles; BuildCombinedSoup
+        // appends the assets after the terrain triangles in order, so the mask is shifted by the
+        // terrain triangle count. Null when nothing was synthesized (the builder then takes its
+        // unchanged path).
+        private static bool[] BuildCombinedForceMask(int terrainTris, int assetTris, bool[] assetForce)
+        {
+            if (assetForce == null || assetTris <= 0)
+                return null;
+            int n = terrainTris + assetTris;
+            var mask = new bool[n];
+            bool any = false;
+            for (int i = 0; i < assetTris && i < assetForce.Length; i++)
+            {
+                if (!assetForce[i]) continue;
+                mask[terrainTris + i] = true;
+                any = true;
+            }
+            return any ? mask : null;
         }
 
         // Same OBJ layout as the v1 mesher (debug view; engine Z-up).

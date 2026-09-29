@@ -49,6 +49,10 @@ namespace BetterBannerlordNavmeshing
             public bool Capped;
             public float[] VertsXyz;   // 3 per vertex, engine Z-up
             public int[] Tris;         // 3 per triangle, 0-based into VertsXyz
+            // In-memory only (never serialized): how many of TriCount's triangles are synthesized
+            // SteppedPropRamps ramp quads (always the LAST ones). Set by the snapshot dump path via
+            // SceneCollisionGeometry, and by the harness when it synthesizes ramps itself.
+            public int RampTris;
         }
 
         public sealed class TerrainData
