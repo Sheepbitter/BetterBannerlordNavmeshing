@@ -46,6 +46,17 @@ namespace BetterBannerlordNavmeshing
         // NavMeshMaxErrorMeters. Disable for a leaner bin (flat/plateau scenes only).
         public bool NavMeshVoxelDetailMesh = true;
 
+        // v2 detail-mesh sampling distance (m). 0 = auto (max(0.9, cellSize)). Default 2.0 m: the
+        // harness sweep shows it removes the tight/sliver faces Recast's detail edge tessellation
+        // makes along walkable boundaries, with no fidelity loss. Lower it for more surface detail
+        // (more faces); raise it (up to ~2*minPolyExtent) for fewer faces.
+        public float NavMeshVoxelDetailSampleDist = 2.0f;
+
+        // v2 contour simplification error (voxels). 0 = auto (NavMeshMaxErrorMeters / cellSize).
+        // Default 1.3 vox (the plan's value): a simpler walkable boundary removes most of the
+        // remaining boundary slivers on boundary-rich maps at no fidelity cost.
+        public float NavMeshVoxelContourMaxError = 1.3f;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -214,7 +225,7 @@ namespace BetterBannerlordNavmeshing
                 NavMeshClearExistingFaces, NavMeshImportIntoScene,
                 NavMeshWriteLogFile, NavMeshLogFolder,
                 NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters,
-                NavMeshVoxelDetailMesh);
+                NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -234,7 +245,7 @@ namespace BetterBannerlordNavmeshing
             string logFolder)
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
-                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true);
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -251,7 +262,9 @@ namespace BetterBannerlordNavmeshing
             bool useVoxelCore,
             float voxelCellSizeMeters,
             float voxelAgentClimbMeters,
-            bool voxelDetailMesh)
+            bool voxelDetailMesh,
+            float voxelDetailSampleDist,
+            float voxelContourMaxError)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -285,6 +298,8 @@ namespace BetterBannerlordNavmeshing
                     + " voxelCellSize=" + F(voxelCellSizeMeters) + "m"
                     + " voxelAgentClimb=" + F(voxelAgentClimbMeters) + "m"
                     + " detail=" + voxelDetailMesh
+                    + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
+                    + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -311,6 +326,8 @@ namespace BetterBannerlordNavmeshing
                     voxel.MaxErrorMeters = settings.MaxErrorMeters;
                     voxel.HeightOffsetMeters = settings.HeightOffsetMeters;
                     voxel.UseDetailMesh = voxelDetailMesh;
+                    voxel.DetailSampleDistMeters = voxelDetailSampleDist;
+                    voxel.ContourMaxErrorVoxels = voxelContourMaxError;
 
                     long voxelBuildMs;
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(

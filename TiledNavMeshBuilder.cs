@@ -81,6 +81,20 @@ namespace BetterBannerlordNavmeshing
             // them; it must stay well below the smallest real stacked-surface separation (6.7 cm in
             // probe data) so distinct levels are never merged.
             public float DetailWeldToleranceMeters = 0.01f;
+
+            // Detail-mesh sampling distance (m). >0 is used directly; 0 falls back to max(0.9, cs).
+            // Default 2.0 m: the sweep shows it collapses the tight/sliver population along
+            // walkable boundaries (hill 31 -> 1 slivers) while staying inside the fidelity budget.
+            // Larger values tessellate edges into fewer samples but lose interior refinement; at a
+            // value >= 2*minPolyExtent Recast skips interior sampling entirely (detail -> fan).
+            public float DetailSampleDistMeters = 2.0f;
+
+            // Contour simplification error (voxels). >0 is used directly; 0 falls back to
+            // MaxErrorMeters / cs (0.5 vox at the defaults). Default 1.3 vox (the plan's value):
+            // a simpler walkable boundary removes the tight/sliver faces that Recast's detail edge
+            // tessellation makes at every boundary vertex on boundary-rich maps, with no fidelity
+            // change (contour error is separate from the surface error budget).
+            public float ContourMaxErrorVoxels = 1.3f;
         }
 
         public sealed class VoxelTileResult
@@ -312,7 +326,7 @@ namespace BetterBannerlordNavmeshing
             int walkableHeight = (int)Math.Ceiling(s.AgentHeightMeters / ch);
             int walkableClimb = (int)Math.Floor(s.AgentMaxClimbMeters / ch + 1e-4f);
             int walkableRadius = (int)Math.Ceiling(s.AgentRadiusMeters / cs);
-            float maxSimplificationError = s.MaxErrorMeters / cs;
+            float maxSimplificationError = EffectiveContourMaxError(s);
             int minRegionArea = s.RegionMinSize * s.RegionMinSize;
             int mergeRegionArea = s.RegionMergeSize * s.RegionMergeSize;
             var areaMod = new RcAreaModification(RcRecast.RC_WALKABLE_AREA);
@@ -332,9 +346,11 @@ namespace BetterBannerlordNavmeshing
                 + "m walkable(r,h,c)=" + walkableRadius + "/" + walkableHeight + "/" + walkableClimb
                 + " edgeLen=" + s.MaxEdgeLenVoxels + "vox vpp=" + s.VertsPerPoly
                 + " regionMin=" + s.RegionMinSize + " regionMerge=" + s.RegionMergeSize
-                + " detail=" + s.UseDetailMesh);
-            Log(log, "v2: contour maxError=" + F(maxSimplificationError) + "vox (= " + F(s.MaxErrorMeters)
-                + "m at cs=" + F(cs) + "m); plan's ~1.3vox heuristic not used, metre budget honoured");
+                + " detail=" + s.UseDetailMesh
+                + " detSampleDist=" + F(EffectiveDetailSampleDist(s)) + "m"
+                + " contourSimpErr=" + F(EffectiveContourMaxError(s)) + "vox");
+            Log(log, "v2: contour maxError=" + F(maxSimplificationError) + "vox (= " + F(maxSimplificationError * cs)
+                + "m at cs=" + F(cs) + "m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)");
             Log(log, "v2: workers=" + workers + " (requested " + requestedWorkers + ", tileCount=" + tileCount + ")");
 
             // --- bin input triangles into tiles (padded AABB overlap) ---
@@ -910,7 +926,7 @@ namespace BetterBannerlordNavmeshing
         private static void BuildDetailOutput(VoxelTileResult r, RcPolyMesh pmesh, RcCompactHeightfield chf,
             RcContext ctx, TiledNavMeshSettings s)
         {
-            float sampleDist = Math.Max(0.9f, s.VoxelCellSizeMeters);
+            float sampleDist = EffectiveDetailSampleDist(s);
             RcPolyMeshDetail dmesh = RcMeshDetails.BuildPolyMeshDetail(ctx, pmesh, chf, sampleDist, s.MaxErrorMeters);
             if (CaptureDetailDebug && DebugDetailMesh == null)
                 DebugDetailMesh = dmesh;
@@ -1271,6 +1287,18 @@ namespace BetterBannerlordNavmeshing
             if (ch <= 0f)
                 return 0;
             return (int)Math.Floor(climbMeters / ch + 1e-4f);
+        }
+
+        // Effective detail-mesh sampling distance (m): explicit override, else max(0.9, cs).
+        public static float EffectiveDetailSampleDist(TiledNavMeshSettings s)
+        {
+            return s.DetailSampleDistMeters > 0f ? s.DetailSampleDistMeters : Math.Max(0.9f, s.VoxelCellSizeMeters);
+        }
+
+        // Effective contour simplification error (voxels): explicit override, else MaxErrorMeters/cs.
+        public static float EffectiveContourMaxError(TiledNavMeshSettings s)
+        {
+            return s.ContourMaxErrorVoxels > 0f ? s.ContourMaxErrorVoxels : s.MaxErrorMeters / s.VoxelCellSizeMeters;
         }
 
         private static void Log(Action<string> log, string message)

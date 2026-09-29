@@ -261,6 +261,8 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
+| `NavMeshVoxelDetailSampleDist` | `2` | v2 detail-mesh sampling distance (m). `0` = auto (`max(0.9, cellSize)`). The default cuts the tight/sliver faces Recast's detail edge tessellation makes along walkable boundaries. Lower = more surface detail (more faces). |
+| `NavMeshVoxelContourMaxError` | `1.3` | v2 contour simplification error (voxels). `0` = auto (`NavMeshMaxErrorMeters / cellSize`, i.e. 0.5). A simpler walkable boundary removes most remaining boundary slivers on boundary-rich maps, with no change to the surface-error budget. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
@@ -281,10 +283,11 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   built on a bounded worker pool (`Parallel.For`, `MaxDegreeOfParallelism = #processors`), then merged in
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
 - **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
-  (0.25 m -> contour simplification `0.25/cs` voxels and the detail-mesh tolerance), `NavMeshCoarsestSpacing`
-  (tile size), `NavMeshHeightOffsetMeters`, `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh`
-  (default true). Agent radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting
-  is actually walkable (see below).
+  (0.25 m -> detail-mesh tolerance), `NavMeshCoarsestSpacing` (tile size), `NavMeshHeightOffsetMeters`,
+  `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh` (default true),
+  `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox). Agent
+  radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually
+  walkable (see below).
 
 ### Detail mesh (on by default)
 
@@ -296,6 +299,16 @@ can be turned off (`NavMeshVoxelDetailMesh = false`) for flat/plateau scenes; on
 keeps the mesh on the ground. Detail vertices are seam-welded across tiles/polys deterministically (see
 `TiledNavMeshBuilder.MergeDetailTiles`).
 
+**Sliver reduction.** Recast's detail phase tessellates every polygon edge and adds an interior sample grid,
+which historically produced a large population of very thin (sliver) faces concentrated along walkable-area
+boundaries and terrain breaks. Two knobs cut that population by ~5-30x with no fidelity change:
+`NavMeshVoxelDetailSampleDist` (default 2 m) coarsens the edge/interior sampling, and
+`NavMeshVoxelContourMaxError` (default 1.3 vox) simplifies the walkable boundary (fewer boundary vertices ->
+fewer boundary slivers). On the harness hill scene the tight-face count (min edge < 0.25 m) and slivers
+(min angle < 5 deg) fall from 0/31 to 0/1, and on a boundary-rich box scene from 56/244 to 0/31, with the
+fidelity budget unchanged. Raise `NavMeshVoxelDetailSampleDist` up to ~2x the smallest polygon extent for
+fewer faces; go beyond that and Recast skips interior sampling (the detail mesh degenerates to the fan).
+
 ### How to read the v2 log lines
 
 Every run also logs the terrain read (see above), then the voxel core:
@@ -305,8 +318,8 @@ NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
 NavMesh: v2: soup verts=... tris=... stride=... spacing=...m
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
 NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
-NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=True
-NavMesh: v2: contour maxError=0.5vox (= 0.25m at cs=0.5m); plan's ~1.3vox heuristic not used, metre budget honoured
+NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=True detSampleDist=2m contourSimpErr=1.3vox
+NavMesh: v2: contour maxError=1.3vox (= 0.65m at cs=0.5m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
 NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
