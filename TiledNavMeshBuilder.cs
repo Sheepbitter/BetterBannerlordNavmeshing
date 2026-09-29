@@ -27,6 +27,11 @@ namespace BetterBannerlordNavmeshing
     // serializing with Nmg8Writer.
     public static class TiledNavMeshBuilder
     {
+        // Harness-only hook: when true the raw RcPolyMeshDetail of the first detail tile is kept in
+        // DebugDetailMesh so a test can inspect the per-submesh index space. Never set in production.
+        public static bool CaptureDetailDebug;
+        public static RcPolyMeshDetail DebugDetailMesh;
+
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -131,6 +136,16 @@ namespace BetterBannerlordNavmeshing
             public string ObjText;  // null unless requested
             public float MinZ;
             public float MaxZ;
+
+            // Topology invariants (computed after merge). When InvariantsPassed is false the mesh
+            // must NOT be written or imported.
+            public bool InvariantsPassed;
+            public int UniqueEdges;
+            public int BoundaryEdges;
+            public int MaxEdgeMultiplicity;
+            public int DuplicateFaces;
+            public int SelfLoops;
+            public int RequiredEdges;   // (3*faces + boundary) / 2
         }
 
         // ------------------------------------------------------------------
@@ -431,6 +446,13 @@ namespace BetterBannerlordNavmeshing
                 : MergeFanTiles(results, tilesX, tilesZ);
             mergeWatch.Stop();
 
+            // Deterministic repair: Recast's per-tile detail tessellation can emit a few
+            // non-manifold fans at tile corners (upstream; its delaunayHull even logs "Removing
+            // dangling face"). Remove the surplus faces so every edge is shared by <= 2 faces.
+            int nonManifoldRepaired = RepairNonManifold(merged);
+            if (nonManifoldRepaired > 0)
+                Log(log, "v2: repaired mesh: removed " + nonManifoldRepaired + " non-manifold faces");
+
             int mergedVertices = merged.X.Count;
             var result = new VoxelMeshResult();
             result.VertexCount = mergedVertices;
@@ -461,12 +483,21 @@ namespace BetterBannerlordNavmeshing
             }
             result.Tris = merged.Tris.ToArray();
 
-            // --- topology count ---
-            result.EdgeCount = CountUniqueEdges(result.Tris, result.FaceCount);
+            // --- topology + invariants (gate) ---
+            ComputeInvariants(result, result.Tris, result.FaceCount);
 
             Log(log, "v2: weld verts=" + SumTileVertices(results) + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
                 + " degenerate=" + merged.Degenerate + " (weldMerged=" + result.WeldMergedVertices + ")");
+            Log(log, "v2: invariants: faces=" + result.FaceCount + " edges=" + result.EdgeCount
+                + " boundary=" + result.BoundaryEdges + " maxEdgeMult=" + result.MaxEdgeMultiplicity
+                + " dupFaces=" + result.DuplicateFaces + " selfLoops=" + result.SelfLoops
+                + " minEdges=" + result.RequiredEdges + " -> " + (result.InvariantsPassed ? "PASS" : "FAIL"));
+            if (!result.InvariantsPassed)
+                Log(log, "v2: ERROR mesh invariants failed: maxEdgeMult=" + result.MaxEdgeMultiplicity
+                    + " dupFaces=" + result.DuplicateFaces + " selfLoops=" + result.SelfLoops
+                    + " edges=" + result.EdgeCount + " required=" + result.RequiredEdges
+                    + "; mesh is non-manifold/duplicated and must not be imported");
 
             total.Stop();
             result.TotalMs = total.ElapsedMilliseconds;
@@ -881,6 +912,8 @@ namespace BetterBannerlordNavmeshing
         {
             float sampleDist = Math.Max(0.9f, s.VoxelCellSizeMeters);
             RcPolyMeshDetail dmesh = RcMeshDetails.BuildPolyMeshDetail(ctx, pmesh, chf, sampleDist, s.MaxErrorMeters);
+            if (CaptureDetailDebug && DebugDetailMesh == null)
+                DebugDetailMesh = dmesh;
             if (dmesh == null || dmesh.nverts == 0 || dmesh.ntris == 0)
             {
                 r.VertsXyz = new float[0];
@@ -899,14 +932,32 @@ namespace BetterBannerlordNavmeshing
             r.VertexCount = dmesh.nverts;
             r.WeldLattice = null;
 
-            r.Tris = new int[dmesh.ntris * 3];
-            for (int i = 0; i < dmesh.ntris; i++)
+            // ROOT-CAUSE FIX: RcMeshDetails.BuildPolyMeshDetail stores each submesh's triangles with
+            // indices LOCAL to that submesh's vertex range (dmesh.meshes[sm] = (vertBase, vertCount,
+            // triBase, triCount)); dmesh.tris values are 0..#vertCount-1. They must be offset by
+            // vertBase to index the global dmesh.verts array. Treating them as global (the previous
+            // bug) made every submesh reference submesh 0's vertices -> mass duplicate / non-manifold
+            // faces (E < F) and a broken mesh the engine could not import.
+            var outTris = new List<int>(dmesh.ntris * 3);
+            for (int sm = 0; sm < dmesh.nmeshes; sm++)
             {
-                r.Tris[i * 3 + 0] = dmesh.tris[i * 4 + 0];
-                r.Tris[i * 3 + 1] = dmesh.tris[i * 4 + 1];
-                r.Tris[i * 3 + 2] = dmesh.tris[i * 4 + 2];
+                int vertBase = dmesh.meshes[sm * 4 + 0];
+                int vertCount = dmesh.meshes[sm * 4 + 1];
+                int triBase = dmesh.meshes[sm * 4 + 2];
+                int triCount = dmesh.meshes[sm * 4 + 3];
+                if (vertCount == 0 || triCount == 0)
+                    continue;
+
+                for (int k = 0; k < triCount; k++)
+                {
+                    int t = (triBase + k) * 4;
+                    outTris.Add(dmesh.tris[t + 0] + vertBase);
+                    outTris.Add(dmesh.tris[t + 1] + vertBase);
+                    outTris.Add(dmesh.tris[t + 2] + vertBase);
+                }
             }
-            r.FaceCount = dmesh.ntris;
+            r.Tris = outTris.ToArray();
+            r.FaceCount = r.Tris.Length / 3;
         }
 
         // Twice the signed area of the triangle projected on the XZ plane
@@ -956,26 +1007,214 @@ namespace BetterBannerlordNavmeshing
             }
         }
 
-        // Number of unique undirected edges over the triangle perimeters. The
-        // serializer rebuilds the actual edge table; this is for the log line.
-        private static int CountUniqueEdges(int[] tris, int faceCount)
+        // Deterministic non-manifold repair: while any edge is shared by > 2 faces, remove the
+        // highest-index face on that edge (and re-evaluate). Removes as few faces as possible and is
+        // order-independent (edges processed in sorted key order). Returns the number removed.
+        private static int RepairNonManifold(MergeOutput o)
         {
-            if (tris == null || faceCount == 0)
+            int faceCount = o.Tris.Count / 3;
+            if (faceCount == 0)
                 return 0;
 
-            var map = new Dictionary<long, int>(LongKeyComparer.Instance);
-            for (int f = 0; f < faceCount; f++)
+            var count = new Dictionary<long, int>(LongKeyComparer.Instance);
+            var perEdge = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
+            for (int i = 0; i < faceCount; i++)
             {
-                int baseIdx = f * 3;
-                for (int i = 0; i < 3; i++)
+                int a = o.Tris[i * 3], b = o.Tris[i * 3 + 1], c = o.Tris[i * 3 + 2];
+                AddFaceEdge(count, perEdge, i, a, b);
+                AddFaceEdge(count, perEdge, i, b, c);
+                AddFaceEdge(count, perEdge, i, c, a);
+            }
+
+            var removed = new bool[faceCount];
+            int removedCount = 0;
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                var bad = new List<long>();
+                foreach (KeyValuePair<long, int> kv in count)
+                    if (kv.Value > 2) bad.Add(kv.Key);
+                if (bad.Count == 0) break;
+                bad.Sort();
+
+                for (int e = 0; e < bad.Count; e++)
                 {
-                    int a = tris[baseIdx + i];
-                    int b = tris[baseIdx + (i + 1) % 3];
-                    long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
-                    map[key] = 0;
+                    List<int> list = perEdge[bad[e]];
+                    int active = 0;
+                    for (int i = 0; i < list.Count; i++) if (!removed[list[i]]) active++;
+                    if (active <= 2) continue;
+
+                    list.Sort();
+                    for (int i = list.Count - 1; i >= 0 && active > 2; i--)
+                    {
+                        int ff = list[i];
+                        if (removed[ff]) continue;
+                        removed[ff] = true;
+                        removedCount++;
+                        active--;
+                        changed = true;
+                        int a = o.Tris[ff * 3], b = o.Tris[ff * 3 + 1], c = o.Tris[ff * 3 + 2];
+                        DecEdge(count, a, b);
+                        DecEdge(count, b, c);
+                        DecEdge(count, c, a);
+                    }
                 }
             }
-            return map.Count;
+
+            if (removedCount > 0)
+            {
+                var keep = new List<int>(o.Tris.Count);
+                for (int i = 0; i < faceCount; i++)
+                {
+                    if (removed[i]) continue;
+                    keep.Add(o.Tris[i * 3]);
+                    keep.Add(o.Tris[i * 3 + 1]);
+                    keep.Add(o.Tris[i * 3 + 2]);
+                }
+                o.Tris.Clear();
+                o.Tris.AddRange(keep);
+            }
+            return removedCount;
+        }
+
+        private static void AddFaceEdge(Dictionary<long, int> count, Dictionary<long, List<int>> perEdge,
+            int face, int a, int b)
+        {
+            long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+            int c;
+            count.TryGetValue(key, out c);
+            count[key] = c + 1;
+            List<int> list;
+            if (!perEdge.TryGetValue(key, out list))
+            {
+                list = new List<int>();
+                perEdge[key] = list;
+            }
+            list.Add(face);
+        }
+
+        private static void DecEdge(Dictionary<long, int> count, int a, int b)
+        {
+            long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+            int c;
+            if (count.TryGetValue(key, out c) && c > 0)
+                count[key] = c - 1;
+        }
+
+        // Topology invariants for the merged mesh. A well-formed triangle soup over a surface has
+        // every edge shared by at most 2 faces, no duplicate faces and no self-loops; then
+        // E == (3F + boundary)/2 exactly. These gate the bin write + import.
+        private static void ComputeInvariants(VoxelMeshResult result, int[] tris, int faceCount)
+        {
+            if (tris == null || faceCount == 0)
+            {
+                result.EdgeCount = 0;
+                result.BoundaryEdges = 0;
+                result.MaxEdgeMultiplicity = 0;
+                result.DuplicateFaces = 0;
+                result.SelfLoops = 0;
+                result.RequiredEdges = 0;
+                result.InvariantsPassed = faceCount == 0;
+                return;
+            }
+
+            var edgeMult = new Dictionary<long, int>(LongKeyComparer.Instance);
+            var faces = new Dictionary<FaceKey, int>();
+            int selfLoops = 0;
+            int dupFaces = 0;
+
+            for (int f = 0; f < faceCount; f++)
+            {
+                int a = tris[f * 3 + 0];
+                int b = tris[f * 3 + 1];
+                int c = tris[f * 3 + 2];
+                if (a == b || b == c || a == c)
+                {
+                    selfLoops++;
+                    continue;
+                }
+
+                var fk = new FaceKey(a, b, c);
+                int seen;
+                if (faces.TryGetValue(fk, out seen))
+                {
+                    faces[fk] = seen + 1;
+                    dupFaces++;
+                }
+                else
+                {
+                    faces[fk] = 1;
+                }
+
+                AddEdgeMult(edgeMult, a, b);
+                AddEdgeMult(edgeMult, b, c);
+                AddEdgeMult(edgeMult, c, a);
+            }
+
+            int boundary = 0;
+            int maxMult = 0;
+            foreach (KeyValuePair<long, int> kv in edgeMult)
+            {
+                if (kv.Value == 1) boundary++;
+                if (kv.Value > maxMult) maxMult = kv.Value;
+            }
+
+            result.EdgeCount = edgeMult.Count;
+            result.BoundaryEdges = boundary;
+            result.MaxEdgeMultiplicity = maxMult;
+            result.DuplicateFaces = dupFaces;
+            result.SelfLoops = selfLoops;
+            result.RequiredEdges = (3 * faceCount + boundary) / 2;
+            result.InvariantsPassed = maxMult <= 2 && dupFaces == 0 && selfLoops == 0
+                && result.EdgeCount >= result.RequiredEdges;
+        }
+
+        private static void AddEdgeMult(Dictionary<long, int> map, int a, int b)
+        {
+            long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+            int c;
+            map.TryGetValue(key, out c);
+            map[key] = c + 1;
+        }
+
+        // Undirected face key (vertices sorted ascending), for duplicate detection.
+        private struct FaceKey : IEquatable<FaceKey>
+        {
+            private readonly int _a;
+            private readonly int _b;
+            private readonly int _c;
+
+            public FaceKey(int a, int b, int c)
+            {
+                int lo, mid, hi;
+                if (a <= b && a <= c) { lo = a; if (b <= c) { mid = b; hi = c; } else { mid = c; hi = b; } }
+                else if (b <= a && b <= c) { lo = b; if (a <= c) { mid = a; hi = c; } else { mid = c; hi = a; } }
+                else { lo = c; if (a <= b) { mid = a; hi = b; } else { mid = b; hi = a; } }
+                _a = lo; _b = mid; _c = hi;
+            }
+
+            public bool Equals(FaceKey other)
+            {
+                return _a == other._a && _b == other._b && _c == other._c;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is FaceKey && Equals((FaceKey)obj);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    int h = 17;
+                    h = h * 31 + _a;
+                    h = h * 31 + _b;
+                    h = h * 31 + _c;
+                    return h;
+                }
+            }
         }
 
         private sealed class LongKeyComparer : IEqualityComparer<long>

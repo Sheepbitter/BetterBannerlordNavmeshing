@@ -67,6 +67,19 @@ namespace BetterBannerlordNavmeshing
             watch.Stop();
             buildMs = watch.ElapsedMilliseconds;
 
+            // Hard gate: never hand a non-manifold/duplicated mesh to the engine. Returning null
+            // makes the caller skip both the bin write and the import (the previous bug wrote an
+            // 81 MB poisoned bin that made the native importer hang).
+            if (vres.FaceCount > 0 && !vres.InvariantsPassed)
+            {
+                if (log != null)
+                    log("v2: ABORTED: mesh invariants failed (maxEdgeMult=" + vres.MaxEdgeMultiplicity
+                        + " dupFaces=" + vres.DuplicateFaces + " selfLoops=" + vres.SelfLoops
+                        + " edges=" + vres.EdgeCount + " required=" + vres.RequiredEdges
+                        + "); bin NOT written and import NOT attempted");
+                return null;
+            }
+
             var result = new TerrainNavMeshBuilder.Result();
             result.VertexCount = vres.VertexCount;
             result.FaceCount = vres.FaceCount;

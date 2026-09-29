@@ -318,6 +318,13 @@ namespace BetterBannerlordNavmeshing
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount, log,
                         out voxelBuildMs);
 
+                    if (voxelMesh == null)
+                    {
+                        log("v2: mesh build aborted by the invariant gate; bin NOT written and import NOT attempted.");
+                        log("done: totalMs=" + runWatch.ElapsedMilliseconds + " failed=true aborted=true");
+                        return null;
+                    }
+
                     result = TerrainNavMeshGenerator.WriteAndImport(scene, voxelMesh, settings.WriteObj,
                         prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, log,
                         voxelBuildMs);
