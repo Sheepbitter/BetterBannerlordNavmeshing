@@ -107,7 +107,10 @@ namespace BetterBannerlordNavmeshing
                 // intersected the terrain/assets would make units lose it). The mixer also reverses
                 // the asset winding (the Z-up -> Y-up swap is orientation-reversing).
                 TiledNavMeshBuilder.BuildCombinedSoup(vertsXyz, tris, assetVertsEngineXyz, assetTris,
-                    out vertsXyz, out tris);
+                    out vertsXyz, out tris, out int flippedWinding);
+                if (log != null)
+                    log("v2: winding: flipped=" + flippedWinding + "/" + assetTriCount
+                        + " asset triangles (downward-wound)");
                 if (log != null)
                     log("v2: soup terrain=" + terrainSoupVerts + "v/" + terrainSoupTris + "t + assets="
                         + (assetVertsEngineXyz != null ? assetVertsEngineXyz.Length / 3 : 0) + "v/" + assetTriCount

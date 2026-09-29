@@ -434,13 +434,20 @@ whole merged mesh** - terrain and structures alike. It exists so the navmesh sit
 surface rather than intersecting it: if the navmesh cut through the terrain/assets, units would lose the mesh
 and get confused. `VoxelNavMeshGenerator` therefore mixes the terrain soup and the asset soup untouched, and
 the builder's one offset lifts both. `TiledNavMeshBuilder.BuildCombinedSoup` **reverses asset triangle
-winding**, because the engine (Z-up) -> Recast (Y-up) axis swap is orientation-reversing: without it every
-engine-up floor would get a Recast-down normal and be rejected by the slope filter. The offset is adjustable
-(`0` = as close to the surface as the voxel lattice allows). Terrain-only scenes skip the mixer entirely, so
-their output is byte-identical to before (harness `RESULT: DETERMINISM PASS`, unchanged hashes).
+winding**, because the engine (Z-up) -> Recast (Y-up) axis swap is orientation-reversing, and then **normalises each triangle per
+triangle**: any asset triangle whose Recast normal points down has two indices swapped, i.e. collision
+data with inconsistent winding is treated as **double-sided for walkability**. Real collision data is
+frequently wound inconsistently (on Birtu 249,809 / 591,589 asset triangles, 42%, were downward-wound);
+a downward-wound floor is rejected by `MarkWalkableTriangles` (normal.Y < 0 -> NULL area) and would
+produce **no navmesh at all** at any cell size, with or without pruning - measured: the corridor
+floors at z 20.0-20.4 had no navmesh until this normalisation. The rasterizer merges the two
+orientations into the same solid span, so the output mesh is unchanged apart from surfaces that were
+previously dropped entirely. The offset is adjustable (`0` = as close to the surface as the voxel
+lattice allows). Terrain-only scenes skip the mixer entirely, so their output is byte-identical to
+before (harness `RESULT: DETERMINISM PASS`, unchanged hashes).
+
 
 **Caveats.**
-
 - **Small isolated surfaces are pruned.** Recast discards walkable regions smaller than `RegionMinSize^2`
   cells (default `8` -> 64 cells) *after* agent-radius erosion: ~4 m^2 at the 0.25 m default cell size
   (typical small decks survive) and ~16 m^2 at 0.5 m (where the harness shows an isolated 4x4 m platform
@@ -484,6 +491,23 @@ NavMesh: snapshot: wrote 3 files in 1234ms terrainMs=... assetsMs=...
 TiledCoreHarness.exe --snapshot <prefix>                       # <prefix>_snapshot_{terrain,assets}.bin + .txt
 TiledCoreHarness.exe --snapshot <terrainBin> <assetsBin> <txt>
 ```
+
+Optional flags (defaults = the recommended set):
+
+```
+--pair "x1,z1|x2,z2"      repeatable. Also accepts x1,z1,level1|x2,z2,level2 (explicit floor level per end).
+                          Measures whether the straight path between the two spots is bridged (see below).
+--band M  --cs M  --radius M  --climb M  --gapfill N  --stitch N  --prune N  --ledge on|off  --detail on|off  --slope D
+```
+
+Assert points are reported with **their own island id** (index + face count + area), and each point's
+stacked level is chosen as: a `diag` asset bounding box that contains the point pins the level to that
+asset's **top** surface; an explicit `z` wins next; otherwise the highest face. `--pair` samples the
+straight segment between the two spots at ~0.25 m steps in that level band and reports
+`gapMaxRun` (the longest contiguous off-band run), `coverage`, and `geo`/`euclid`/`ratio` where `geo` is a
+Dijkstra path over face adjacency measured through the shared-edge midpoints (a straight, directly
+connected pair measures ~1.35-1.45x its euclidean distance). A pair PASSes when `gapMaxRun <= 0.5 m` and
+`ratio <= 1.5`; the exit code is 0 only when every pair passes (and there are no pairs).
 
 It loads the snapshot and rebuilds the **exact** soup the editor would: `BuildTerrainSoup` with the header's
 spacing/stride, then the assets merged through `BuildCombinedSoup` (engine Z-up -> Recast Y-up, winding
@@ -662,6 +686,8 @@ NavMesh: soup OBJ written: <folder>\<prefab>_soup_assets.obj
 NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
 NavMesh: v2: gap fill: filled=<n> emptyColumns=<n> (cap=2 cells, before erosion)   <- only when NavMeshVoxelGapFillCells>0
 NavMesh: v2: stitch: added=<n> faces across tiles (cap=6 cells)                     <- only when NavMeshVoxelStitchMaxGapCells>0
+NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
+NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
 NavMesh: v2: invariants: faces=... edges=... boundary=... maxEdgeMult=.. dupFaces=.. selfLoops=.. minEdges=.. -> PASS

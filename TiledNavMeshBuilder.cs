@@ -325,14 +325,25 @@ namespace BetterBannerlordNavmeshing
         // lifted uniformly later by HeightOffsetMeters, so terrain AND structures share the same
         // anti-intersection offset (a navmesh that intersected the terrain/assets would make units
         // lose the mesh).
+        //
+        // Per-triangle winding normalisation: the blanket reversal above only fixes the axis swap.
+        // Real collision data is frequently wound inconsistently per triangle, and a DOWNWARD-wound
+        // floor (Recast normal.Y < 0) is rejected by MarkWalkableTriangles -> NULL area -> no navmesh
+        // face at any cell size, with or without pruning (measured on Birtu: the corridor floors at
+        // z 20.0-20.4 produced no navmesh at all). So each asset triangle whose Recast normal.Y < 0
+        // has two indices swapped, i.e. such collision geometry is treated as DOUBLE-SIDED for
+        // walkability. This changes only the input soup: the rasterizer merges the two orientations
+        // into the same solid span, so the output mesh is unchanged apart from surfaces that were
+        // previously dropped entirely.
         public static void BuildCombinedSoup(float[] terrainVertsXyz, int[] terrainTris,
             float[] assetVertsEngineXyz, int[] assetTris,
-            out float[] vertsXyz, out int[] tris)
+            out float[] vertsXyz, out int[] tris, out int flippedTriangles)
         {
             int tv = terrainVertsXyz != null ? terrainVertsXyz.Length / 3 : 0;
             int tt = terrainTris != null ? terrainTris.Length / 3 : 0;
             int av = assetVertsEngineXyz != null ? assetVertsEngineXyz.Length / 3 : 0;
             int at = assetTris != null ? assetTris.Length / 3 : 0;
+            flippedTriangles = 0;
 
             vertsXyz = new float[(tv + av) * 3];
             if (tv > 0)
@@ -354,9 +365,19 @@ namespace BetterBannerlordNavmeshing
                 int s = i * 3;
                 int d = (tt + i) * 3;
                 // Reversed winding (see comment above): (b, b+2, b+1).
-                tris[d + 0] = assetTris[s + 0] + tv;
-                tris[d + 1] = assetTris[s + 2] + tv;
-                tris[d + 2] = assetTris[s + 1] + tv;
+                int r0 = assetTris[s + 0] + tv;
+                int r1 = assetTris[s + 2] + tv;
+                int r2 = assetTris[s + 1] + tv;
+                if (TriNormalY(vertsXyz, r0, r1, r2) < 0f)
+                {
+                    int tmp = r1;
+                    r1 = r2;
+                    r2 = tmp;
+                    flippedTriangles++;
+                }
+                tris[d + 0] = r0;
+                tris[d + 1] = r1;
+                tris[d + 2] = r2;
             }
         }
 
@@ -663,6 +684,19 @@ namespace BetterBannerlordNavmeshing
             int nonManifoldRepaired = RepairNonManifold(merged);
             if (nonManifoldRepaired > 0)
                 Log(log, "v2: repaired mesh: removed " + nonManifoldRepaired + " non-manifold faces");
+
+            // Cross-tile stitch (before pruning): reconnect near-miss pieces that the per-tile stitch
+            // could not reach (different tiles, or beyond its cap). A stitch is refused when the input
+            // soup has solid geometry spanning the gap envelope (wall, closed door, low ceiling).
+            if (s.StitchMaxGapCells > 0)
+            {
+                int msPairs, msAdded, msRefused;
+                MergeStitch(merged, vertsXyz, tris, inputTris, s.VoxelCellSizeMeters, s.CellHeightMeters,
+                    s.HeightOffsetMeters, bminY, walkableHeight, walkableClimb, s.StitchMaxGapCells,
+                    out msPairs, out msAdded, out msRefused);
+                Log(log, "v2: merge-stitch: pairs=" + msPairs + " added=" + msAdded + " refused=" + msRefused
+                    + " (cap=" + s.StitchMaxGapCells + " cells)");
+            }
 
             // Prune small isolated islands (sealed-void lids / stray fragments) before the gate, so an
             // unreachable fragment never reaches the engine. Never touches the big networks.
@@ -977,6 +1011,329 @@ namespace BetterBannerlordNavmeshing
                 if (o.Y[i] < o.MinY) o.MinY = o.Y[i];
                 if (o.Y[i] > o.MaxY) o.MaxY = o.Y[i];
             }
+        }
+
+        // ================================================================ merge-level stitch
+        // Cross-tile stitch over the MERGED mesh, run before the prune so near-miss pieces join the big
+        // networks (and therefore survive pruning). Same rule as the per-tile stitch; the clearance
+        // check re-reads the input soup through a coarse XZ grid and refuses the stitch when solid
+        // geometry spans the gap envelope.
+        private static void MergeStitch(MergeOutput o, float[] soupVerts, int[] soupTris, int soupTriCount,
+            float cs, float ch, float offset, float bminY, int walkableHeight, int walkableClimb,
+            int stitchMaxGapCells, out int pairs, out int added, out int refused)
+        {
+            pairs = 0;
+            added = 0;
+            refused = 0;
+            int nf = o.Tris.Count / 3;
+            if (nf < 2 || o.X.Count < 3)
+                return;
+            float maxGap = stitchMaxGapCells * cs;
+            float maxGap2 = maxGap * maxGap;
+
+            int[] fp = new int[nf];
+            for (int i = 0; i < nf; i++) fp[i] = i;
+            var edgeMult = new Dictionary<long, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
+                StitchAddEdge(edgeMult, fp, f, a, b);
+                StitchAddEdge(edgeMult, fp, f, b, c);
+                StitchAddEdge(edgeMult, fp, f, c, a);
+            }
+
+            var compIndex = new Dictionary<int, int>();
+            var compRoots = new List<int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int root = StitchFind(fp, f);
+                if (!compIndex.ContainsKey(root))
+                {
+                    compIndex[root] = compRoots.Count;
+                    compRoots.Add(root);
+                }
+            }
+            int nc = compRoots.Count;
+            if (nc < 2 || nc > 4096)
+                return;
+
+            var bA = new List<int>[nc];
+            var bB = new List<int>[nc];
+            for (int i = 0; i < nc; i++) { bA[i] = new List<int>(); bB[i] = new List<int>(); }
+            for (int f = 0; f < nf; f++)
+            {
+                int ci = compIndex[StitchFind(fp, f)];
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = o.Tris[f * 3 + k];
+                    int i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                    if (edgeMult[StitchEdgeKey(i0, i1)] != 1)
+                        continue;                     // interior edge
+                    bA[ci].Add(i0);
+                    bB[ci].Add(i1);
+                }
+            }
+
+            // Coarse soup grid for the clearance probe.
+            const float soupCell = 4f;
+            Dictionary<long, List<int>> grid;
+            List<int> bigList;
+            BuildSoupGrid(soupVerts, soupTris, soupTriCount, soupCell, out grid, out bigList);
+
+            var compParent = new int[nc];
+            for (int i = 0; i < nc; i++) compParent[i] = i;
+            var edgeDistinct = new Dictionary<long, int>();
+
+            for (int i = 0; i < nc; i++)
+            {
+                int ei = bA[i].Count;
+                if (ei == 0 || ei > 4096)
+                    continue;
+                for (int j = i + 1; j < nc; j++)
+                {
+                    int ej = bA[j].Count;
+                    if (ej == 0 || ej > 4096)
+                        continue;
+                    if (StitchFind(compParent, i) == StitchFind(compParent, j))
+                        continue;
+
+                    // Coarse AABB pre-reject.
+                    float aminX = float.MaxValue, amaxX = float.MinValue, aminZ = float.MaxValue, amaxZ = float.MinValue;
+                    for (int k = 0; k < ei; k++)
+                    {
+                        float x0 = o.X[bA[i][k]], z0 = o.Z[bA[i][k]], x1 = o.X[bB[i][k]], z1 = o.Z[bB[i][k]];
+                        if (x0 < aminX) aminX = x0;
+                        if (x1 < aminX) aminX = x1;
+                        if (x0 > amaxX) amaxX = x0;
+                        if (x1 > amaxX) amaxX = x1;
+                        if (z0 < aminZ) aminZ = z0;
+                        if (z1 < aminZ) aminZ = z1;
+                        if (z0 > amaxZ) amaxZ = z0;
+                        if (z1 > amaxZ) amaxZ = z1;
+                    }
+                    float bminX = float.MaxValue, bmaxX = float.MinValue, bminZ = float.MaxValue, bmaxZ = float.MinValue;
+                    for (int k = 0; k < ej; k++)
+                    {
+                        float x0 = o.X[bA[j][k]], z0 = o.Z[bA[j][k]], x1 = o.X[bB[j][k]], z1 = o.Z[bB[j][k]];
+                        if (x0 < bminX) bminX = x0;
+                        if (x1 < bminX) bminX = x1;
+                        if (x0 > bmaxX) bmaxX = x0;
+                        if (x1 > bmaxX) bmaxX = x1;
+                        if (z0 < bminZ) bminZ = z0;
+                        if (z1 < bminZ) bminZ = z1;
+                        if (z0 > bmaxZ) bmaxZ = z0;
+                        if (z1 > bmaxZ) bmaxZ = z1;
+                    }
+                    double ddx = Math.Max(0.0, Math.Max(aminX - bmaxX, bminX - amaxX));
+                    double ddz = Math.Max(0.0, Math.Max(aminZ - bmaxZ, bminZ - amaxZ));
+                    if (ddx * ddx + ddz * ddz > maxGap2)
+                        continue;
+
+                    // Nearest boundary-edge pair (3D distance).
+                    int bestIA = -1, bestIB = -1;
+                    double best = double.MaxValue;
+                    for (int ka = 0; ka < ei; ka++)
+                    {
+                        int a0 = bA[i][ka], a1 = bB[i][ka];
+                        for (int kb = 0; kb < ej; kb++)
+                        {
+                            int c0 = bA[j][kb], c1 = bB[j][kb];
+                            double d = EdgePairDist2(o, a0, a1, c0, c1);
+                            if (d < best) { best = d; bestIA = ka; bestIB = kb; }
+                        }
+                    }
+                    if (bestIA < 0 || best > maxGap2)
+                        continue;
+
+                    int ua = bA[i][bestIA], ub = bB[i][bestIA];
+                    int va = bA[j][bestIB], vb = bB[j][bestIB];
+                    if (ua == va || ua == vb || ub == va || ub == vb)
+                        continue;
+                    float yLo = Math.Min(o.Y[ua], o.Y[va]);
+                    float yHi = Math.Max(o.Y[ua], o.Y[va]);
+                    if (yHi - yLo > walkableClimb * ch + 1e-4f)
+                        continue;
+
+                    pairs++;
+
+                    // Clearance: solid geometry must not span the gap envelope. The floors themselves
+                    // sit at the envelope's bottom (excluded by the 0.6*ch lift); a wall, a closed door
+                    // or a ceiling within walkableHeight of the floor trips it.
+                    float mxA = (o.X[ua] + o.X[ub]) * 0.5f, mzA = (o.Z[ua] + o.Z[ub]) * 0.5f;
+                    float mxB = (o.X[va] + o.X[vb]) * 0.5f, mzB = (o.Z[va] + o.Z[vb]) * 0.5f;
+                    float soupFloor = yLo - offset;
+                    float envLo = soupFloor + 0.6f * ch;
+                    float envHi = soupFloor + walkableHeight * ch;
+                    if (GapEnvelopeSolid(soupVerts, soupTris, grid, bigList, soupCell,
+                            mxA, mzA, mxB, mzB, cs, envLo, envHi))
+                    {
+                        refused++;
+                        continue;
+                    }
+
+                    // Fresh-edge check, then add the quad (reusing existing vertices).
+                    int mu, mv;
+                    edgeMult.TryGetValue(StitchEdgeKey(ua, ub), out mu);
+                    edgeMult.TryGetValue(StitchEdgeKey(va, vb), out mv);
+                    if (mu != 1 || mv != 1)
+                    {
+                        refused++;                        // an earlier stitch already closed one side
+                        continue;
+                    }
+                    if (edgeMult.ContainsKey(StitchEdgeKey(ua, va))
+                        || edgeMult.ContainsKey(StitchEdgeKey(ub, vb))
+                        || edgeMult.ContainsKey(StitchEdgeKey(ua, vb)))
+                    {
+                        refused++;
+                        continue;
+                    }
+                    int t1a = ua, t1b = va, t1c = vb;
+                    if (TriNormalYList(o, t1a, t1b, t1c) < 0f) { t1b = vb; t1c = va; }
+                    int t2a = ua, t2b = vb, t2c = ub;
+                    if (TriNormalYList(o, t2a, t2b, t2c) < 0f) { t2b = ub; t2c = vb; }
+                    if (t1a == t1b || t1b == t1c || t1a == t1c || t2a == t2b || t2b == t2c || t2a == t2c)
+                    {
+                        refused++;
+                        continue;
+                    }
+                    o.Tris.Add(t1a); o.Tris.Add(t1b); o.Tris.Add(t1c);
+                    o.Tris.Add(t2a); o.Tris.Add(t2b); o.Tris.Add(t2c);
+                    StitchRegister(edgeMult, ua, va);
+                    StitchRegister(edgeMult, ub, vb);
+                    StitchRegister(edgeMult, ua, vb);
+                    StitchRegister(edgeMult, ua, ub);
+                    StitchRegister(edgeMult, va, vb);
+                    added += 2;
+                    StitchUnion(compParent, i, j);
+                }
+            }
+        }
+
+        private static double EdgePairDist2(MergeOutput o, int a0, int a1, int b0, int b1)
+        {
+            double d = VDist2List(o, a0, b0);
+            double t = VDist2List(o, a0, b1);
+            if (t < d) d = t;
+            t = VDist2List(o, a1, b0);
+            if (t < d) d = t;
+            t = VDist2List(o, a1, b1);
+            if (t < d) d = t;
+            return d;
+        }
+
+        private static double VDist2List(MergeOutput o, int i, int j)
+        {
+            double dx = o.X[i] - o.X[j];
+            double dy = o.Y[i] - o.Y[j];
+            double dz = o.Z[i] - o.Z[j];
+            return dx * dx + dy * dy + dz * dz;
+        }
+
+        private static float TriNormalYList(MergeOutput o, int a, int b, int c)
+        {
+            float ux = o.X[b] - o.X[a], uy = o.Y[b] - o.Y[a], uz = o.Z[b] - o.Z[a];
+            float wx = o.X[c] - o.X[a], wy = o.Y[c] - o.Y[a], wz = o.Z[c] - o.Z[a];
+            return uz * wx - ux * wz;
+        }
+
+        private static long SoupCellKey(int x, int z)
+        {
+            return ((long)x << 32) | (uint)z;
+        }
+
+        // Coarse XZ grid over the input soup; triangles covering too many cells go to bigList.
+        private static void BuildSoupGrid(float[] soupVerts, int[] soupTris, int triCount, float cellSize,
+            out Dictionary<long, List<int>> grid, out List<int> bigList)
+        {
+            grid = new Dictionary<long, List<int>>();
+            bigList = new List<int>();
+            for (int t = 0; t < triCount; t++)
+            {
+                int a = soupTris[t * 3], b = soupTris[t * 3 + 1], c = soupTris[t * 3 + 2];
+                float minX = Math.Min(soupVerts[a * 3], Math.Min(soupVerts[b * 3], soupVerts[c * 3]));
+                float maxX = Math.Max(soupVerts[a * 3], Math.Max(soupVerts[b * 3], soupVerts[c * 3]));
+                float minZ = Math.Min(soupVerts[a * 3 + 2], Math.Min(soupVerts[b * 3 + 2], soupVerts[c * 3 + 2]));
+                float maxZ = Math.Max(soupVerts[a * 3 + 2], Math.Max(soupVerts[b * 3 + 2], soupVerts[c * 3 + 2]));
+                int cx0 = (int)Math.Floor(minX / cellSize), cx1 = (int)Math.Floor(maxX / cellSize);
+                int cz0 = (int)Math.Floor(minZ / cellSize), cz1 = (int)Math.Floor(maxZ / cellSize);
+                long cells = (long)(cx1 - cx0 + 1) * (cz1 - cz0 + 1);
+                if (cells > 256)
+                {
+                    bigList.Add(t);
+                    continue;
+                }
+                for (int cx = cx0; cx <= cx1; cx++)
+                {
+                    for (int cz = cz0; cz <= cz1; cz++)
+                    {
+                        long key = SoupCellKey(cx, cz);
+                        List<int> list;
+                        if (!grid.TryGetValue(key, out list))
+                        {
+                            list = new List<int>();
+                            grid[key] = list;
+                        }
+                        list.Add(t);
+                    }
+                }
+            }
+        }
+
+        // Walks the straight line between the two stitch edges and refuses when solid geometry spans the
+        // envelope OVER that line (a wall/door in the gap, or a ceiling within walkableHeight). Testing
+        // the line rather than a box keeps walls beside the corridor from refusing a valid stitch.
+        private static bool GapEnvelopeSolid(float[] soupVerts, int[] soupTris,
+            Dictionary<long, List<int>> grid, List<int> bigList, float cellSize,
+            float x0, float z0, float x1, float z1, float cs, float yLo, float yHi)
+        {
+            float dx = x1 - x0, dz = z1 - z0;
+            int steps = Math.Max(1, (int)Math.Ceiling(Math.Max(Math.Abs(dx), Math.Abs(dz)) / cs));
+            if (steps <= 1)
+                return false;
+            for (int k = 1; k < steps; k++)
+            {
+                float px = x0 + dx * k / steps;
+                float pz = z0 + dz * k / steps;
+                List<int> list;
+                if (grid.TryGetValue(SoupCellKey((int)Math.Floor(px / cellSize), (int)Math.Floor(pz / cellSize)),
+                        out list))
+                {
+                    for (int i = 0; i < list.Count; i++)
+                        if (TriCoversPoint(soupVerts, soupTris, list[i], px, pz, yLo, yHi))
+                            return true;
+                }
+            }
+            for (int i = 0; i < bigList.Count; i++)
+            {
+                float tdx = x1 - x0, tdz = z1 - z0;
+                int tsteps = Math.Max(1, (int)Math.Ceiling(Math.Max(Math.Abs(tdx), Math.Abs(tdz)) / cs));
+                for (int k = 1; k < tsteps; k++)
+                {
+                    float px = x0 + tdx * k / tsteps;
+                    float pz = z0 + tdz * k / tsteps;
+                    if (TriCoversPoint(soupVerts, soupTris, bigList[i], px, pz, yLo, yHi))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        // Conservative point test: the triangle's Y range spans the envelope and its XZ bbox covers the
+        // sample point.
+        private static bool TriCoversPoint(float[] v, int[] tris, int t, float px, float pz, float yLo, float yHi)
+        {
+            int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+            float minY = Math.Min(v[a * 3 + 1], Math.Min(v[b * 3 + 1], v[c * 3 + 1]));
+            float maxY = Math.Max(v[a * 3 + 1], Math.Max(v[b * 3 + 1], v[c * 3 + 1]));
+            if (maxY < yLo || minY > yHi)
+                return false;
+            float minX = Math.Min(v[a * 3], Math.Min(v[b * 3], v[c * 3]));
+            float maxX = Math.Max(v[a * 3], Math.Max(v[b * 3], v[c * 3]));
+            if (px < minX || px > maxX)
+                return false;
+            float minZ = Math.Min(v[a * 3 + 2], Math.Min(v[b * 3 + 2], v[c * 3 + 2]));
+            float maxZ = Math.Max(v[a * 3 + 2], Math.Max(v[b * 3 + 2], v[c * 3 + 2]));
+            return pz >= minZ && pz <= maxZ;
         }
 
         private sealed class MergeOutput
@@ -1605,6 +1962,11 @@ namespace BetterBannerlordNavmeshing
 
                     // Quad (two triangles) reusing the four boundary vertices. Keep the new edges fresh
                     // so no edge ends up shared by more than two faces, and wind with +Y normals.
+                    int pmu, pmv;
+                    edgeMult.TryGetValue(StitchEdgeKey(weld[ua], weld[ub]), out pmu);
+                    edgeMult.TryGetValue(StitchEdgeKey(weld[va], weld[vb]), out pmv);
+                    if (pmu != 1 || pmv != 1)
+                        continue;   // a previous stitch already closed one side
                     if (edgeMult.ContainsKey(StitchEdgeKey(weld[ua], weld[va]))
                         || edgeMult.ContainsKey(StitchEdgeKey(weld[ub], weld[vb]))
                         || edgeMult.ContainsKey(StitchEdgeKey(weld[ua], weld[vb])))
