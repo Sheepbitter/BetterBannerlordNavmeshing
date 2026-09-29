@@ -16,11 +16,22 @@ namespace BetterBannerlordNavmeshing
     // TerrainNavMeshGenerator.WriteAndImport used by the v1 mesher.
     public static class VoxelNavMeshGenerator
     {
+        // Diagnostic capture of the raw input soup in ENGINE space (Z-up), for the
+        // NavMeshVoxelWriteSoupObj option: it lets a failing spot be inspected with geometry
+        // provenance (terrain vs assets). Null unless that option is on.
+        public sealed class SoupCapture
+        {
+            public float[] TerrainVertsEngine;
+            public int[] TerrainTris;
+            public float[] AssetVertsEngine;
+            public int[] AssetTris;
+        }
+
         public static TerrainNavMeshBuilder.Result BuildExportMesh(
             float[] stitchedHeights, int width, int height, float terrainVertexSpacing, int sampleStride,
             TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj,
             float agentClimbOverrideMeters, int maxWorkers,
-            float[] assetVertsEngineXyz, int[] assetTris,
+            float[] assetVertsEngineXyz, int[] assetTris, bool[] terrainHoleMask, SoupCapture soupCapture,
             System.Action<string> log, out long buildMs)
         {
             if (log != null)
@@ -56,10 +67,37 @@ namespace BetterBannerlordNavmeshing
 
             float[] vertsXyz;
             int[] tris;
-            TiledNavMeshBuilder.BuildTerrainSoup(stitchedHeights, width, height, terrainVertexSpacing,
-                sampleStride, out vertsXyz, out tris);
+            if (terrainHoleMask != null)
+            {
+                TiledNavMeshBuilder.BuildTerrainSoup(stitchedHeights, width, height, terrainVertexSpacing,
+                    sampleStride, terrainHoleMask, out vertsXyz, out tris);
+                if (log != null)
+                    log("v2: terrain hole mask applied: cells touching a hole are dropped from the soup");
+            }
+            else
+            {
+                TiledNavMeshBuilder.BuildTerrainSoup(stitchedHeights, width, height, terrainVertexSpacing,
+                    sampleStride, out vertsXyz, out tris);
+            }
             int terrainSoupVerts = vertsXyz.Length / 3;
             int terrainSoupTris = tris.Length / 3;
+
+            if (soupCapture != null)
+            {
+                // Recast (x, y=height, z) -> engine (x=recastX, y=recastZ, z=recastY).
+                var te = new float[vertsXyz.Length];
+                for (int i = 0; i < vertsXyz.Length; i += 3)
+                {
+                    te[i + 0] = vertsXyz[i + 0];
+                    te[i + 1] = vertsXyz[i + 2];
+                    te[i + 2] = vertsXyz[i + 1];
+                }
+                soupCapture.TerrainVertsEngine = te;
+                soupCapture.TerrainTris = tris;
+                soupCapture.AssetVertsEngine = assetVertsEngineXyz;
+                soupCapture.AssetTris = assetTris;
+            }
+
             int assetTriCount = assetTris != null ? assetTris.Length / 3 : 0;
             if (assetTriCount > 0)
             {

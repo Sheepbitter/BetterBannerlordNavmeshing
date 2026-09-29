@@ -265,7 +265,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
 | `NavMeshUseVoxelCore` | `true` | Run the v2 tiled voxel core (terrain + ingested static asset collision; the default since 2026-09-29). Set false for the v1 adaptive terrain mesher. See *Voxel core (experimental)*. |
-| `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
+| `NavMeshVoxelCellSize` | `0.25` | Voxel cell size (m) for the v2 core. 0.25 is required for 1.0-1.2 m doorways/walkways/stair treads to survive (see *Narrow features & connectivity*); it costs ~4x build time and ~2-4x faces vs 0.5 (0.5 remains fine for open terrain / fast iteration). |
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
 | `NavMeshVoxelDetailSampleDist` | `2` | v2 detail-mesh sampling distance (m). `0` = auto (`max(0.9, cellSize)`). The default cuts the tight/sliver faces Recast's detail edge tessellation makes along walkable boundaries. Lower = more surface detail (more faces). |
@@ -274,6 +274,10 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelIncludeDynamic` | `true` | v2 assets: include movable/dynamic physics props (e.g. Birtu's merlons) at their placed pose. Set false to build only from static geometry. |
 | `NavMeshVoxelIncludeFlora` | `false` | v2 assets: include flora collision (trees/bushes). Off by default - flora is usually visual and its many small shapes add faces without being reliably navigable. |
 | `NavMeshVoxelAssetTrace` | `false` | Diagnostic: log one `assets: TRACE 'entity' body='...' ...` line per included entity immediately before its native triangle read, so if a crash ever happens the log's last line names the culprit. One diagnostic run only. See *Assets (structures)*. |
+| `NavMeshVoxelAgentRadius` | `0.25` | v2 agent radius (m). Erosion = `ceil(radius / NavMeshVoxelCellSize)` cells each side; tile border = `3 + ceil(radius / cs)`. 0.25 keeps erosion at 1 cell even at cs 0.25 (0.35 would erode 2 and close 1.0-1.2 m doorways/walkways/stairs). See *Narrow features & connectivity*. |
+| `NavMeshVoxelLedgeFilter` | `true` | v2 Recast ledge filter. On = Recast default (trims spans within `walkableClimb` of a drop, keeping the mesh off cliff edges) but it also eats the border cells of narrow walkways with drops on both sides. Turn off if narrow structures keep losing their edges. |
+| `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
+| `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
@@ -295,14 +299,16 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
 - **Tiled + parallel.** The world is split into 16 m tiles (`NavMeshCoarsestSpacing`) with a Recast border,
   built on a bounded worker pool (`Parallel.For`, `MaxDegreeOfParallelism = #processors`), then merged in
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
-- **Settings:** `NavMeshVoxelCellSize` (default 0.5 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
+- **Settings:** `NavMeshVoxelCellSize` (default 0.25 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
   (0.25 m -> detail-mesh tolerance), `NavMeshCoarsestSpacing` (tile size), `NavMeshHeightOffsetMeters`,
   `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh` (default true),
   `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox),
+  `NavMeshVoxelAgentRadius` (default 0.25 m), `NavMeshVoxelLedgeFilter` (default true),
   `NavMeshVoxelIncludeAssets` / `NavMeshVoxelIncludeDynamic` / `NavMeshVoxelIncludeFlora` (asset ingestion;
-  see *Assets (structures)*). Agent
-  radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually
-  walkable (see below).
+  see *Assets (structures)*), `NavMeshVoxelTerrainHoleAudit` (default false; see *Terrain holes*),
+  `NavMeshVoxelWriteSoupObj` (default false; soup dump), `NavMeshVoxelAssetTrace` (default false; crash
+  triage). Agent height is fixed at 1.8 m; **radius is configurable** and **climb is auto-derived** so the
+  slope setting is actually walkable (see below).
 
 ### Async build & performance instrumentation
 
@@ -418,21 +424,83 @@ their output is byte-identical to before (harness `RESULT: DETERMINISM PASS`, un
 **Caveats.**
 
 - **Small isolated surfaces are pruned.** Recast discards walkable regions smaller than `RegionMinSize^2`
-  cells (default `8` -> 64 cells ~= 16 m^2 at `NavMeshVoxelCellSize = 0.5`), *after* agent-radius erosion, so
-  an isolated platform only survives once its walkable core reaches ~64 cells - measured: a 4x4 m platform
-  keeps only 25-35 cells after erosion and is pruned, and an isolated square needs to be ~6x6 m to survive.
-  Surfaces that connect to larger navmesh (the usual in-scene case: a deck bridges two banks, stairs reach
-  the ground) are unaffected. The harness asserts both behaviours and the exact survival floor.
+  cells (default `8` -> 64 cells) *after* agent-radius erosion: ~4 m^2 at the 0.25 m default cell size
+  (typical small decks survive) and ~16 m^2 at 0.5 m (where the harness shows an isolated 4x4 m platform
+  pruned - it keeps only 25-35 cells after erosion and needs ~64). Surfaces that connect to larger navmesh
+  (the usual in-scene case: a deck bridges two banks, stairs reach the ground) are unaffected.
 - **Asset fidelity** is `NavMeshMaxErrorMeters`-bounded like the terrain, plus the same uniform
   `NavMeshHeightOffsetMeters` lift and the detail phase's upstream `+ch` nudge; the whole mesh is lifted
   together, so structures do not sit lower than the terrain around them.
+
+### Narrow features & connectivity
+
+Doorways, walkways and thin stair treads fail when **erosion + quantization eat the whole feature**:
+erosion is `ceil(NavMeshVoxelAgentRadius / NavMeshVoxelCellSize)` cells *per side*, so at `cs = 0.5` and
+radius 0.35 (or 0.25) a 1.2 m doorway is 2 cells wide and vanishes, and a 1.0 m walkway (2 cells) is eroded
+to nothing. The Recast **ledge filter** compounds it: it removes spans within `walkableClimb` of a drop, so a
+narrow walkway with drops on both sides loses its border cells too. The harness connectivity lab
+(`Test 13/14`) builds terrain+asset scenes for a 1.2 m doorway, a 1.0 m walkway (drops both sides), a 1.0 m
+wide 6x0.4 m staircase, a 2.5x2.2x8 m open-ended tunnel and a courtyard with two 1.2 m mouths, and asserts
+face-adjacency connectivity with union-find.
+
+Measured sweep (`P` = connected, order a b c d e; multi-threaded, 24x24 m scenes):
+
+| cs | radius | ledge | a | b | c | d | e | pass | faces | ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.5 | 0.35 | on | . | . | . | P | . | 1/5 | 241 | 4 |
+| 0.5 | 0.35 | off | . | . | . | P | . | 1/5 | 239 | 3 |
+| 0.5 | 0.25 | on | . | . | . | P | . | 1/5 | 241 | 3 |
+| 0.5 | 0.1 | on | . | . | . | P | . | 1/5 | 241 | 3 |
+| **0.25** | **0.25** | **on** | **P** | **P** | **P** | **P** | **P** | **5/5** | **504** | **11** |
+| 0.25 | 0.1 | on | P | P | P | P | P | 5/5 | 504 | 11 |
+| 0.25 | 0.35 | on | . | . | . | P | . | 1/5 | 473 | 10 |
+| 0.15 | 0.25 | on | P | P | P | P | P | 5/5 | 854 | 50 |
+| 0.15 | 0.35 | off | P | P | P | P | P | 5/5 | 874 | 43 |
+
+- At `cs = 0.5` **no radius or ledge setting helps** - erosion is 1 cell for every radius <= 0.5, so the
+  1.0-1.2 m features are gone regardless.
+- The cheapest all-pass configuration is **`cs = 0.25` with `NavMeshVoxelAgentRadius <= 0.25`** (ledge filter
+  either way; keep it on). radius 0.35 at cs 0.25 erodes 2 cells and still fails.
+- **`NavMeshVoxelCellSize` defaults to 0.25 since 2026-09-29** (the cheapest all-pass configuration above);
+  that is roughly 4x the cells of 0.5, so expect ~4x the build time and ~2-4x the faces (Birtu ~1 s -> ~4 s;
+  the async build keeps the editor responsive). Set 0.5 for fast iteration on open terrain - 0.25 with the
+  default `NavMeshVoxelAgentRadius = 0.25` is the shipping configuration.
+
+### Terrain holes (false lids)
+
+When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
+built from can still span it, producing a **false walkable lid** over the void - an agent standing on it falls
+through. Decompiled evidence (dnSpy, 1.4.8 assemblies):
+
+- The **only** hole-aware terrain API is `Scene.GetTerrainHeight(Vec2 position, bool checkHoles = true)`
+  (interface `IScene.GetTerrainHeight(UIntPtr, Vec2, bool)`; `[EngineMethod("get_terrain_height", ...)]`).
+  The shipped `HeightMapExtractor` mod and the game's own spawn/formation snapping all call it with
+  `checkHoles: true`.
+- The **bulk source this sampler prefers** - `Scene.GetTerrainData` + `Scene.GetTerrainNodeData` +
+  `Scene.GetTerrainHeightData` (which calls `IScene.FillTerrainHeightData` into a `float[]` per node) - has
+  **no** hole parameter and **no** hole array. A full dump of `Scene`'s terrain methods shows no hole/carve/
+  mask/enumeration API at all (only `GetTerrain*`, `SetLandscapeRainMaskData`, `HasTerrainHeightmap`,
+  `ContainsTerrain`, terrain raycasts).
+- ⇒ Terrain holes are **not enumerable and not representable in the bulk node arrays**; the only observable
+  signal is a per-point disagreement between the stored height and the hole-aware query.
+
+So the fix is: audit the sampled vertices against the hole-aware point query and **drop the terrain cells that
+disagree** (`TiledNavMeshBuilder.BuildTerrainSoup(..., bool[] holeMask, ...)` skips any cell whose four
+corners touch a hole). This is `NavMeshVoxelTerrainHoleAudit`, **off by default** because it costs one native
+point query per terrain vertex (Birtu's grid is 385x385 ~= 148k vertices; Na'ilu's is ~1M). On Birtu the
+existing 324-sample cross-check matched the hole-aware query 324/324, so no hole was visible at those probes -
+if the tunnel lid persists with the audit on, the `NavMeshVoxelWriteSoupObj` dump tells you whether the lid is
+terrain (drop it) or a genuine asset surface. The harness proves the mechanism (`Test 15`: control has a lid;
+with the mask the lid is gone and the asset floor below is present and connected).
 
 ### How to read the v2 log lines
 
 Every run also logs the terrain read (see above), then the voxel core:
 
 ```
-NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
+NavMesh: v2: core engaged (tiled voxel). cellSize=0.25m tile=16m
+NavMesh: terrain hole audit: verts=<n> holes=<n> (tol 1m, auditMs=<n>)   <- only when NavMeshVoxelTerrainHoleAudit=true
+NavMesh: terrain hole audit: <n> stored vertices disagree with GetTerrainHeight(checkHoles=true); their cells are dropped from the terrain soup
 NavMesh: assets: preloading <M> unique physics bodies by name
 NavMesh: assets: preloaded <M> bodies by name (preloadMs=<n>)
 NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- every 250 entities (read pass)
@@ -440,14 +508,17 @@ NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=..
 NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=..] tris=... cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 10 by triangle count)
+NavMesh: v2: terrain hole mask applied: cells touching a hole are dropped from the soup   <- only when holes were found
 NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted uniformly by +0.5m)
 NavMesh: v2: soup verts=... tris=... (terrain only) stride=... spacing=...m      <- only when NavMeshVoxelIncludeAssets=false or no assets found
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
-NavMesh: v2: agentClimb=2.2m (auto) walkableClimb=11 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=65.556deg (setting=65deg)
-NavMesh: v2: params slope=65deg radius=0.35m height=1.8m climb=2.2m walkable(r,h,c)=1/9/11 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 detail=True detSampleDist=2m contourSimpErr=1.3vox
-NavMesh: v2: contour maxError=1.3vox (= 0.65m at cs=0.5m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
+NavMesh: v2: agentClimb=0.6m (auto) walkableClimb=3 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=50.194deg (setting=50deg)
+NavMesh: v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 ledgeFilter=True detail=True detSampleDist=2m contourSimpErr=1.3vox
+NavMesh: v2: contour maxError=1.3vox (= 0.325m at cs=0.25m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
+NavMesh: soup OBJ written: <folder>\<prefab>_soup_terrain.obj      <- only when NavMeshVoxelWriteSoupObj=true
+NavMesh: soup OBJ written: <folder>\<prefab>_soup_assets.obj
 NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
 NavMesh: v2: mesh V=... E=... F=... degenerate=... binBytes=... buildMs=...
@@ -463,6 +534,11 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
   scan's wall time.
 - `v2: soup terrain=... + assets=...` - the merged Recast-space soup size; the uniform lift applied to the
   whole mesh (`NavMeshHeightOffsetMeters`) is stated in the line.
+- `terrain hole audit: ...` / `v2: terrain hole mask applied: ...` - only when `NavMeshVoxelTerrainHoleAudit`
+  is on: how many sampled vertices disagreed with the hole-aware point query and therefore had their cells
+  dropped from the terrain soup.
+- `soup OBJ written: ...` - only when `NavMeshVoxelWriteSoupObj` is on: engine-space dumps of the terrain
+  and asset soup for geometry provenance.
 - `v2: tiles=... built=... failed=...` - failed tiles are also logged individually as `v2: FAILED tile#...`
   with the first exception message; they are never silently dropped.
 - `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.

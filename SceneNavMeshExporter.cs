@@ -34,12 +34,28 @@ namespace BetterBannerlordNavmeshing
         // voxel pipeline (TiledNavMeshBuilder) instead of the v1 adaptive terrain mesher.
         // Terrain-only for now; set false to use the v1 mesher.
         public bool NavMeshUseVoxelCore = true;
-        public float NavMeshVoxelCellSize = 0.5f;
+        // Voxel cell size (m). Default 0.25 m since 2026-09-29: the connectivity lab shows 1.0-1.2 m
+        // doorways, walkways and stair treads systematically vanish at 0.5 m (erosion + quantization
+        // leave 0 cells regardless of the radius setting). 0.25 costs ~4x build time and ~2-4x faces;
+        // raise it to 0.5 for fast iteration on open terrain.
+        public float NavMeshVoxelCellSize = 0.25f;
 
         // Agent max climb (m) for the v2 voxel core. 0 = auto-derive so that
         // NavMeshMaxSlopeDegrees is actually traversable (Recast's ledge filter
         // needs walkableClimb >= 2*cs*tan(slope)/ch). See the README.
         public float NavMeshVoxelAgentClimbMeters = 0f;
+
+        // Agent radius (m) for the v2 voxel core. Erosion = ceil(radius/cellSize) cells each side and
+        // the tile border is 3 + ceil(radius/cellSize). Default 0.25 m: at cellSize 0.5 this is still
+        // erosion 1, but at cellSize 0.25 it stays 1 instead of 2, which is what keeps 1.0-1.2 m
+        // doorways / walkways / stair treads connected. See the connectivity lab in the README.
+        public float NavMeshVoxelAgentRadius = 0.25f;
+
+        // Recast ledge filter (default true = Recast behaviour). It trims spans within walkableClimb of
+        // a drop, which keeps the mesh off real cliff edges but also eats the border cells of narrow
+        // walkways/bridges that have drops on both sides. Turn off if narrow structures keep losing
+        // their edges (or if a level is connected on one side but not the other).
+        public bool NavMeshVoxelLedgeFilter = true;
 
         // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
         // the terrain surface instead of chording under hills/knolls; bounded by
@@ -69,6 +85,18 @@ namespace BetterBannerlordNavmeshing
         // PhysicsShape.GetTriangle read. If that native call ever read-AVs the process, the last line
         // in the log names the culprit entity/body. Cheap enough to leave off in normal runs.
         public bool NavMeshVoxelAssetTrace = false;
+
+        // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
+        // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance
+        // (terrain soup vs asset triangles) in the editor or Blender.
+        public bool NavMeshVoxelWriteSoupObj = false;
+
+        // Terrain-hole audit (default off). The engine's bulk node arrays carry no hole information, so
+        // a carve can become a false walkable lid. When on, every sampled terrain vertex is compared
+        // against the hole-aware point query Scene.GetTerrainHeight(pos, checkHoles: true) and any
+        // vertex that disagrees by more than 1 m is treated as a hole: its terrain cells are dropped
+        // from the soup. Costs one native point query per vertex (see the README for the measured cost).
+        public bool NavMeshVoxelTerrainHoleAudit = false;
 
         // Run the v2 voxel build on a background thread so the editor UI stays alive during the
         // 3-60 s builds. Only the pure-managed voxel build runs off-thread; the terrain read and the
@@ -117,6 +145,8 @@ namespace BetterBannerlordNavmeshing
             public float AgentClimbMeters;
             public float[] AssetVertsEngineXyz;
             public int[] AssetTris;
+            public bool[] TerrainHoleMask;
+            public VoxelNavMeshGenerator.SoupCapture SoupCapture;
             public long AssetsMs;
             public int FacesBefore;
             public long SampleMs;
@@ -319,7 +349,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters,
                 NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError,
                 NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
-                NavMeshVoxelAssetTrace);
+                NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
+                NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -340,7 +371,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false);
+                true, true, false, false, 0.25f, true, false, false);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -363,7 +394,11 @@ namespace BetterBannerlordNavmeshing
             bool voxelIncludeAssets,
             bool voxelIncludeDynamic,
             bool voxelIncludeFlora,
-            bool voxelAssetTrace)
+            bool voxelAssetTrace,
+            float voxelAgentRadius,
+            bool voxelLedgeFilter,
+            bool voxelWriteSoupObj,
+            bool voxelTerrainHoleAudit)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -396,6 +431,8 @@ namespace BetterBannerlordNavmeshing
                     + " useVoxelCore=" + useVoxelCore
                     + " voxelCellSize=" + F(voxelCellSizeMeters) + "m"
                     + " voxelAgentClimb=" + F(voxelAgentClimbMeters) + "m"
+                    + " voxelAgentRadius=" + F(voxelAgentRadius) + "m"
+                    + " voxelLedgeFilter=" + voxelLedgeFilter
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
@@ -403,6 +440,8 @@ namespace BetterBannerlordNavmeshing
                     + " includeDynamic=" + voxelIncludeDynamic
                     + " includeFlora=" + voxelIncludeFlora
                     + " assetTrace=" + voxelAssetTrace
+                    + " writeSoupObj=" + voxelWriteSoupObj
+                    + " terrainHoleAudit=" + voxelTerrainHoleAudit
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -412,7 +451,7 @@ namespace BetterBannerlordNavmeshing
                 // Reads the scene's live in-memory terrain (including unsaved edits);
                 // the sampler's per-node min/max + GetTerrainHeight cross-check lines
                 // are what prove the bulk grid matches the live surface.
-                SceneTerrainSampler.TerrainGrid grid = SceneTerrainSampler.Read(scene, log);
+                SceneTerrainSampler.TerrainGrid grid = SceneTerrainSampler.Read(scene, voxelTerrainHoleAudit, log);
                 log("grid ready: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m fallback=" + grid.UsedPointFallback
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
@@ -432,6 +471,8 @@ namespace BetterBannerlordNavmeshing
                     voxel.UseDetailMesh = voxelDetailMesh;
                     voxel.DetailSampleDistMeters = voxelDetailSampleDist;
                     voxel.ContourMaxErrorVoxels = voxelContourMaxError;
+                    voxel.AgentRadiusMeters = voxelAgentRadius;
+                    voxel.UseLedgeFilter = voxelLedgeFilter;
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
@@ -445,11 +486,14 @@ namespace BetterBannerlordNavmeshing
                         assetsMs = assets.ScanMs;
                     }
 
+                    VoxelNavMeshGenerator.SoupCapture soupCapture =
+                        voxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
+
                     long voxelBuildMs;
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
-                        assetVerts, assetTris, log,
+                        assetVerts, assetTris, grid.HoleMask, soupCapture, log,
                         out voxelBuildMs);
 
                     if (voxelMesh == null)
@@ -462,6 +506,7 @@ namespace BetterBannerlordNavmeshing
                     result = TerrainNavMeshGenerator.WriteAndImport(scene, voxelMesh, settings.WriteObj,
                         prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, log,
                         voxelBuildMs);
+                    WriteSoupObjs(result, soupCapture, log);
                 }
                 else
                 {
@@ -564,6 +609,8 @@ namespace BetterBannerlordNavmeshing
                     + " useVoxelCore=True"
                     + " voxelCellSize=" + F(NavMeshVoxelCellSize) + "m"
                     + " voxelAgentClimb=" + F(NavMeshVoxelAgentClimbMeters) + "m"
+                    + " voxelAgentRadius=" + F(NavMeshVoxelAgentRadius) + "m"
+                    + " voxelLedgeFilter=" + NavMeshVoxelLedgeFilter
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
@@ -571,6 +618,8 @@ namespace BetterBannerlordNavmeshing
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
                     + " includeFlora=" + NavMeshVoxelIncludeFlora
                     + " assetTrace=" + NavMeshVoxelAssetTrace
+                    + " writeSoupObj=" + NavMeshVoxelWriteSoupObj
+                    + " terrainHoleAudit=" + NavMeshVoxelTerrainHoleAudit
                     + " asyncBuild=True"
                     + " writeLogFile=" + NavMeshWriteLogFile
                     + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
@@ -580,7 +629,8 @@ namespace BetterBannerlordNavmeshing
 
                 // Scene reads stay on the main thread.
                 var sampleWatch = System.Diagnostics.Stopwatch.StartNew();
-                SceneTerrainSampler.TerrainGrid grid = SceneTerrainSampler.Read(scene, log);
+                SceneTerrainSampler.TerrainGrid grid =
+                    SceneTerrainSampler.Read(scene, NavMeshVoxelTerrainHoleAudit, log);
                 sampleWatch.Stop();
                 log("grid ready: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m fallback=" + grid.UsedPointFallback
@@ -616,6 +666,8 @@ namespace BetterBannerlordNavmeshing
                 voxel.UseDetailMesh = NavMeshVoxelDetailMesh;
                 voxel.DetailSampleDistMeters = NavMeshVoxelDetailSampleDist;
                 voxel.ContourMaxErrorVoxels = NavMeshVoxelContourMaxError;
+                voxel.AgentRadiusMeters = NavMeshVoxelAgentRadius;
+                voxel.UseLedgeFilter = NavMeshVoxelLedgeFilter;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;
@@ -628,6 +680,8 @@ namespace BetterBannerlordNavmeshing
                 req.AgentClimbMeters = NavMeshVoxelAgentClimbMeters;
                 req.AssetVertsEngineXyz = assetVerts;
                 req.AssetTris = assetTris;
+                req.TerrainHoleMask = grid.HoleMask;
+                req.SoupCapture = NavMeshVoxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
                 req.AssetsMs = assetsMs;
                 req.FacesBefore = facesBeforeRun;
                 req.SampleMs = sampleWatch.ElapsedMilliseconds;
@@ -669,7 +723,7 @@ namespace BetterBannerlordNavmeshing
                 req.Mesh = VoxelNavMeshGenerator.BuildExportMesh(
                     req.GridHeights, req.GridWidth, req.GridHeight, req.GridSpacing, req.Settings.SampleStride,
                     req.Voxel, req.Settings.WriteObj, req.AgentClimbMeters, Environment.ProcessorCount,
-                    req.AssetVertsEngineXyz, req.AssetTris,
+                    req.AssetVertsEngineXyz, req.AssetTris, req.TerrainHoleMask, req.SoupCapture,
                     req.Log, out buildMs);
                 req.BuildMs = buildMs;
             }
@@ -716,6 +770,7 @@ namespace BetterBannerlordNavmeshing
                 TerrainNavMeshGenerator.ExportResult result = TerrainNavMeshGenerator.WriteAndImport(
                     req.Scene, req.Mesh, req.Settings.WriteObj, req.PrefabNameOverride, req.FolderOverride,
                     req.ClearExisting, req.ImportIntoScene, log, req.BuildMs);
+                WriteSoupObjs(result, req.SoupCapture, log);
 
                 log("v2: perf: clickToDoneMs=" + req.RunWatch.ElapsedMilliseconds
                     + " sampleMs=" + req.SampleMs
@@ -853,6 +908,55 @@ namespace BetterBannerlordNavmeshing
         private static string F(float value)
         {
             return value.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        // NavMeshVoxelWriteSoupObj: dump the raw input soup (engine space) next to the bin so a failing
+        // spot can be inspected with geometry provenance. Uses the resolved bin path + prefab name.
+        private static void WriteSoupObjs(TerrainNavMeshGenerator.ExportResult result,
+            VoxelNavMeshGenerator.SoupCapture cap, System.Action<string> log)
+        {
+            if (cap == null || result == null || string.IsNullOrEmpty(result.BinPath))
+                return;
+            try
+            {
+                string dir = System.IO.Path.GetDirectoryName(result.BinPath);
+                string name = result.PrefabName;
+                string terrainPath = System.IO.Path.Combine(dir, name + "_soup_terrain.obj");
+                string assetsPath = System.IO.Path.Combine(dir, name + "_soup_assets.obj");
+                WriteObjEngine(terrainPath, cap.TerrainVertsEngine, cap.TerrainTris);
+                WriteObjEngine(assetsPath, cap.AssetVertsEngine, cap.AssetTris);
+                log("soup OBJ written: " + terrainPath);
+                log("soup OBJ written: " + assetsPath);
+            }
+            catch (Exception ex)
+            {
+                log("soup OBJ ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
+            }
+        }
+
+        private static void WriteObjEngine(string path, float[] verts, int[] tris)
+        {
+            var ic = CultureInfo.InvariantCulture;
+            int vc = verts != null ? verts.Length / 3 : 0;
+            int fc = tris != null ? tris.Length / 3 : 0;
+            var sb = new System.Text.StringBuilder();
+            sb.Append("# engine-space soup (v2 voxel core input): vertices ").Append(vc.ToString(ic))
+              .Append(" faces ").Append(fc.ToString(ic)).AppendLine();
+            for (int i = 0; i < vc; i++)
+            {
+                sb.Append("v ")
+                  .Append(verts[i * 3 + 0].ToString("R", ic)).Append(' ')
+                  .Append(verts[i * 3 + 1].ToString("R", ic)).Append(' ')
+                  .Append(verts[i * 3 + 2].ToString("R", ic)).AppendLine();
+            }
+            for (int f = 0; f < fc; f++)
+            {
+                sb.Append("f ")
+                  .Append((tris[f * 3 + 0] + 1).ToString(ic)).Append(' ')
+                  .Append((tris[f * 3 + 1] + 1).ToString(ic)).Append(' ')
+                  .Append((tris[f * 3 + 2] + 1).ToString(ic)).AppendLine();
+            }
+            System.IO.File.WriteAllText(path, sb.ToString(), System.Text.Encoding.UTF8);
         }
 
         private static string F1(double value)

@@ -20,12 +20,29 @@ namespace BetterBannerlordNavmeshing
             public int Height;
             public float Spacing;
             public bool UsedPointFallback;
+
+            // Optional terrain-hole mask, indexed like Heights (true = hole/void). Only produced when
+            // the hole audit is requested: the engine's bulk node arrays (our fast path) carry no hole
+            // information, so a hole only shows up as a disagreement between the stored height and the
+            // hole-aware point query Scene.GetTerrainHeight(pos, checkHoles: true).
+            public bool[] HoleMask;
         }
 
         // Tolerance for comparing a node's stored vertex against a point sample.
         private const float SampleTolerance = 0.25f;
 
+        // A stored height that disagrees with the hole-aware point query by more than this is treated
+        // as a terrain hole. Kept well above the observed bulk-vs-metadata noise (~1.6 m on Birtu is
+        // metadata-only; the point cross-check matched 324/324 at 0.25 m), so this only fires on a
+        // genuine void in the surface.
+        private const float HoleAuditToleranceMeters = 1.0f;
+
         public static TerrainGrid Read(Scene scene, System.Action<string> log)
+        {
+            return Read(scene, false, log);
+        }
+
+        public static TerrainGrid Read(Scene scene, bool holeAudit, System.Action<string> log)
         {
             if (scene == null)
                 throw new ArgumentNullException("scene");
@@ -76,7 +93,11 @@ namespace BetterBannerlordNavmeshing
                 TerrainGrid grid = ReadBulk(scene, log, nodeCountX, nodeCountY, verts, quadLen,
                     globalWidth, globalHeight);
                 if (grid != null)
+                {
+                    if (holeAudit)
+                        AuditHoles(scene, log, grid);
                     return grid;
+                }
             }
             catch (Exception ex)
             {
@@ -84,7 +105,41 @@ namespace BetterBannerlordNavmeshing
                     + " -- falling back to point sampling");
             }
 
+            // Point fallback: every vertex already comes from the hole-aware query, so no audit is needed.
             return ReadPointFallback(scene, log, globalWidth, globalHeight, quadLen);
+        }
+
+        // Compares every stored vertex against Scene.GetTerrainHeight(pos, checkHoles: true). Vertices
+        // that disagree beyond the tolerance are terrain holes (voids); their cells are dropped from the
+        // terrain soup so no walkable lid is emitted over a carve.
+        private static void AuditHoles(Scene scene, System.Action<string> log, TerrainGrid grid)
+        {
+            int w = grid.Width;
+            int h = grid.Height;
+            var mask = new bool[w * h];
+            int holes = 0;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (int x = 0; x < w; x++)
+            {
+                float wx = x * grid.Spacing;
+                for (int y = 0; y < h; y++)
+                {
+                    float wy = y * grid.Spacing;
+                    float point = scene.GetTerrainHeight(new Vec2(wx, wy), true);
+                    if (Math.Abs(point - grid.Heights[x * h + y]) > HoleAuditToleranceMeters)
+                    {
+                        mask[x * h + y] = true;
+                        holes++;
+                    }
+                }
+            }
+            watch.Stop();
+            grid.HoleMask = holes > 0 ? mask : null;
+            Emit(log, "terrain hole audit: verts=" + (w * h) + " holes=" + holes
+                + " (tol " + F(HoleAuditToleranceMeters) + "m, auditMs=" + watch.ElapsedMilliseconds + ")");
+            if (holes > 0)
+                Emit(log, "terrain hole audit: " + holes
+                    + " stored vertices disagree with GetTerrainHeight(checkHoles=true); their cells are dropped from the terrain soup");
         }
 
         // Bulk path: one GetTerrainHeightData call per node, stitched into the

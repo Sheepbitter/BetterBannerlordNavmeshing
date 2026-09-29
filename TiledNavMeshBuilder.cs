@@ -55,9 +55,19 @@ namespace BetterBannerlordNavmeshing
             //  - detail mesh max error (metres) when UseDetailMesh is on.
             public float MaxErrorMeters = 0.25f;
 
-            public float AgentRadiusMeters = 0.35f;
+            // Agent radius. Erosion = ceil(radius/cs) cells per side, and the tile border is
+            // 3 + ceil(radius/cs). Default 0.25 m: at the default cs 0.5 this is still erosion 1
+            // (identical to 0.35), but at the recommended cs 0.25 it stays erosion 1 instead of 2,
+            // which is what lets 1.0-1.2 m doorways/walkways/stairs survive.
+            public float AgentRadiusMeters = 0.25f;
             public float AgentHeightMeters = 1.8f;
             public float AgentMaxClimbMeters = 0.4f;
+
+            // Recast's ledge filter (FilterLedgeSpans). It removes spans that sit within walkableClimb
+            // of a drop, which is what keeps the mesh off cliff edges -- but it also eats the border
+            // cells of narrow walkways/bridges that have drops on both sides. Toggle off to keep those
+            // (at the cost of mesh reaching closer to real ledges). Default on = Recast behaviour.
+            public bool UseLedgeFilter = true;
 
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
@@ -221,6 +231,67 @@ namespace BetterBannerlordNavmeshing
                     tris[t++] = i00; tris[t++] = i01; tris[t++] = i11;
                 }
             }
+        }
+
+        // Terrain soup with a hole mask (indexed like stitchedHeights; true = terrain hole/void).
+        // Any cell whose four corners touch a hole is skipped entirely, so no walkable lid is emitted
+        // over a carve -- the real floor below (an asset) is then the only surface there.
+        public static void BuildTerrainSoup(float[] stitchedHeights, int width, int height,
+            float terrainVertexSpacing, int sampleStride, bool[] holeMask,
+            out float[] vertsXyz, out int[] tris)
+        {
+            if (stitchedHeights == null)
+                throw new ArgumentNullException("stitchedHeights");
+            if (width < 2 || height < 2)
+                throw new ArgumentException("width and height must be at least 2.");
+            if (stitchedHeights.Length != width * height)
+                throw new ArgumentException("stitchedHeights length must equal width * height.");
+            if (sampleStride < 1)
+                throw new ArgumentException("sampleStride must be at least 1.");
+            if (holeMask == null)
+                throw new ArgumentNullException("holeMask");
+
+            int[] sampleX = BuildSampleAxis(width, sampleStride);
+            int[] sampleY = BuildSampleAxis(height, sampleStride);
+            int samplesX = sampleX.Length;
+            int samplesY = sampleY.Length;
+
+            vertsXyz = new float[samplesX * samplesY * 3];
+            for (int sx = 0; sx < samplesX; sx++)
+            {
+                int sourceX = sampleX[sx];
+                for (int sy = 0; sy < samplesY; sy++)
+                {
+                    int sourceY = sampleY[sy];
+                    int s = (sx * samplesY + sy) * 3;
+                    vertsXyz[s + 0] = sourceX * terrainVertexSpacing;
+                    vertsXyz[s + 1] = stitchedHeights[sourceX * height + sourceY];
+                    vertsXyz[s + 2] = sourceY * terrainVertexSpacing;
+                }
+            }
+
+            int cellsX = samplesX - 1;
+            int cellsY = samplesY - 1;
+            var tri = new List<int>(cellsX > 0 && cellsY > 0 ? cellsX * cellsY * 6 : 0);
+            for (int sx = 0; sx < cellsX; sx++)
+            {
+                for (int sy = 0; sy < cellsY; sy++)
+                {
+                    if (holeMask[sampleX[sx] * height + sampleY[sy]]
+                        || holeMask[sampleX[sx + 1] * height + sampleY[sy]]
+                        || holeMask[sampleX[sx + 1] * height + sampleY[sy + 1]]
+                        || holeMask[sampleX[sx] * height + sampleY[sy + 1]])
+                        continue;
+
+                    int i00 = sx * samplesY + sy;
+                    int i10 = (sx + 1) * samplesY + sy;
+                    int i11 = (sx + 1) * samplesY + (sy + 1);
+                    int i01 = sx * samplesY + (sy + 1);
+                    tri.Add(i00); tri.Add(i11); tri.Add(i10);
+                    tri.Add(i00); tri.Add(i01); tri.Add(i11);
+                }
+            }
+            tris = tri.ToArray();
         }
 
         // Appends engine-space (Z-up) asset triangles to a Recast Y-up terrain soup. Asset
@@ -390,6 +461,7 @@ namespace BetterBannerlordNavmeshing
                 + "m walkable(r,h,c)=" + walkableRadius + "/" + walkableHeight + "/" + walkableClimb
                 + " edgeLen=" + s.MaxEdgeLenVoxels + "vox vpp=" + s.VertsPerPoly
                 + " regionMin=" + s.RegionMinSize + " regionMerge=" + s.RegionMergeSize
+                + " ledgeFilter=" + s.UseLedgeFilter
                 + " detail=" + s.UseDetailMesh
                 + " detSampleDist=" + F(EffectiveDetailSampleDist(s)) + "m"
                 + " contourSimpErr=" + F(EffectiveContourMaxError(s)) + "vox");
@@ -869,7 +941,8 @@ namespace BetterBannerlordNavmeshing
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
-                RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
+                if (s.UseLedgeFilter)
+                    RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
 
                 RcCompactHeightfield chf = RcCompacts.BuildCompactHeightfield(ctx, walkableHeight, walkableClimb, hf);

@@ -165,6 +165,9 @@ terrain and assets, asset winding fix; harness multi-level tests (platform/room/
 pass. Open: isolated walkable islands under ~16 m² are pruned by the region minimum (connected structures
 unaffected); the detail mesh can carry locally steeper faces than the poly skeleton; height-snap for steep
 terrain remains a candidate if it shows in-editor; in-editor validation of structures (Birtu) pending.
+**V4 (2026-09-29):** narrow-feature connectivity lab -> cell size 0.25 m + agent radius 0.25 m defaults
+(1.0-1.2 m doorways/walkways/stair treads now connect; ~4x build cost, async keeps the UI alive);
+terrain-hole audit for false lids over carves + soup-OBJ provenance dump.
 
 **Phase 3 — Assets.** Collision triangles with BVH culling; flora excluded, dynamic skipped or static-snapped;
 buildings block by absence of faces, walkable to agent-radius edges; stairs via `HasSteps` + climb.
