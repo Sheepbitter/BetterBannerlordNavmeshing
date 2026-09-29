@@ -100,6 +100,7 @@ namespace BetterBannerlordNavmeshing
             int exFlora = 0, exBarrier = 0, exTerrain = 0, exLadder = 0;
             int exDynamic = 0, exNoShape = 0, exceptions = 0;
             int preloadNamesEmpty = 0;
+            int exUnsolid = 0;
 
             for (int i = 0; i < entities.Count; i++)
             {
@@ -129,6 +130,10 @@ namespace BetterBannerlordNavmeshing
                         || mobility == GameEntity.Mobility.Dynamic
                         || mobility == GameEntity.Mobility.DynamicForced
                         || hasDynamic;
+                    // Non-solid-for-agents markers: such a body must not become walkable navmesh.
+                    // (Not present on Birtu today; future-proofing.)
+                    bool isUnsolid = (all & (BodyFlags.Disabled | BodyFlags.OnlyCollideWithRaycast
+                        | BodyFlags.DontTransferToPhysicsEngine | BodyFlags.MissileOnly)) != 0;
 
                     // Exclusions (defaults): terrain (meshed from the heightmap), barriers
                     // (invisible blocker volumes), ladders, flora. Dynamic props are optional.
@@ -136,6 +141,7 @@ namespace BetterBannerlordNavmeshing
                     if (isFlora && !includeFlora) { exFlora++; continue; }
                     if (isBarrier) { exBarrier++; continue; }
                     if (isLadder) { exLadder++; continue; }
+                    if (isUnsolid) { exUnsolid++; continue; }
                     if (isDynamic && !includeDynamic) { exDynamic++; continue; }
 
                     PhysicsShape shape;
@@ -323,7 +329,7 @@ namespace BetterBannerlordNavmeshing
                 log("assets: entities=" + count + " physics=" + physics + " included=" + included
                     + " excluded=[flora=" + exFlora + " barrier=" + exBarrier + " terrain=" + exTerrain
                     + " ladder=" + exLadder + " dynamic=" + exDynamic + " noShape=" + exNoShape
-                    + " empty=" + exEmpty + " exceptions=" + exceptions + "]"
+                    + " empty=" + exEmpty + " exceptions=" + exceptions + " unsolid=" + exUnsolid + "]"
                     + " tris=" + result.TriangleCount + " cappedShapes=" + shapesCapped
                     + " scanMs=" + result.ScanMs);
                 log("assets: kinds stairs=" + cStairs + " wall=" + cWall + " floor=" + cFloor

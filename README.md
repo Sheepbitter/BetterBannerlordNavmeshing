@@ -223,6 +223,12 @@ Scene Nav Mesh Exporter dumps what geometry the scene actually exposes into the 
   of interest, e.g. under a bridge). Logs each hit and the vertical gaps, then compares
   `GetGroundHeightAtPosition` (and its `out normal` form), `GetTerrainHeight`, and the navmesh face group at
   that X/Y - i.e. topmost surface vs ground.
+  - **Terrain source check** (`probe terrain column:`) - the stored bulk node value at that column (both index
+    orders) vs the hole-aware `GetTerrainHeight(xy, true)` and the hole-blind `GetTerrainHeight(xy, false)`:
+    answers "is the terrain our soup is built from the live surface here, or a hole/lid?".
+  - **Asset geometry within 2 m** (`assets within 2m:`) - entity box triangle totals, the box Y range, the
+    triangle-precise count and Y range inside the 2 m disc, plus the top 5 contributors by name. Bodies are
+    preloaded by name first (the `PhysicsShape` queue), so `GetTriangle` is never called on an unloaded body.
 - **Scene levels** - `GetUpgradeLevelCount` / `GetUpgradeLevelNameOfIndex` / `GetUpgradeLevelMaskOfLevelName` /
   `GetUpgradeLevelMask`: one line per declared level plus the combined mask (used to choose face level masks).
 
@@ -236,6 +242,9 @@ Example lines:
 [..] column hit 0: z=14.02 entity='bridge_deck' flags=0x00000000 distance=185.98
 [..] column: hits=3 gaps=[0.02,7.4]
 [..] ground query: GetGroundHeightAtPosition=6.61 (normal=0,0,1) GetTerrainHeight=6.58 navMeshFaceGroup=none
+[..] probe terrain column: node=(3,7) verts=65 quad=1.563m local=(12.5,3.75)m index=(8,2) storedIxMajor=6.58m storedIyMajor=6.58m pointCheckHoles=6.58m pointNoHoles=6.58m agree(ix)=True agree(iy)=True holeAwareDiffersFromStored=False
+[..] assets within 2m: entities=7 boxTris=12048 boxZ=[6.2..9.9] nearTris=2140 nearZ=[6.31..6.74]
+[..] assets within 2m top: 'paved_terrace_a'=4210 | 'paved_terrace_b'=3855 | 'ruinous_wall_a'=2401 | 'sturgia_dungeon_corridor_c'=1582
 [..] level 0: name='level_1' mask=0x0000000F
 [..] levels: count=1 combinedMask=0x000000FF
 [..] probe done: totalMs=820
@@ -276,6 +285,10 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelAssetTrace` | `false` | Diagnostic: log one `assets: TRACE 'entity' body='...' ...` line per included entity immediately before its native triangle read, so if a crash ever happens the log's last line names the culprit. One diagnostic run only. See *Assets (structures)*. |
 | `NavMeshVoxelAgentRadius` | `0.25` | v2 agent radius (m). Erosion = `ceil(radius / NavMeshVoxelCellSize)` cells each side; tile border = `3 + ceil(radius / cs)`. 0.25 keeps erosion at 1 cell even at cs 0.25 (0.35 would erode 2 and close 1.0-1.2 m doorways/walkways/stairs). See *Narrow features & connectivity*. |
 | `NavMeshVoxelLedgeFilter` | `true` | v2 Recast ledge filter. On = Recast default (trims spans within `walkableClimb` of a drop, keeping the mesh off cliff edges) but it also eats the border cells of narrow walkways with drops on both sides. Turn off if narrow structures keep losing their edges. |
+| `NavMeshVoxelGapFillCells` | `2` | Gap bridging (cells, `0` = off). Before erosion, a column with no walkable span is filled when walkable spans flank it on opposite sides along one axis with an empty run of at most this many cells and a floor within the agent climb. Closes abutting-prefab / paved-terrace seams (a hairline collision gap that erosion would widen into a break). See *Gap bridging*. |
+| `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
+| `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
+| `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -304,6 +317,8 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh` (default true),
   `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox),
   `NavMeshVoxelAgentRadius` (default 0.25 m), `NavMeshVoxelLedgeFilter` (default true),
+  `NavMeshVoxelGapFillCells` (default 2), `NavMeshVoxelStitchMaxGapCells` (default 6),
+  `NavMeshVoxelPruneIsolatedIslands` / `NavMeshVoxelPruneMaxIslandFaces` (default true / 400),
   `NavMeshVoxelIncludeAssets` / `NavMeshVoxelIncludeDynamic` / `NavMeshVoxelIncludeFlora` (asset ingestion;
   see *Assets (structures)*), `NavMeshVoxelTerrainHoleAudit` (default false; see *Terrain holes*),
   `NavMeshVoxelWriteSoupObj` (default false; soup dump), `NavMeshVoxelAssetTrace` (default false; crash
@@ -393,6 +408,7 @@ name):
 | Flora (`BodyOwnerFlora`) | **excluded** (`NavMeshVoxelIncludeFlora = false`) | Usually visual; many small shapes add faces without being reliably navigable. |
 | Barriers (`Barrier` / `Barrier3D`) | excluded | Invisible blocker volumes; walkable faces must not sit on them. |
 | Ladders (`Ladder`) | excluded | Not a walkable surface; the engine handles ladders separately. |
+| Non-solid-for-agents markers (`Disabled` / `OnlyCollideWithRaycast` / `DontTransferToPhysicsEngine` / `MissileOnly`) | excluded | Flagged as not solid for agents: such a body must not become walkable navmesh. Counted as `unsolid=` in the exclusion log. (None on Birtu today; future-proofing.) |
 | Terrain-owner bodies (`BodyOwnerTerrain`) | excluded | The terrain is already meshed from the heightfield; reading it again would double up. |
 | Non-physics / empty / no-shape entities | excluded | Nothing to voxelize. |
 
@@ -466,6 +482,71 @@ Measured sweep (`P` = connected, order a b c d e; multi-threaded, 24x24 m scenes
   the async build keeps the editor responsive). Set 0.5 for fast iteration on open terrain - 0.25 with the
   default `NavMeshVoxelAgentRadius = 0.25` is the shipping configuration.
 
+### Gap bridging
+
+A hairline collision gap where two prefab floor pieces abut (a paved terrace, a corridor joint) is usually
+sub-cell, but agent-radius erosion widens it into a real break: erosion strips one cell from each side of the
+gap and the ledge filter strips one more (it reads an in-bounds *empty* column as a drop). `NavMeshVoxelGapFillCells`
+(default 2, `0` = off) closes such seams. Right after rasterization - and **before** the ledge filter, otherwise
+that filter would reopen the seam - a column with no walkable span is filled when walkable spans flank it on
+**opposite sides along one axis** (N/S, E/W or either diagonal) with an empty run of at most `gapFillCells`
+cells and a floor difference within the agent climb; the filled span takes the **lower** neighbour floor. Only
+cells inside a tile's own area are filled and only columns inside that tile's padded field are probed, so
+exactly one tile decides each world cell (identical across a tile boundary - no new cracks).
+
+Harness `Test 16` (two floors with a gap, union-find connectivity):
+
+| scenario | cap | result |
+|---|---|---|
+| 1-cell gap | 2 (default) | connected |
+| 1-cell gap | 0 (off) | broken |
+| 2-cell gap | 2 (default) | connected |
+| 2-cell gap | 1 | broken |
+| 3-cell gap | 2 (default) | broken (over the cap) |
+| 2-cell gap, floors 2 m apart | 2 (default) | broken (delta > climb) |
+| 1.5 m ditch with a floor below | 2 (default) | broken (real ditch) |
+
+On all existing harness scenes the fill fires zero times, so face counts are unchanged.
+
+### Stitching
+
+Gap bridging only closes seams the rasterizer stores as empty columns. A seam can also survive as **two
+disconnected mesh components** (the collision gap rasterized a cell on one side, the contour inset another).
+`NavMeshVoxelStitchMaxGapCells` (cells, `0` = off) runs **per tile, after the tile's mesh is built**: it finds
+the tile's separate components, and for each pair whose nearest boundary edges are within the cap and within
+`walkableClimb` it adds a two-triangle quad that **reuses existing boundary vertices** (so both weld paths stay
+exact). It is refused when the tile's solid spans put geometry inside the gap envelope - a wall, a closed door -
+or leave less than `walkableHeight` of headroom (a ceiling). Deterministic and per-tile only, so tile order
+cannot change the result. New edges are only added when they are fresh, and the invariant gate stays green
+(no duplicate faces, no edge shared by more than two faces, no self-loops).
+
+**Calibration (measured, harness Test 18):** at cs 0.25 / radius 0.25 a real seam (a 1-cell raster gap)
+becomes a **1.25 m = 5-cell mesh gap** after erosion and the contour inset. The default `6` therefore covers
+the measured case with margin (`5` is the minimum that works; `4` is one cell short and can serve as a
+conservative cap if a bridge ever appears where it should not). `0` disables stitching.
+
+Harness `Test 18` (union-find connectivity):
+
+| scenario | cap | result |
+|---|---|---|
+| 1-cell raster seam, clear air | 5 | connected (2 faces added) |
+| same seam | 4 | broken (calibration row: one cell short of the 5-cell gap) |
+| same seam | 0 (off) | broken |
+| same seam with a wall in the gap | 5 | broken (refused) |
+| same seam with a low ceiling | 5 | broken (refused) |
+| floors 2 m apart in height | 5 | broken (delta > climb) |
+
+### Island pruning
+
+After the merge and the non-manifold repair, *small isolated islands* are removed: fragments with at most
+`NavMeshVoxelPruneMaxIslandFaces` faces (default 400) when `NavMeshVoxelPruneIsolatedIslands` is on. This is
+what clears sealed-void lids and stray patches (they cannot be reached by an agent anyway); the big networks
+(terrain, castle structure) are never touched because they are far above the cap. `0` (or the bool off)
+disables it. The `v2: prune: ...` line reports what was removed and where.
+
+Harness `Test 19`: a big terrain island (> cap) is bit-identical with pruning on/off; a small detached
+platform island is pruned with the default and kept when the cap is 0.
+
 ### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
@@ -493,6 +574,11 @@ if the tunnel lid persists with the audit on, the `NavMeshVoxelWriteSoupObj` dum
 terrain (drop it) or a genuine asset surface. The harness proves the mechanism (`Test 15`: control has a lid;
 with the mask the lid is gone and the asset floor below is present and connected).
 
+A second, different lid cause is **real geometry inside a sealed void** - e.g. the tops of `sturgia_dungeon_corridor_c`
+modules under a `large_plank_floor_a` ~4 m above, with no agent access. That is not a terrain problem, so the
+always-on `v2: islands=...` line is emitted as data: connected components by face adjacency with size, area,
+centroid and Y range. A pruning rule can be chosen from it (small area, isolated, within a height band).
+
 ### How to read the v2 log lines
 
 Every run also logs the terrain read (see above), then the voxel core:
@@ -505,7 +591,7 @@ NavMesh: assets: preloading <M> unique physics bodies by name
 NavMesh: assets: preloaded <M> bodies by name (preloadMs=<n>)
 NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- every 250 entities (read pass)
 NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=.. dyn=.. meshCount=.. tris=..   <- only when NavMeshVoxelAssetTrace=true
-NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=..] tris=... cappedShapes=... scanMs=...
+NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=.. unsolid=..] tris=... cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 10 by triangle count)
 NavMesh: v2: terrain hole mask applied: cells touching a hole are dropped from the soup   <- only when holes were found
@@ -513,14 +599,19 @@ NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted un
 NavMesh: v2: soup verts=... tris=... (terrain only) stride=... spacing=...m      <- only when NavMeshVoxelIncludeAssets=false or no assets found
 NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
 NavMesh: v2: agentClimb=0.6m (auto) walkableClimb=3 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=50.194deg (setting=50deg)
-NavMesh: v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 ledgeFilter=True detail=True detSampleDist=2m contourSimpErr=1.3vox
+NavMesh: v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 gapFill=2 stitch=6 prune=400 ledgeFilter=True detail=True detSampleDist=2m contourSimpErr=1.3vox
 NavMesh: v2: contour maxError=1.3vox (= 0.325m at cs=0.25m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
 NavMesh: soup OBJ written: <folder>\<prefab>_soup_terrain.obj      <- only when NavMeshVoxelWriteSoupObj=true
 NavMesh: soup OBJ written: <folder>\<prefab>_soup_assets.obj
 NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
+NavMesh: v2: gap fill: filled=<n> emptyColumns=<n> (cap=2 cells, before erosion)   <- only when NavMeshVoxelGapFillCells>0
+NavMesh: v2: stitch: added=<n> faces across tiles (cap=6 cells)                     <- only when NavMeshVoxelStitchMaxGapCells>0
+NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
+NavMesh: v2: invariants: faces=... edges=... boundary=... maxEdgeMult=.. dupFaces=.. selfLoops=.. minEdges=.. -> PASS
+NavMesh: v2: islands=<n> totalFaces=... largest=[0:faces=... area=...m2 centroid=(x,y,z) zr=[min..max] | 1:... ] top10
 NavMesh: v2: mesh V=... E=... F=... degenerate=... binBytes=... buildMs=...
 NavMesh: v2 timings: tilesMs=... mergeMs=... totalMs=...
 NavMesh: v2: tileMs min/avg/max=.../.../...
@@ -541,7 +632,16 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
   and asset soup for geometry provenance.
 - `v2: tiles=... built=... failed=...` - failed tiles are also logged individually as `v2: FAILED tile#...`
   with the first exception message; they are never silently dropped.
+- `v2: gap fill: filled=... emptyColumns=...` - columns bridged by `NavMeshVoxelGapFillCells` and how many
+  empty columns were candidates (the fill fires zero times on open terrain, so face counts are unchanged).
+- `v2: stitch: added=... faces across tiles` - connector faces added by the per-tile stitch (0 = no near-miss
+  cuts found at that cap).
+- `v2: prune: removed ... islands, ... faces` - islands dropped as too small, the largest one's size and
+  position, and how many islands were kept.
 - `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.
+- `v2: islands=... totalFaces=... largest=[...]` - always on and cheap: connected components by face adjacency,
+  with the ten largest by area (`faces`, `area` m^2, area-weighted `centroid`, and the island's Y range `zr`).
+  This is the data used to choose a rule for pruning sealed-void lids.
 - After that the normal `build done` / import lines appear (the shared path).
 
 ### A/B against v1

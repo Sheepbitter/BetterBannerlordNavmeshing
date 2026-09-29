@@ -57,6 +57,21 @@ namespace BetterBannerlordNavmeshing
         // their edges (or if a level is connected on one side but not the other).
         public bool NavMeshVoxelLedgeFilter = true;
 
+        // Gap fill (cells, default 2, 0 = off). Before erosion, fills a column with no walkable span
+        // when walkable spans flank it on opposite sides along one axis with an empty run of at most
+        // this many cells and a floor difference within the agent climb. Closes abutting-prefab /
+        // paved-terrace seams (a hairline collision gap that erosion would widen into a break).
+        public int NavMeshVoxelGapFillCells = 2;
+
+        // Stitch (cells, default 4 = 1.0 m at cellSize 0.25, 0 = off). Per tile: reconnects two mesh
+        // components whose nearest boundary edges are within this many cells and within the agent climb,
+        // by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings.
+        public int NavMeshVoxelStitchMaxGapCells = 6;
+
+        // Prune small isolated islands after the merge (sealed-void lids, stray fragments).
+        public bool NavMeshVoxelPruneIsolatedIslands = true;
+        public int NavMeshVoxelPruneMaxIslandFaces = 400;
+
         // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
         // the terrain surface instead of chording under hills/knolls; bounded by
         // NavMeshMaxErrorMeters. Disable for a leaner bin (flat/plateau scenes only).
@@ -350,7 +365,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError,
                 NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
-                NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit);
+                NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
+                NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands, NavMeshVoxelPruneMaxIslandFaces);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -371,7 +387,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false);
+                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -398,7 +414,11 @@ namespace BetterBannerlordNavmeshing
             float voxelAgentRadius,
             bool voxelLedgeFilter,
             bool voxelWriteSoupObj,
-            bool voxelTerrainHoleAudit)
+            bool voxelTerrainHoleAudit,
+            int voxelGapFillCells,
+            int voxelStitchMaxGapCells,
+            bool voxelPruneIsolatedIslands,
+            int voxelPruneMaxIslandFaces)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -433,6 +453,9 @@ namespace BetterBannerlordNavmeshing
                     + " voxelAgentClimb=" + F(voxelAgentClimbMeters) + "m"
                     + " voxelAgentRadius=" + F(voxelAgentRadius) + "m"
                     + " voxelLedgeFilter=" + voxelLedgeFilter
+                    + " voxelGapFillCells=" + voxelGapFillCells
+                    + " voxelStitchMaxGapCells=" + voxelStitchMaxGapCells
+                    + " voxelPrune=" + (voxelPruneIsolatedIslands ? voxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
@@ -473,6 +496,10 @@ namespace BetterBannerlordNavmeshing
                     voxel.ContourMaxErrorVoxels = voxelContourMaxError;
                     voxel.AgentRadiusMeters = voxelAgentRadius;
                     voxel.UseLedgeFilter = voxelLedgeFilter;
+                    voxel.GapFillCells = voxelGapFillCells;
+                    voxel.StitchMaxGapCells = voxelStitchMaxGapCells;
+                    voxel.PruneIsolatedIslands = voxelPruneIsolatedIslands;
+                    voxel.PruneMaxIslandFaces = voxelPruneMaxIslandFaces;
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
@@ -611,6 +638,9 @@ namespace BetterBannerlordNavmeshing
                     + " voxelAgentClimb=" + F(NavMeshVoxelAgentClimbMeters) + "m"
                     + " voxelAgentRadius=" + F(NavMeshVoxelAgentRadius) + "m"
                     + " voxelLedgeFilter=" + NavMeshVoxelLedgeFilter
+                    + " voxelGapFillCells=" + NavMeshVoxelGapFillCells
+                    + " voxelStitchMaxGapCells=" + NavMeshVoxelStitchMaxGapCells
+                    + " voxelPrune=" + (NavMeshVoxelPruneIsolatedIslands ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
@@ -668,6 +698,10 @@ namespace BetterBannerlordNavmeshing
                 voxel.ContourMaxErrorVoxels = NavMeshVoxelContourMaxError;
                 voxel.AgentRadiusMeters = NavMeshVoxelAgentRadius;
                 voxel.UseLedgeFilter = NavMeshVoxelLedgeFilter;
+                voxel.GapFillCells = NavMeshVoxelGapFillCells;
+                voxel.StitchMaxGapCells = NavMeshVoxelStitchMaxGapCells;
+                voxel.PruneIsolatedIslands = NavMeshVoxelPruneIsolatedIslands;
+                voxel.PruneMaxIslandFaces = NavMeshVoxelPruneMaxIslandFaces;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;

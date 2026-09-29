@@ -440,6 +440,223 @@ namespace BetterBannerlordNavmeshing
             log("ground query: GetGroundHeightAtPosition=" + Fs(ground)
                 + " (normal=" + V(normal) + ") GetTerrainHeight=" + Fs(terrain)
                 + " navMeshFaceGroup=" + faceGroup);
+
+            TerrainColumnProbe(scene, log, x, y, terrain);
+            AssetColumnProbe(scene, log, x, y);
+        }
+
+        // (a) Terrain source check at the attached entity's column: the stored (bulk) node value vs the
+        // hole-aware point query. If they disagree, the bulk grid our terrain soup is built from is not
+        // the live surface at this spot (a terrain hole/carve, or a stale node array).
+        private static void TerrainColumnProbe(Scene scene, System.Action<string> log, float x, float y,
+            float pointWithHoles)
+        {
+            try
+            {
+                if (!scene.HasTerrainHeightmap)
+                {
+                    log("probe terrain column: no terrain heightmap on this scene.");
+                    return;
+                }
+                Vec2i nodeDimension;
+                float nodeSize;
+                int layerCount, layerVersion;
+                scene.GetTerrainData(out nodeDimension, out nodeSize, out layerCount, out layerVersion);
+                int nodeCountX = nodeDimension.Item1;
+                int nodeCountY = nodeDimension.Item2;
+                int nx = (int)Math.Floor(x / nodeSize);
+                int ny = (int)Math.Floor(y / nodeSize);
+                if (nx < 0) nx = 0; if (ny < 0) ny = 0;
+                if (nx >= nodeCountX) nx = nodeCountX - 1;
+                if (ny >= nodeCountY) ny = nodeCountY - 1;
+
+                int verts;
+                float quad, nmin, nmax;
+                scene.GetTerrainNodeData(nx, ny, out verts, out quad, out nmin, out nmax);
+                float[] node = scene.GetTerrainHeightData(nx, ny);
+                if (node == null || verts < 2 || node.Length != verts * verts)
+                {
+                    log("probe terrain column: node=(" + nx + "," + ny + ") data unavailable (verts="
+                        + verts + " len=" + (node == null ? -1 : node.Length) + ").");
+                    return;
+                }
+
+                float lx = x - nx * nodeSize;
+                float ly = y - ny * nodeSize;
+                int ix = (int)Math.Round(lx / quad);
+                int iy = (int)Math.Round(ly / quad);
+                if (ix < 0) ix = 0; if (iy < 0) iy = 0;
+                if (ix >= verts) ix = verts - 1;
+                if (iy >= verts) iy = verts - 1;
+                float storedIxMajor = node[ix * verts + iy];
+                float storedIyMajor = node[iy * verts + ix];
+
+                float pointNoHoles = float.MaxValue;
+                try
+                {
+                    pointNoHoles = scene.GetTerrainHeight(new Vec2(x, y), false);
+                }
+                catch (Exception ex)
+                {
+                    log("probe terrain column: GetTerrainHeight(noHoles) error: " + E(ex));
+                }
+
+                float tol = 0.25f;
+                bool agreeIx = Math.Abs(storedIxMajor - pointWithHoles) <= tol;
+                bool agreeIy = Math.Abs(storedIyMajor - pointWithHoles) <= tol;
+                log("probe terrain column: node=(" + nx + "," + ny + ") verts=" + verts + " quad=" + F(quad)
+                    + "m local=(" + F(lx) + "," + F(ly) + ")m index=(" + ix + "," + iy + ")"
+                    + " storedIxMajor=" + Fs(storedIxMajor) + "m storedIyMajor=" + Fs(storedIyMajor) + "m"
+                    + " pointCheckHoles=" + Fs(pointWithHoles) + "m pointNoHoles=" + Fs(pointNoHoles) + "m"
+                    + " agree(ix)=" + agreeIx + " agree(iy)=" + agreeIy
+                    + " holeAwareDiffersFromStored=" + (!agreeIx && !agreeIy));
+            }
+            catch (Exception ex)
+            {
+                log("probe terrain column error: " + E(ex));
+            }
+        }
+
+        // (b) Asset geometry within 2 m of the attached entity's column: triangle count, z-range and the
+        // biggest contributors by name. Bodies are preloaded by name first (the engine's own recipe):
+        // GetTriangle read-AVs the process on a body whose native mesh table is not loaded yet.
+        private static void AssetColumnProbe(Scene scene, System.Action<string> log, float x, float y)
+        {
+            const float radius = 2f;
+            var entities = new List<GameEntity>();
+            try
+            {
+                scene.GetEntities(ref entities);
+            }
+            catch (Exception ex)
+            {
+                log("assets within 2m error: " + E(ex));
+                return;
+            }
+
+            var cand = new List<GameEntity>();
+            var names = new List<string>();
+            var triCounts = new List<int>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            int boxTris = 0;
+            int boxZMin = 0, boxZMax = 0;
+            bool haveBox = false;
+
+            for (int i = 0; i < entities.Count; i++)
+            {
+                GameEntity e = entities[i];
+                if (e == null) continue;
+                try
+                {
+                    if (!e.HasPhysicsBody()) continue;
+                    BoundingBox bb = SafeBox(() => e.GetGlobalBoundingBox());
+                    double dx = Math.Max(0.0, Math.Max(bb.min.x - x, x - bb.max.x));
+                    double dy = Math.Max(0.0, Math.Max(bb.min.y - y, y - bb.max.y));
+                    if (dx * dx + dy * dy > (double)radius * radius) continue;
+
+                    PhysicsShape shape = e.GetBodyShape();
+                    if (shape == null) continue;
+                    int meshCount = SafeInt(() => shape.TriangleMeshCount());
+                    int et = 0;
+                    for (int m = 0; m < meshCount; m++)
+                        et += SafeInt(() => shape.TriangleCountInTriangleMesh(m));
+                    if (et <= 0) continue;
+
+                    cand.Add(e);
+                    triCounts.Add(et);
+                    names.Add(SafeEntityName(e));
+                    boxTris += et;
+                    if (!haveBox) { boxZMin = (int)bb.min.z; boxZMax = (int)bb.max.z; haveBox = true; }
+                    else
+                    {
+                        if (bb.min.z < boxZMin) boxZMin = (int)bb.min.z;
+                        if (bb.max.z > boxZMax) boxZMax = (int)bb.max.z;
+                    }
+
+                    string bodyName = null;
+                    try { bodyName = shape.GetName(); } catch (Exception) { }
+                    if (!string.IsNullOrEmpty(bodyName) && seen.Add(bodyName))
+                        PhysicsShape.AddPreloadQueueWithName(bodyName, new Vec3(1f, 1f, 1f, -1f));
+                }
+                catch (Exception ex)
+                {
+                    log("assets within 2m entity error: " + E(ex));
+                }
+            }
+
+            if (cand.Count == 0)
+            {
+                log("assets within 2m: none (boxTris=0)");
+                return;
+            }
+
+            try
+            {
+                PhysicsShape.ProcessPreloadQueue();
+            }
+            catch (Exception ex)
+            {
+                log("assets within 2m preload error: " + E(ex));
+            }
+
+            // Triangle-precise pass (safe now that the bodies are queued).
+            var tri = new Vec3[3];
+            int nearTris = 0;
+            float tzMin = float.MaxValue, tzMax = float.MinValue;
+            int boxOnly = 0;
+            for (int c = 0; c < cand.Count; c++)
+            {
+                GameEntity e = cand[c];
+                PhysicsShape shape;
+                try { shape = e.GetBodyShape(); }
+                catch (Exception) { continue; }
+                if (shape == null) { boxOnly++; continue; }
+                int meshCount = SafeInt(() => shape.TriangleMeshCount());
+                bool read = true;
+                for (int m = 0; m < meshCount && read && nearTris < 200000; m++)
+                {
+                    int tc = SafeInt(() => shape.TriangleCountInTriangleMesh(m));
+                    for (int t = 0; t < tc; t++)
+                    {
+                        if (nearTris >= 200000) break;
+                        try { shape.GetTriangle(tri, m, t); }
+                        catch (Exception) { continue; }
+                        float cx = (tri[0].x + tri[1].x + tri[2].x) / 3f;
+                        float cy = (tri[0].y + tri[1].y + tri[2].y) / 3f;
+                        float dx = cx - x, dy = cy - y;
+                        if (dx * dx + dy * dy > radius * radius) continue;
+                        nearTris++;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            if (tri[k].z < tzMin) tzMin = tri[k].z;
+                            if (tri[k].z > tzMax) tzMax = tri[k].z;
+                        }
+                    }
+                }
+            }
+
+            log("assets within 2m: entities=" + cand.Count + " boxTris=" + boxTris
+                + " boxZ=[" + boxZMin + ".." + boxZMax + "]"
+                + " nearTris=" + nearTris
+                + (nearTris > 0 ? " nearZ=[" + Fs(tzMin) + ".." + Fs(tzMax) + "]" : "")
+                + (boxOnly > 0 ? " (shapeUnavailable=" + boxOnly + ")" : ""));
+
+            var order = new List<int>();
+            for (int i = 0; i < cand.Count; i++) order.Add(i);
+            order.Sort(delegate (int a, int b)
+            {
+                int cmp = triCounts[b].CompareTo(triCounts[a]);
+                if (cmp != 0) return cmp;
+                return names[a].CompareTo(names[b]);
+            });
+            int top = Math.Min(5, order.Count);
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < top; i++)
+            {
+                if (i > 0) sb.Append(" | ");
+                sb.Append("'").Append(names[order[i]]).Append("'=").Append(triCounts[order[i]]);
+            }
+            log("assets within 2m top: " + sb.ToString());
         }
 
         // ------------------------------------------------------------------

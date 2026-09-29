@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using DotRecast.Core;
@@ -69,6 +70,25 @@ namespace BetterBannerlordNavmeshing
             // (at the cost of mesh reaching closer to real ledges). Default on = Recast behaviour.
             public bool UseLedgeFilter = true;
 
+            // Gap fill (cells, before erosion). 0 = off. Fills a column with no walkable span when it
+            // is flanked by walkable spans on opposite sides along one axis (N/S, E/W or the two
+            // diagonal axes) with an empty run of at most this many cells and a floor difference
+            // within walkableClimb. Fixes abutting-prefab / paved-terrace seams whose hairline
+            // collision gap erosion would otherwise widen into a break. 2 by default.
+            public int GapFillCells = 2;
+
+            // Stitch (per tile, after the tile mesh is built). 0 = off. Reconnects two mesh
+            // components of the same tile whose nearest boundary edges are within this many cells
+            // (default 4 = 1.0 m at cs 0.25) and whose floors differ by at most walkableClimb, by
+            // adding a small quad that reuses existing boundary vertices. Refused when solid geometry
+            // sits inside the gap envelope (a wall / closed door / low ceiling).
+            public int StitchMaxGapCells = 4;
+
+            // Prune (after the global merge + non-manifold repair). Removes small isolated islands
+            // (sealed-void lids and stray fragments) so they cannot sit where no agent can reach.
+            public bool PruneIsolatedIslands = true;
+            public int PruneMaxIslandFaces = 400;
+
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
 
@@ -129,6 +149,9 @@ namespace BetterBannerlordNavmeshing
             public int VertexCount;
             public int FaceCount;
             public int RasterizedTris;
+            public int GapFilled;      // columns filled by the gap-fill pre-pass (before erosion)
+            public int GapEmptyColumns; // own-area columns with no walkable span that the fill scanned
+            public int Stitched;       // connector faces added by the per-tile stitch pass
         }
 
         public sealed class VoxelMeshResult
@@ -461,6 +484,9 @@ namespace BetterBannerlordNavmeshing
                 + "m walkable(r,h,c)=" + walkableRadius + "/" + walkableHeight + "/" + walkableClimb
                 + " edgeLen=" + s.MaxEdgeLenVoxels + "vox vpp=" + s.VertsPerPoly
                 + " regionMin=" + s.RegionMinSize + " regionMerge=" + s.RegionMergeSize
+                + " gapFill=" + s.GapFillCells
+                + " stitch=" + s.StitchMaxGapCells
+                + " prune=" + (s.PruneIsolatedIslands ? s.PruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                 + " ledgeFilter=" + s.UseLedgeFilter
                 + " detail=" + s.UseDetailMesh
                 + " detSampleDist=" + F(EffectiveDetailSampleDist(s)) + "m"
@@ -600,6 +626,30 @@ namespace BetterBannerlordNavmeshing
             Log(log, "v2: tiles=" + tileCount + " built=" + builtTiles + " failed=" + failedTiles
                 + " workers=" + workers + " polys=" + polyTotal);
 
+            if (s.GapFillCells > 0)
+            {
+                int gapFilled = 0;
+                int gapEmpty = 0;
+                for (int i = 0; i < results.Length; i++)
+                    if (results[i] != null && !results[i].Failed)
+                    {
+                        gapFilled += results[i].GapFilled;
+                        gapEmpty += results[i].GapEmptyColumns;
+                    }
+                Log(log, "v2: gap fill: filled=" + gapFilled + " emptyColumns=" + gapEmpty
+                    + " (cap=" + s.GapFillCells + " cells, before erosion)");
+            }
+
+            if (s.StitchMaxGapCells > 0)
+            {
+                int stitched = 0;
+                for (int i = 0; i < results.Length; i++)
+                    if (results[i] != null && !results[i].Failed)
+                        stitched += results[i].Stitched;
+                Log(log, "v2: stitch: added=" + stitched + " faces across tiles (cap=" + s.StitchMaxGapCells
+                    + " cells" + (stitched > 0 ? "" : " - no near-miss cuts found") + ")");
+            }
+
             // --- merge in sorted order (deterministic) ---
             var mergeWatch = Stopwatch.StartNew();
             MergeOutput merged = s.UseDetailMesh
@@ -613,6 +663,20 @@ namespace BetterBannerlordNavmeshing
             int nonManifoldRepaired = RepairNonManifold(merged);
             if (nonManifoldRepaired > 0)
                 Log(log, "v2: repaired mesh: removed " + nonManifoldRepaired + " non-manifold faces");
+
+            // Prune small isolated islands (sealed-void lids / stray fragments) before the gate, so an
+            // unreachable fragment never reaches the engine. Never touches the big networks.
+            if (s.PruneIsolatedIslands && s.PruneMaxIslandFaces > 0 && merged.Tris.Count >= 3)
+            {
+                int prunedIslands, prunedFaces, prunedLargest, keptIslands;
+                float px, py, pz;
+                PruneSmallIslands(merged, s.PruneMaxIslandFaces, out prunedIslands, out prunedFaces,
+                    out prunedLargest, out px, out py, out pz, out keptIslands);
+                Log(log, "v2: prune: removed " + prunedIslands + " islands, " + prunedFaces
+                    + " faces (<=" + s.PruneMaxIslandFaces + " faces each); largest removed="
+                    + prunedLargest + " at (" + F(px) + "," + F(py) + "," + F(pz) + "); kept="
+                    + keptIslands + " islands");
+            }
 
             int mergedVertices = merged.X.Count;
             var result = new VoxelMeshResult();
@@ -660,6 +724,8 @@ namespace BetterBannerlordNavmeshing
                     + " edges=" + result.EdgeCount + " required=" + result.RequiredEdges
                     + "; mesh is non-manifold/duplicated and must not be imported");
 
+            LogIslands(result, log);
+
             total.Stop();
             result.TotalMs = total.ElapsedMilliseconds;
             Log(log, "v2 timings: tilesMs=" + result.TilesMs + " mergeMs=" + result.MergeMs
@@ -667,6 +733,250 @@ namespace BetterBannerlordNavmeshing
             Log(log, "v2: tileMs min/avg/max=" + result.TileMsMin + "/" + result.TileMsAvg + "/" + result.TileMsMax);
 
             return result;
+        }
+
+        // Connected components by face adjacency (faces sharing an edge are one island). Always-on and
+        // cheap; it is the data needed to choose a rule that prunes "sealed void" lids (small walkable
+        // islands with no access, e.g. the tops of dungeon-corridor modules under a plank floor).
+        private static void LogIslands(VoxelMeshResult r, System.Action<string> log)
+        {
+            if (log == null || r.FaceCount == 0)
+                return;
+
+            int nf = r.FaceCount;
+            var fp = new int[nf];
+            for (int i = 0; i < nf; i++) fp[i] = i;
+            var edgeFirst = new Dictionary<long, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+                FaceUnionEdge(edgeFirst, fp, f, a, b);
+                FaceUnionEdge(edgeFirst, fp, f, b, c);
+                FaceUnionEdge(edgeFirst, fp, f, c, a);
+            }
+
+            var faceCount = new Dictionary<int, int>();
+            var areaSum = new Dictionary<int, double>();
+            var cxSum = new Dictionary<int, double>();
+            var cySum = new Dictionary<int, double>();
+            var czSum = new Dictionary<int, double>();
+            var zMin = new Dictionary<int, float>();
+            var zMax = new Dictionary<int, float>();
+
+            for (int f = 0; f < nf; f++)
+            {
+                int root = FaceFind(fp, f);
+                int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+                double ax = r.VertsXyz[a * 3], ay = r.VertsXyz[a * 3 + 1], az = r.VertsXyz[a * 3 + 2];
+                double bx = r.VertsXyz[b * 3], by = r.VertsXyz[b * 3 + 1], bz = r.VertsXyz[b * 3 + 2];
+                double cxx = r.VertsXyz[c * 3], cyy = r.VertsXyz[c * 3 + 1], czz = r.VertsXyz[c * 3 + 2];
+                double area = 0.5 * Math.Abs((bx - ax) * (czz - az) - (bz - az) * (cxx - ax));
+                if (area <= 0.0) area = 1e-9;
+
+                int n;
+                faceCount.TryGetValue(root, out n);
+                faceCount[root] = n + 1;
+                double s;
+                areaSum.TryGetValue(root, out s);
+                areaSum[root] = s + area;
+                cxSum.TryGetValue(root, out s); cxSum[root] = s + (ax + bx + cxx) / 3.0 * area;
+                cySum.TryGetValue(root, out s); cySum[root] = s + (ay + by + cyy) / 3.0 * area;
+                czSum.TryGetValue(root, out s); czSum[root] = s + (az + bz + czz) / 3.0 * area;
+
+                float fmin = (float)Math.Min(ay, Math.Min(by, cyy));
+                float fmax = (float)Math.Max(ay, Math.Max(by, cyy));
+                float zmn;
+                if (zMin.TryGetValue(root, out zmn))
+                {
+                    if (fmin < zmn) zMin[root] = fmin;
+                    if (fmax > zMax[root]) zMax[root] = fmax;
+                }
+                else
+                {
+                    zMin[root] = fmin;
+                    zMax[root] = fmax;
+                }
+            }
+
+            var roots = new List<int>(areaSum.Keys);
+            roots.Sort(delegate (int x, int y)
+            {
+                int cmp = areaSum[y].CompareTo(areaSum[x]);
+                if (cmp != 0) return cmp;
+                cmp = faceCount[y].CompareTo(faceCount[x]);
+                if (cmp != 0) return cmp;
+                return x.CompareTo(y);
+            });
+
+            var ic = CultureInfo.InvariantCulture;
+            var sb = new System.Text.StringBuilder();
+            int listed = Math.Min(10, roots.Count);
+            for (int i = 0; i < listed; i++)
+            {
+                int root = roots[i];
+                double area = areaSum[root];
+                double inv = area > 0.0 ? 1.0 / area : 0.0;
+                if (i > 0) sb.Append(" | ");
+                sb.Append(i)
+                  .Append(":faces=").Append(faceCount[root].ToString(ic))
+                  .Append(" area=").Append(area.ToString("F2", ic)).Append("m2")
+                  .Append(" centroid=(")
+                  .Append((cxSum[root] * inv).ToString("F2", ic)).Append(",")
+                  .Append((cySum[root] * inv).ToString("F2", ic)).Append(",")
+                  .Append((czSum[root] * inv).ToString("F2", ic)).Append(")")
+                  .Append(" zr=[").Append(zMin[root].ToString("F2", ic)).Append("..")
+                  .Append(zMax[root].ToString("F2", ic)).Append("]");
+            }
+            log("v2: islands=" + roots.Count + " totalFaces=" + nf + " largest=[" + sb.ToString() + "] top" + listed);
+        }
+
+        private static int FaceFind(int[] p, int x)
+        {
+            while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; }
+            return x;
+        }
+
+        private static int FaceUnion(int[] p, int a, int b)
+        {
+            int ra = FaceFind(p, a);
+            int rb = FaceFind(p, b);
+            if (ra != rb) p[ra] = rb;
+            return FaceFind(p, a);
+        }
+
+        private static void FaceUnionEdge(Dictionary<long, int> edgeFirstFace, int[] fparent, int face, int a, int b)
+        {
+            long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+            int other;
+            if (edgeFirstFace.TryGetValue(key, out other))
+                FaceUnion(fparent, other, face);
+            else
+                edgeFirstFace[key] = face;
+        }
+
+        // Removes every face-adjacency island with at most maxFaces faces and compacts the vertex array.
+        // Reports the removed island/face counts, the largest removed island (faces + centroid) and the
+        // islands kept. Vertex/face removal only, so the invariant gate is unaffected.
+        private static void PruneSmallIslands(MergeOutput o, int maxFaces,
+            out int removedIslands, out int removedFaces, out int largestRemoved, out float largestX,
+            out float largestY, out float largestZ, out int keptIslands)
+        {
+            removedIslands = 0;
+            removedFaces = 0;
+            largestRemoved = 0;
+            largestX = 0f;
+            largestY = 0f;
+            largestZ = 0f;
+            keptIslands = 0;
+
+            int nf = o.Tris.Count / 3;
+            if (nf == 0)
+                return;
+
+            var fp = new int[nf];
+            for (int i = 0; i < nf; i++) fp[i] = i;
+            var edgeFirst = new Dictionary<long, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
+                FaceUnionEdge(edgeFirst, fp, f, a, b);
+                FaceUnionEdge(edgeFirst, fp, f, b, c);
+                FaceUnionEdge(edgeFirst, fp, f, c, a);
+            }
+
+            var count = new Dictionary<int, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int root = FaceFind(fp, f);
+                int c;
+                count.TryGetValue(root, out c);
+                count[root] = c + 1;
+            }
+
+            var dropped = new Dictionary<int, bool>();
+            int largestRoot = -1;
+            foreach (KeyValuePair<int, int> kv in count)
+            {
+                if (kv.Value <= maxFaces)
+                {
+                    dropped[kv.Key] = true;
+                    removedIslands++;
+                    removedFaces += kv.Value;
+                    if (kv.Value > largestRemoved)
+                    {
+                        largestRemoved = kv.Value;
+                        largestRoot = kv.Key;
+                    }
+                }
+                else
+                {
+                    keptIslands++;
+                }
+            }
+            if (removedIslands == 0)
+                return;
+
+            if (largestRoot >= 0)
+            {
+                double sx = 0, sy = 0, sz = 0;
+                int n = 0;
+                for (int f = 0; f < nf; f++)
+                {
+                    if (FaceFind(fp, f) != largestRoot)
+                        continue;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int v = o.Tris[f * 3 + k];
+                        sx += o.X[v];
+                        sy += o.Y[v];
+                        sz += o.Z[v];
+                        n++;
+                    }
+                }
+                if (n > 0)
+                {
+                    largestX = (float)(sx / n);
+                    largestY = (float)(sy / n);
+                    largestZ = (float)(sz / n);
+                }
+            }
+
+            var remap = new int[o.X.Count];
+            for (int i = 0; i < remap.Length; i++) remap[i] = -1;
+            var newX = new List<float>();
+            var newY = new List<float>();
+            var newZ = new List<float>();
+            var newTris = new List<int>(o.Tris.Count);
+            for (int f = 0; f < nf; f++)
+            {
+                bool drop;
+                if (dropped.TryGetValue(FaceFind(fp, f), out drop) && drop)
+                    continue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int v = o.Tris[f * 3 + k];
+                    if (remap[v] < 0)
+                    {
+                        remap[v] = newX.Count;
+                        newX.Add(o.X[v]);
+                        newY.Add(o.Y[v]);
+                        newZ.Add(o.Z[v]);
+                    }
+                    newTris.Add(remap[v]);
+                }
+            }
+
+            o.X.Clear(); o.X.AddRange(newX);
+            o.Y.Clear(); o.Y.AddRange(newY);
+            o.Z.Clear(); o.Z.AddRange(newZ);
+            o.Tris.Clear(); o.Tris.AddRange(newTris);
+            o.MinY = float.MaxValue;
+            o.MaxY = float.MinValue;
+            for (int i = 0; i < o.Y.Count; i++)
+            {
+                if (o.Y[i] < o.MinY) o.MinY = o.Y[i];
+                if (o.Y[i] > o.MaxY) o.MaxY = o.Y[i];
+            }
         }
 
         private sealed class MergeOutput
@@ -941,6 +1251,17 @@ namespace BetterBannerlordNavmeshing
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
+                if (s.GapFillCells > 0)
+                {
+                    // Must run before the ledge filter: FilterLedgeSpans reads an in-bounds EMPTY
+                    // column as a drop and deletes the floor cell beside a gap, which would widen a
+                    // hairline seam by one cell per side and defeat the fill.
+                    int gapFilled, gapEmpty;
+                    gapFilled = FillNarrowGaps(hf, s.GapFillCells, walkableClimb, border, cellsPerTile,
+                        out gapEmpty);
+                    r.GapFilled = gapFilled;
+                    r.GapEmptyColumns = gapEmpty;
+                }
                 if (s.UseLedgeFilter)
                     RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
@@ -968,6 +1289,10 @@ namespace BetterBannerlordNavmeshing
                     BuildDetailOutput(r, pmesh, chf, ctx, s);
                 else
                     BuildFanOutput(r, pmesh, tx, ty, cellsPerTile, tileSpan, originX, originZ, bminY, s);
+
+                if (s.StitchMaxGapCells > 0 && r.FaceCount > 1)
+                    r.Stitched = StitchTileComponents(r, hf, bminY, s.CellHeightMeters, s.HeightOffsetMeters,
+                        walkableHeight, walkableClimb, s.StitchMaxGapCells, s.DetailWeldToleranceMeters);
             }
             catch (Exception ex)
             {
@@ -978,6 +1303,485 @@ namespace BetterBannerlordNavmeshing
             tileWatch.Stop();
             r.ElapsedMs = tileWatch.ElapsedMilliseconds;
             return r;
+        }
+
+        // Gap fill. Runs right after the low-obstacle filter and BEFORE the ledge filter: FilterLedgeSpans
+        // treats an in-bounds EMPTY column as a drop and deletes the floor cell beside a gap, which would
+        // widen a hairline seam by one cell per side and defeat this pass entirely.
+        //
+        // A column with no walkable span is filled when walkable spans flank it on OPPOSITE sides along
+        // one axis (N/S, E/W or the two diagonal axes) with an empty run of at most gapFillCells cells
+        // and a floor difference within walkableClimb; the filled span takes the LOWER neighbour floor.
+        //
+        // Tile consistency: only cells inside THIS tile's own area are filled and only columns inside
+        // this tile's padded heightfield are probed, so exactly one tile decides each world cell and the
+        // fill is identical on both sides of a tile boundary (no new cracks).
+        private static int FillNarrowGaps(RcHeightfield hf, int gapFillCells, int walkableClimb,
+            int border, int cellsPerTile, out int emptyColumns)
+        {
+            emptyColumns = 0;
+            int w = hf.width;
+            int h = hf.height;
+            int ownX0 = border;
+            int ownZ0 = border;
+            int ownX1 = border + cellsPerTile;
+            int ownZ1 = border + cellsPerTile;
+            if (ownX1 > w) ownX1 = w;
+            if (ownZ1 > h) ownZ1 = h;
+            if (ownX0 >= ownX1 || ownZ0 >= ownZ1)
+                return 0;
+
+            // Floor (voxel) of the first walkable span per column, -1 when the column has none. Taken
+            // once so a column's flanks are only ever ORIGINAL walkable columns (no cascade).
+            var floor = new int[w * h];
+            for (int ci = 0; ci < w * h; ci++)
+                floor[ci] = WalkableFloor(hf.spans[ci]);
+
+            int filled = 0;
+            for (int z = ownZ0; z < ownZ1; z++)
+            {
+                for (int x = ownX0; x < ownX1; x++)
+                {
+                    int ci = x + z * w;
+                    if (floor[ci] >= 0)
+                        continue;                       // column already walkable
+                    emptyColumns++;
+                    int y;
+                    if (!TryGapFloor(floor, w, h, x, z, gapFillCells, walkableClimb, out y))
+                        continue;
+                    if (!CanPlaceSpan(hf.spans[ci], y))
+                        continue;                       // something solid already occupies that height
+                    InsertSpanSorted(hf, ci, y);
+                    filled++;
+                }
+            }
+            return filled;
+        }
+
+        private static int WalkableFloor(RcSpan span)
+        {
+            for (RcSpan s = span; s != null; s = s.next)
+                if (s.area != RcRecast.RC_NULL_AREA)
+                    return s.smax;
+            return -1;
+        }
+
+        // True when a one-voxel solid span [y-1, y] fits without overlapping existing geometry.
+        private static bool CanPlaceSpan(RcSpan span, int y)
+        {
+            for (RcSpan s = span; s != null; s = s.next)
+                if (!(s.smax <= y - 1 || s.smin >= y))
+                    return false;
+            return true;
+        }
+
+        // Keeps the column sorted bottom-to-top (Recast expects spans in ascending smin order).
+        private static void InsertSpanSorted(RcHeightfield hf, int columnIndex, int y)
+        {
+            var s = new RcSpan();
+            s.smin = y - 1;
+            s.smax = y;
+            s.area = RcRecast.RC_WALKABLE_AREA;
+            RcSpan cur = hf.spans[columnIndex];
+            if (cur == null || s.smax <= cur.smin)
+            {
+                s.next = cur;
+                hf.spans[columnIndex] = s;
+                return;
+            }
+            while (cur.next != null && cur.next.smin < s.smin)
+                cur = cur.next;
+            s.next = cur.next;
+            cur.next = s;
+        }
+
+        // The four axis pairs: E/W, N/S, NE/SW, NW/SE. A diagonal pair is still one axis (its own
+        // diagonal line), so a fill is always justified along a single axis.
+        private static readonly int[] GapAxisX = { 1, 0, 1, 1 };
+        private static readonly int[] GapAxisZ = { 0, 1, 1, -1 };
+
+        private static bool TryGapFloor(int[] floor, int w, int h, int x, int z,
+            int maxRun, int walkableClimb, out int floorY)
+        {
+            floorY = 0;
+            int bestRun = int.MaxValue;
+            bool found = false;
+            for (int axis = 0; axis < 4; axis++)
+            {
+                int dx = GapAxisX[axis];
+                int dz = GapAxisZ[axis];
+                int y0, d0, y1, d1;
+                if (!ScanFlank(floor, w, h, x, z, dx, dz, maxRun, out y0, out d0))
+                    continue;
+                if (!ScanFlank(floor, w, h, x, z, -dx, -dz, maxRun, out y1, out d1))
+                    continue;
+                int run = d0 + d1 - 1;                 // empty cells between the two flanks
+                if (run > maxRun)
+                    continue;
+                if (Math.Abs(y0 - y1) > walkableClimb)
+                    continue;
+                if (run < bestRun)
+                {
+                    bestRun = run;
+                    floorY = Math.Min(y0, y1);
+                    found = true;
+                }
+            }
+            return found;
+        }
+
+        private static bool ScanFlank(int[] floor, int w, int h, int x, int z,
+            int dx, int dz, int maxRun, out int spanY, out int dist)
+        {
+            spanY = 0;
+            dist = 0;
+            for (int d = 1; d <= maxRun; d++)
+            {
+                int nx = x + dx * d;
+                int nz = z + dz * d;
+                if (nx < 0 || nz < 0 || nx >= w || nz >= h)
+                    return false;
+                int ci = nx + nz * w;
+                if (floor[ci] >= 0)
+                {
+                    spanY = floor[ci];
+                    dist = d;
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Per-tile stitch. Reconnects components of the tile's own mesh whose nearest boundary edges are
+        // within stitchMaxGapCells cells and within walkableClimb vertically, by adding a small quad that
+        // REUSES existing boundary vertices (so both weld paths stay exact). It is refused when the
+        // tile's solid spans put geometry inside the gap envelope (a wall or closed door) or leave too
+        // little headroom (a ceiling). Deterministic, and per-tile only (cross-tile continuity is
+        // already exact on the lattice).
+        private static int StitchTileComponents(VoxelTileResult r, RcHeightfield hf, float bminY, float ch,
+            float offset, int walkableHeight, int walkableClimb, int stitchMaxGapCells, float weldTol)
+        {
+            int nv = r.VertexCount;
+            int nf = r.FaceCount;
+            if (nv < 3 || nf < 2)
+                return 0;
+            float cs = hf.cs;
+            float maxGap = stitchMaxGapCells * cs;
+            float maxGap2 = maxGap * maxGap;
+
+            int[] weld = BuildPositionWeld(r.VertsXyz, nv, weldTol);
+
+            // Face adjacency + edge multiplicity over welded ids.
+            int[] fp = new int[nf];
+            for (int i = 0; i < nf; i++) fp[i] = i;
+            var edgeMult = new Dictionary<long, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                int a = weld[r.Tris[f * 3]], b = weld[r.Tris[f * 3 + 1]], c = weld[r.Tris[f * 3 + 2]];
+                StitchAddEdge(edgeMult, fp, f, a, b);
+                StitchAddEdge(edgeMult, fp, f, b, c);
+                StitchAddEdge(edgeMult, fp, f, c, a);
+            }
+            // Early out: a single component (the common case) needs no stitching.
+            bool multi = false;
+            for (int i = 0; i < nf; i++) if (StitchFind(fp, i) != StitchFind(fp, 0)) { multi = true; break; }
+            if (!multi)
+                return 0;
+
+            var compFaces = new Dictionary<int, int>();
+            var compList = new List<int>();
+            for (int i = 0; i < nf; i++)
+            {
+                int root = StitchFind(fp, i);
+                if (!compFaces.ContainsKey(root)) { compFaces[root] = 0; compList.Add(root); }
+                compFaces[root]++;
+            }
+            compList.Sort();
+            int nc = compList.Count;
+            if (nc < 2)
+                return 0;
+
+            // Boundary edges per component (welded edge multiplicity 1), with their original vertices.
+            var compIndex = new Dictionary<int, int>();
+            for (int i = 0; i < nc; i++) compIndex[compList[i]] = i;
+            var bA = new List<int>[nc];
+            var bB = new List<int>[nc];
+            var bMin = new List<float>[nc];
+            var bMax = new List<float>[nc];
+            for (int i = 0; i < nc; i++)
+            {
+                bA[i] = new List<int>();
+                bB[i] = new List<int>();
+                bMin[i] = new List<float>();
+                bMax[i] = new List<float>();
+            }
+            for (int f = 0; f < nf; f++)
+            {
+                int ci = compIndex[StitchFind(fp, f)];
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = r.Tris[f * 3 + k];
+                    int i1 = r.Tris[f * 3 + ((k + 1) % 3)];
+                    int w0 = weld[i0], w1 = weld[i1];
+                    if (edgeMult[StitchEdgeKey(w0, w1)] != 1)
+                        continue;                       // interior edge
+                    // One entry per welded boundary edge (the face loop may see it twice for the two
+                    // faces that share it; multiplicity 1 means it belongs to exactly one face).
+                    bA[ci].Add(i0);
+                    bB[ci].Add(i1);
+                    float x0 = r.VertsXyz[i0 * 3], y0 = r.VertsXyz[i0 * 3 + 1], z0 = r.VertsXyz[i0 * 3 + 2];
+                    float x1 = r.VertsXyz[i1 * 3], y1 = r.VertsXyz[i1 * 3 + 1], z1 = r.VertsXyz[i1 * 3 + 2];
+                    bMin[ci].Add(Math.Min(x0, x1)); bMax[ci].Add(Math.Max(x0, x1));
+                    bMin[ci].Add(Math.Min(z0, z1)); bMax[ci].Add(Math.Max(z0, z1));
+                }
+            }
+
+            int[] compParent = new int[nc];
+            for (int i = 0; i < nc; i++) compParent[i] = i;
+
+            var tris = new List<int>(r.Tris);
+            int added = 0;
+            for (int i = 0; i < nc; i++)
+            {
+                int ei = bA[i].Count;
+                if (ei == 0 || ei > 4096)
+                    continue;
+                for (int j = i + 1; j < nc; j++)
+                {
+                    int ej = bA[j].Count;
+                    if (ej == 0 || ej > 4096)
+                        continue;
+                    if (StitchFind(compParent, i) == StitchFind(compParent, j))
+                        continue;
+                    // Coarse reject on the boundary AABB (XZ), in cell units.
+                    float aminX = float.MaxValue, amaxX = float.MinValue, aminZ = float.MaxValue, amaxZ = float.MinValue;
+                    for (int k = 0; k < ei; k++)
+                    {
+                        if (bMin[i][k * 2] < aminX) aminX = bMin[i][k * 2];
+                        if (bMax[i][k * 2] > amaxX) amaxX = bMax[i][k * 2];
+                        if (bMin[i][k * 2 + 1] < aminZ) aminZ = bMin[i][k * 2 + 1];
+                        if (bMax[i][k * 2 + 1] > amaxZ) amaxZ = bMax[i][k * 2 + 1];
+                    }
+                    float bminX = float.MaxValue, bmaxX = float.MinValue, bminZ = float.MaxValue, bmaxZ = float.MinValue;
+                    for (int k = 0; k < ej; k++)
+                    {
+                        if (bMin[j][k * 2] < bminX) bminX = bMin[j][k * 2];
+                        if (bMax[j][k * 2] > bmaxX) bmaxX = bMax[j][k * 2];
+                        if (bMin[j][k * 2 + 1] < bminZ) bminZ = bMin[j][k * 2 + 1];
+                        if (bMax[j][k * 2 + 1] > bmaxZ) bmaxZ = bMax[j][k * 2 + 1];
+                    }
+                    double ddx = Math.Max(0.0, Math.Max(aminX - bmaxX, bminX - amaxX));
+                    double ddz = Math.Max(0.0, Math.Max(aminZ - bmaxZ, bminZ - amaxZ));
+                    if (ddx * ddx + ddz * ddz > maxGap2)
+                        continue;
+
+                    // Nearest boundary-edge pair.
+                    int bestIA = -1, bestIB = -1;
+                    double best = double.MaxValue;
+                    for (int ka = 0; ka < ei; ka++)
+                    {
+                        int a0 = bA[i][ka], a1 = bB[i][ka];
+                        for (int kb = 0; kb < ej; kb++)
+                        {
+                            int c0 = bA[j][kb], c1 = bB[j][kb];
+                            double d = EdgePairDist2(r.VertsXyz, a0, a1, c0, c1);
+                            if (d < best) { best = d; bestIA = ka; bestIB = kb; }
+                        }
+                    }
+                    if (bestIA < 0 || best > maxGap2)
+                        continue;
+
+                    int ua = bA[i][bestIA], ub = bB[i][bestIA];
+                    int va = bA[j][bestIB], vb = bB[j][bestIB];
+                    if (ua == va || ua == vb || ub == va || ub == vb)
+                        continue;                       // components share a vertex: skip
+                    float dyAB = Math.Abs(r.VertsXyz[ua * 3 + 1] - r.VertsXyz[va * 3 + 1]);
+                    if (dyAB > walkableClimb * ch + 1e-4f)
+                        continue;
+
+                    int yLo = (int)Math.Floor((Math.Min(r.VertsXyz[ua * 3 + 1], r.VertsXyz[va * 3 + 1]) - offset - bminY) / ch) - 1;
+                    int yHi = (int)Math.Ceiling((Math.Max(r.VertsXyz[ua * 3 + 1], r.VertsXyz[va * 3 + 1]) - offset - bminY) / ch) + walkableHeight;
+                    if (!StitchGapClear(r, hf, ua, va, yLo, yHi))
+                        continue;
+
+                    // Quad (two triangles) reusing the four boundary vertices. Keep the new edges fresh
+                    // so no edge ends up shared by more than two faces, and wind with +Y normals.
+                    if (edgeMult.ContainsKey(StitchEdgeKey(weld[ua], weld[va]))
+                        || edgeMult.ContainsKey(StitchEdgeKey(weld[ub], weld[vb]))
+                        || edgeMult.ContainsKey(StitchEdgeKey(weld[ua], weld[vb])))
+                        continue;
+
+                    int t1a = ua, t1b = va, t1c = vb;
+                    if (TriNormalY(r.VertsXyz, t1a, t1b, t1c) < 0f) { t1b = vb; t1c = va; }
+                    int t2a = ua, t2b = vb, t2c = ub;
+                    if (TriNormalY(r.VertsXyz, t2a, t2b, t2c) < 0f) { t2b = ub; t2c = vb; }
+                    if (t1a == t1b || t1b == t1c || t1a == t1c || t2a == t2b || t2b == t2c || t2a == t2c)
+                        continue;
+
+                    tris.Add(t1a); tris.Add(t1b); tris.Add(t1c);
+                    tris.Add(t2a); tris.Add(t2b); tris.Add(t2c);
+                    StitchRegister(edgeMult, weld[ua], weld[va]);
+                    StitchRegister(edgeMult, weld[ub], weld[vb]);
+                    StitchRegister(edgeMult, weld[ua], weld[vb]);
+                    StitchRegister(edgeMult, weld[ua], weld[ub]);
+                    StitchRegister(edgeMult, weld[va], weld[vb]);
+                    added += 2;
+                    StitchUnion(compParent, i, j);
+                }
+            }
+
+            if (added == 0)
+                return 0;
+            r.Tris = tris.ToArray();
+            r.FaceCount = r.Tris.Length / 3;
+            return added;
+        }
+
+        private static void StitchAddEdge(Dictionary<long, int> mult, int[] fp, int face, int a, int b)
+        {
+            long key = StitchEdgeKey(a, b);
+            int c;
+            mult.TryGetValue(key, out c);
+            mult[key] = c + 1;
+            long tagged = key | FaceTagBit;
+            if (c == 0)
+                mult[tagged] = face;
+            else
+                StitchUnion(fp, mult[tagged], face);
+        }
+
+        private static long StitchEdgeKey(int a, int b)
+        {
+            return a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+        }
+
+        private const long FaceTagBit = long.MinValue;
+
+        private static int StitchFind(int[] p, int x)
+        {
+            while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; }
+            return x;
+        }
+
+        private static void StitchUnion(int[] p, int a, int b)
+        {
+            int ra = StitchFind(p, a), rb = StitchFind(p, b);
+            if (ra != rb) p[ra] = rb;
+        }
+
+        private static double EdgePairDist2(float[] v, int a0, int a1, int b0, int b1)
+        {
+            double d = VDist2(v, a0, b0);
+            double t = VDist2(v, a0, b1);
+            if (t < d) d = t;
+            t = VDist2(v, a1, b0);
+            if (t < d) d = t;
+            t = VDist2(v, a1, b1);
+            if (t < d) d = t;
+            return d;
+        }
+
+        private static double VDist2(float[] v, int i, int j)
+        {
+            double dx = v[i * 3] - v[j * 3];
+            double dy = v[i * 3 + 1] - v[j * 3 + 1];
+            double dz = v[i * 3 + 2] - v[j * 3 + 2];
+            return dx * dx + dy * dy + dz * dz;
+        }
+
+        private static float TriNormalY(float[] v, int a, int b, int c)
+        {
+            float ux = v[b * 3] - v[a * 3], uy = v[b * 3 + 1] - v[a * 3 + 1], uz = v[b * 3 + 2] - v[a * 3 + 2];
+            float wx = v[c * 3] - v[a * 3], wy = v[c * 3 + 1] - v[a * 3 + 1], wz = v[c * 3 + 2] - v[a * 3 + 2];
+            return uz * wx - ux * wz;
+        }
+
+        // A new edge may only be added when it does not already exist (any multiplicity).
+        private static void StitchRegister(Dictionary<long, int> mult, int a, int b)
+        {
+            long key = StitchEdgeKey(a, b);
+            int c;
+            mult.TryGetValue(key, out c);
+            mult[key] = c + 1;
+        }
+
+        // Clearance: sample the heightfield cells strictly between the two boundary vertices and refuse
+        // when a solid span overlaps the gap envelope [yLo, yHi] (wall / closed door / low ceiling).
+        private static bool StitchGapClear(VoxelTileResult r, RcHeightfield hf, int ia, int ib, int yLo, int yHi)
+        {
+            float cs = hf.cs;
+            int cx0 = (int)Math.Floor((r.VertsXyz[ia * 3] - hf.bmin.X) / cs);
+            int cz0 = (int)Math.Floor((r.VertsXyz[ia * 3 + 2] - hf.bmin.Z) / cs);
+            int cx1 = (int)Math.Floor((r.VertsXyz[ib * 3] - hf.bmin.X) / cs);
+            int cz1 = (int)Math.Floor((r.VertsXyz[ib * 3 + 2] - hf.bmin.Z) / cs);
+            int steps = Math.Max(Math.Abs(cx1 - cx0), Math.Abs(cz1 - cz0));
+            if (steps <= 1)
+                return true;
+            for (int i = 1; i < steps; i++)
+            {
+                int cx = cx0 + (int)Math.Round((double)(cx1 - cx0) * i / steps);
+                int cz = cz0 + (int)Math.Round((double)(cz1 - cz0) * i / steps);
+                if (cx < 0 || cz < 0 || cx >= hf.width || cz >= hf.height)
+                    continue;
+                for (RcSpan s = hf.spans[cx + cz * hf.width]; s != null; s = s.next)
+                    if (s.smax > yLo && s.smin < yHi)
+                        return false;
+            }
+            return true;
+        }
+
+        private static long Hash3(long x, long y, long z)
+        {
+            return (x * 73856093L) ^ (y * 19349663L) ^ (z * 83492791L);
+        }
+
+        // Position-based vertex weld (exact for lattice coordinates, tolerance-based for detail meshes).
+        private static int[] BuildPositionWeld(float[] verts, int nv, float tol)
+        {
+            var ids = new int[nv];
+            var grid = new Dictionary<long, List<int>>();
+            var cx = new List<float>();
+            var cy = new List<float>();
+            var cz = new List<float>();
+            float inv = 1f / tol;
+            float tol2 = tol * tol;
+            int next = 0;
+            for (int i = 0; i < nv; i++)
+            {
+                float x = verts[i * 3], y = verts[i * 3 + 1], z = verts[i * 3 + 2];
+                long gx = (long)Math.Floor(x * inv);
+                long gy = (long)Math.Floor(y * inv);
+                long gz = (long)Math.Floor(z * inv);
+                int found = -1;
+                for (long dx = -1; dx <= 1 && found < 0; dx++)
+                {
+                    for (long dy = -1; dy <= 1 && found < 0; dy++)
+                    {
+                        for (long dz = -1; dz <= 1 && found < 0; dz++)
+                        {
+                            List<int> list;
+                            if (!grid.TryGetValue(Hash3(gx + dx, gy + dy, gz + dz), out list))
+                                continue;
+                            for (int k = 0; k < list.Count; k++)
+                            {
+                                int id = list[k];
+                                float ddx = x - cx[id], ddy = y - cy[id], ddz = z - cz[id];
+                                if (ddx * ddx + ddy * ddy + ddz * ddz <= tol2) { found = id; break; }
+                            }
+                        }
+                    }
+                }
+                if (found < 0)
+                {
+                    found = next++;
+                    cx.Add(x); cy.Add(y); cz.Add(z);
+                    long key = Hash3(gx, gy, gz);
+                    List<int> list;
+                    if (!grid.TryGetValue(key, out list)) { list = new List<int>(); grid[key] = list; }
+                    list.Add(found);
+                }
+                ids[i] = found;
+            }
+            return ids;
         }
 
         // Fan-triangulate each convex Recast polygon. Vertices are placed on the
