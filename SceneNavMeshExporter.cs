@@ -58,11 +58,17 @@ namespace BetterBannerlordNavmeshing
         public float NavMeshVoxelContourMaxError = 1.3f;
 
         // Phase 3: ingest static asset collision geometry (interiors, stairs, decks, bridges over
-        // terrain) into the v2 voxel core. Assets land flush on their true geometry; the terrain
-        // keeps its z-fighting lift. Dynamic props (e.g. merlons) and flora are toggled separately.
+        // terrain) into the v2 voxel core. NavMeshHeightOffsetMeters lifts the whole merged mesh
+        // (terrain and structures alike) so it never intersects either. Dynamic props (e.g. merlons)
+        // and flora are toggled separately.
         public bool NavMeshVoxelIncludeAssets = true;
         public bool NavMeshVoxelIncludeDynamic = true;
         public bool NavMeshVoxelIncludeFlora = false;
+
+        // Diagnostic (default off): log one line per included entity immediately before its native
+        // PhysicsShape.GetTriangle read. If that native call ever read-AVs the process, the last line
+        // in the log names the culprit entity/body. Cheap enough to leave off in normal runs.
+        public bool NavMeshVoxelAssetTrace = false;
 
         // Run the v2 voxel build on a background thread so the editor UI stays alive during the
         // 3-60 s builds. Only the pure-managed voxel build runs off-thread; the terrain read and the
@@ -312,7 +318,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshWriteLogFile, NavMeshLogFolder,
                 NavMeshUseVoxelCore, NavMeshVoxelCellSize, NavMeshVoxelAgentClimbMeters,
                 NavMeshVoxelDetailMesh, NavMeshVoxelDetailSampleDist, NavMeshVoxelContourMaxError,
-                NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora);
+                NavMeshVoxelIncludeAssets, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
+                NavMeshVoxelAssetTrace);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -333,7 +340,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false);
+                true, true, false, false);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -355,7 +362,8 @@ namespace BetterBannerlordNavmeshing
             float voxelContourMaxError,
             bool voxelIncludeAssets,
             bool voxelIncludeDynamic,
-            bool voxelIncludeFlora)
+            bool voxelIncludeFlora,
+            bool voxelAssetTrace)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -394,6 +402,7 @@ namespace BetterBannerlordNavmeshing
                     + " includeAssets=" + voxelIncludeAssets
                     + " includeDynamic=" + voxelIncludeDynamic
                     + " includeFlora=" + voxelIncludeFlora
+                    + " assetTrace=" + voxelAssetTrace
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -429,7 +438,8 @@ namespace BetterBannerlordNavmeshing
                     if (voxelIncludeAssets)
                     {
                         SceneCollisionGeometry.AssetTriangles assets =
-                            SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora, log);
+                            SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
+                                voxelAssetTrace, log);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
                         assetsMs = assets.ScanMs;
@@ -560,6 +570,7 @@ namespace BetterBannerlordNavmeshing
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
                     + " includeFlora=" + NavMeshVoxelIncludeFlora
+                    + " assetTrace=" + NavMeshVoxelAssetTrace
                     + " asyncBuild=True"
                     + " writeLogFile=" + NavMeshWriteLogFile
                     + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
@@ -584,7 +595,8 @@ namespace BetterBannerlordNavmeshing
                 {
                     var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                     SceneCollisionGeometry.AssetTriangles assets =
-                        SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, log);
+                        SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
+                            NavMeshVoxelAssetTrace, log);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
                     assetTris = assets.Tris;

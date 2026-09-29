@@ -14,7 +14,7 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | `Nmg8Writer.cs` | Shared NMG8 prefab serializer (extracted verbatim from `TerrainNavMeshGenerator`); used by both the v1 adaptive mesher and the v2 voxel core. Output bytes are unchanged for v1. |
 | `TiledNavMeshBuilder.cs` | **Voxel core (navmesh v2, experimental).** Tiled + parallel Recast pipeline via the vendored DotRecast subset; terrain **+ static asset collision** geometry (one soup). Pure data-in/data-out (no TaleWorlds types). |
 | `VoxelNavMeshGenerator.cs` | Adapter: terrain sampler grid (+ optional engine-space asset triangles) -> voxel core -> engine-space mesh, then the shared write/import path. Merges both into one soup; `NavMeshHeightOffsetMeters` lifts the whole merged mesh uniformly. |
-| `SceneCollisionGeometry.cs` | **Main-thread asset collector (phase 3).** Enumerates scene entities, classifies by `BodyFlags`/mobility, reads `GetBodyShape()` triangles and transforms them by the entity global frame into engine-space world triangles (plain arrays for the background build). |
+| `SceneCollisionGeometry.cs` | **Main-thread asset collector (phase 3).** Enumerates scene entities, classifies by `BodyFlags`/mobility, **preloads the included bodies by name** (engine's own `PhysicsShape` preload queue - `GetTriangle` read-AVs on an unloaded body), then reads `GetBodyShape()` triangles and transforms them by the entity global frame into engine-space world triangles (plain arrays for the background build). Optional per-entity TRACE line for crash triage. |
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
@@ -37,8 +37,13 @@ Release and deploys them, then copies this repo's `SubModule.xml` into the modul
 <Bannerlord>\Modules\BetterBannerlordNavmeshing\
   SubModule.xml
   bin\Win64_Shipping_wEditor\BetterBannerlordNavmeshing.dll
+  bin\Win64_Shipping_wEditor\BetterBannerlordNavmeshing.pdb
   bin\Win64_Shipping_Client\BetterBannerlordNavmeshing.dll
+  bin\Win64_Shipping_Client\BetterBannerlordNavmeshing.pdb
 ```
+
+The `.pdb` files are deployed next to the DLLs (both variants) so crash dumps resolve our frames to source
+lines. They are debug-only and are not part of any release/zip logic.
 
 Override the game path if needed: `.\build.ps1 -GameDir 'D:\...\Mount & Blade II Bannerlord'`.
 
@@ -268,6 +273,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelIncludeAssets` | `true` | v2: ingest static asset collision geometry (interiors, stairs, decks, bridges) into the voxel soup so structures are navigable. Terrain-only when false. See *Assets (structures)*. |
 | `NavMeshVoxelIncludeDynamic` | `true` | v2 assets: include movable/dynamic physics props (e.g. Birtu's merlons) at their placed pose. Set false to build only from static geometry. |
 | `NavMeshVoxelIncludeFlora` | `false` | v2 assets: include flora collision (trees/bushes). Off by default - flora is usually visual and its many small shapes add faces without being reliably navigable. |
+| `NavMeshVoxelAssetTrace` | `false` | Diagnostic: log one `assets: TRACE 'entity' body='...' ...` line per included entity immediately before its native triangle read, so if a crash ever happens the log's last line names the culprit. One diagnostic run only. See *Assets (structures)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
@@ -388,6 +394,17 @@ Per-shape triangle reads are capped at 200k with a `assets: WARNING shape '...' 
 shape access is per-entity `try/catch`, so one bad entity (logged, counted under `exceptions`) never aborts the
 collection.
 
+**Body preload (crash hardening).** `PhysicsShape.GetTriangle` read-AVs the whole process when a shape's native
+triangle-mesh table is NULL - an engine bug (the native function asserts about the null table, then dereferences
+`NULL+0x40` anyway) that hits bodies whose physics has not been loaded, and which is **not catchable** from
+managed code even though `TriangleMeshCount()` reports > 0. So `Collect` now runs the engine's own load recipe
+(`PreloadHelper.PreloadMeshesAndPhysics`) before it reads any triangle: it collects the unique included body
+names (`shape.GetName()`, falling back to the entity name), calls `PhysicsShape.AddPreloadQueueWithName(name,
+new Vec3(1f,1f,1f,-1f))` for each, then a single `PhysicsShape.ProcessPreloadQueue()`. If that ever still
+crashes, set `NavMeshVoxelAssetTrace = true` for one diagnostic run: a `assets: TRACE 'entity' body='...'`
+line is written immediately before each native read, so the log's last line names the culprit. In normal runs
+a cheap `assets: progress` line is logged every 250 entities during the read pass.
+
 **Height offset mechanics.** `NavMeshHeightOffsetMeters` (+0.5 m) is a **single uniform lift applied to the
 whole merged mesh** - terrain and structures alike. It exists so the navmesh sits just above the collision
 surface rather than intersecting it: if the navmesh cut through the terrain/assets, units would lose the mesh
@@ -416,6 +433,10 @@ Every run also logs the terrain read (see above), then the voxel core:
 
 ```
 NavMesh: v2: core engaged (tiled voxel). cellSize=0.5m tile=16m
+NavMesh: assets: preloading <M> unique physics bodies by name
+NavMesh: assets: preloaded <M> bodies by name (preloadMs=<n>)
+NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- every 250 entities (read pass)
+NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=.. dyn=.. meshCount=.. tris=..   <- only when NavMeshVoxelAssetTrace=true
 NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=..] tris=... cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 10 by triangle count)

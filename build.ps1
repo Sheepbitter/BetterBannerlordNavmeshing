@@ -22,6 +22,19 @@ foreach ($variant in $variants) {
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed for $variant (exit code $LASTEXITCODE)"
     }
+
+    # Deploy the PDB beside the DLL so crash dumps resolve our frames to source lines.
+    # (The csproj's DeployToModule target only copies the DLL.) PDBs are never zipped/released.
+    $builtPdb = Join-Path $repo "bin\$Configuration\net472\BetterBannerlordNavmeshing.pdb"
+    $variantBin = Join-Path $moduleDir "bin\$variant"
+    if (Test-Path -LiteralPath $builtPdb) {
+        New-Item -ItemType Directory -Path $variantBin -Force | Out-Null
+        $pdbDst = Join-Path $variantBin 'BetterBannerlordNavmeshing.pdb'
+        Copy-Item -LiteralPath $builtPdb -Destination $pdbDst -Force
+        Write-Host "  PDB -> $pdbDst"
+    } else {
+        Write-Host "  WARNING: PDB not found at $builtPdb"
+    }
     Write-Host ""
 }
 
@@ -35,11 +48,18 @@ Write-Host ""
 Write-Host "Summary"
 foreach ($variant in $variants) {
     $dll = Join-Path $moduleDir "bin\$variant\BetterBannerlordNavmeshing.dll"
+    $pdb = Join-Path $moduleDir "bin\$variant\BetterBannerlordNavmeshing.pdb"
     if (Test-Path -LiteralPath $dll) {
         $bytes = (Get-Item -LiteralPath $dll).Length
         Write-Host ("  OK       {0}\BetterBannerlordNavmeshing.dll ({1} bytes)" -f $variant, $bytes)
     } else {
         Write-Host ("  MISSING  {0}\BetterBannerlordNavmeshing.dll" -f $variant)
+    }
+    if (Test-Path -LiteralPath $pdb) {
+        $pbytes = (Get-Item -LiteralPath $pdb).Length
+        Write-Host ("  OK       {0}\BetterBannerlordNavmeshing.pdb ({1} bytes)" -f $variant, $pbytes)
+    } else {
+        Write-Host ("  MISSING  {0}\BetterBannerlordNavmeshing.pdb" -f $variant)
     }
 }
 Write-Host "  SubModule.xml present: $([bool](Test-Path -LiteralPath $subModuleDst))"

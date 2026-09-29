@@ -15,6 +15,17 @@ namespace BetterBannerlordNavmeshing
     //   - tri are shape-local; world = entity.GetGlobalFrame().TransformToParent(v)
     //   - classify by BodyFlags (| PhysicsDescBodyFlag) + GetMobility(), not prefab name.
     //
+    // Crash hardening (2026-09-29): PhysicsShape.GetTriangle read-AVs the process when the
+    // shape's native triangle-mesh table (shape+0xB8) is NULL -- an engine bug: the native
+    // function asserts about the null table, fails to return, then dereferences NULL+0x40
+    // anyway. That happens for bodies whose physics has not been loaded, even though the
+    // managed TriangleMeshCount()/TriangleCountInTriangleMesh() report > 0. It is not
+    // catchable from managed code (it kills the process), so we load the bodies first with
+    // the engine's own recipe (PhysicsShape.AddPreloadQueueWithName(name, ...) per unique
+    // body name, then a single PhysicsShape.ProcessPreloadQueue()) before any triangle read.
+    // A per-entity TRACE line (exporter setting NavMeshVoxelAssetTrace) can be enabled so a
+    // future crash log ends with the culprit's name.
+    //
     // The result is plain data (float[]/int[]) so it can cross to the background build
     // thread. Triangle winding is left as authored; the voxel mixer reverses it when it
     // maps engine (Z-up) to Recast (Y-up), because that axis swap is orientation-reversing.
@@ -23,6 +34,9 @@ namespace BetterBannerlordNavmeshing
         // Guard against a pathological shape: never read more than this many triangles from
         // one entity (Birtu's largest was ~5.6k; 200k is far above anything real).
         private const int PerShapeTriCap = 200000;
+
+        // Emit a cheap progress line every N entities during the triangle-read pass.
+        private const int ProgressEvery = 250;
 
         public sealed class AssetTriangles
         {
@@ -35,7 +49,20 @@ namespace BetterBannerlordNavmeshing
             public long ScanMs;
         }
 
-        public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora,
+        // An included entity carried from the classification pass to the triangle-read pass.
+        private sealed class Candidate
+        {
+            public GameEntity Entity;
+            public PhysicsShape Shape;
+            public string Name;       // display name (never empty; "?" if unknown)
+            public string BodyName;   // shape.GetName() or the raw entity name (may be empty)
+            public BodyFlags Flags;
+            public GameEntity.Mobility Mobility;
+            public bool IsDynamic;
+            public bool IsStairs;
+        }
+
+        public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
             System.Action<string> log)
         {
             var result = new AssetTriangles();
@@ -59,17 +86,20 @@ namespace BetterBannerlordNavmeshing
                 return result;
             }
 
-            var verts = new List<float>();
-            var tris = new List<int>();
-            var largestTris = new List<int>();
-            var largestName = new List<string>();
+            if (log != null && trace)
+                log("assets: TRACE enabled: one line per included entity is emitted before its triangle read.");
 
-            int count = 0, physics = 0, included = 0;
+            // ---------------------------------------------------------------- pass 1
+            // Classify only. No triangle is read here, so nothing in this pass can hit the
+            // null-mesh-table crash. Collection is bounded by the same try/catch as before.
+            var candidates = new List<Candidate>();
+            var preloadNames = new List<string>();
+            var preloadSeen = new HashSet<string>(StringComparer.Ordinal);
+
+            int count = 0, physics = 0;
             int exFlora = 0, exBarrier = 0, exTerrain = 0, exLadder = 0;
-            int exDynamic = 0, exNoShape = 0, exEmpty = 0, exExceptions = 0;
-            int shapesCapped = 0;
-            int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
-            var tri = new Vec3[3];
+            int exDynamic = 0, exNoShape = 0, exceptions = 0;
+            int preloadNamesEmpty = 0;
 
             for (int i = 0; i < entities.Count; i++)
             {
@@ -84,7 +114,8 @@ namespace BetterBannerlordNavmeshing
                         continue;
                     physics++;
 
-                    string name = SafeEntityName(e);
+                    string rawName = SafeRawEntityName(e);
+                    string name = string.IsNullOrEmpty(rawName) ? "?" : rawName;
                     BodyFlags all = SafeFlags(() => e.BodyFlag) | SafeFlags(() => e.PhysicsDescBodyFlag);
                     GameEntity.Mobility mobility = SafeMobility(e);
                     bool hasDynamic = SafeBool(() => e.HasDynamicRigidBody());
@@ -114,8 +145,8 @@ namespace BetterBannerlordNavmeshing
                     }
                     catch (Exception ex)
                     {
-                        exExceptions++;
-                        if (log != null && exExceptions <= 8)
+                        exceptions++;
+                        if (log != null && exceptions <= 8)
                             log("assets: shape entity='" + name + "' EXCEPTION " + Err(ex));
                         continue;
                     }
@@ -125,22 +156,99 @@ namespace BetterBannerlordNavmeshing
                         continue;
                     }
 
-                    int meshCount = SafeInt(() => shape.TriangleMeshCount());
+                    string bodyName = SafeShapeName(shape, rawName);
+                    var c = new Candidate();
+                    c.Entity = e;
+                    c.Shape = shape;
+                    c.Name = name;
+                    c.BodyName = bodyName;
+                    c.Flags = all;
+                    c.Mobility = mobility;
+                    c.IsDynamic = isDynamic;
+                    c.IsStairs = isStairs;
+                    candidates.Add(c);
+
+                    if (string.IsNullOrEmpty(bodyName))
+                        preloadNamesEmpty++;
+                    else if (preloadSeen.Add(bodyName))
+                        preloadNames.Add(bodyName);
+                }
+                catch (Exception ex)
+                {
+                    exceptions++;
+                    if (log != null && exceptions <= 8)
+                        log("assets: entity '" + SafeEntityName(e) + "' EXCEPTION " + Err(ex));
+                }
+            }
+
+            // ---------------------------------------------------------------- preload pass
+            // Load exactly the bodies we are about to read, by body name, with the engine's own
+            // recipe (PreloadHelper.PreloadMeshesAndPhysics does the same). This is what makes the
+            // native triangle-mesh table non-null so GetTriangle cannot read-AV the process.
+            var preloadWatch = System.Diagnostics.Stopwatch.StartNew();
+            if (log != null)
+            {
+                if (preloadNamesEmpty > 0)
+                    log("assets: " + preloadNamesEmpty + " included bodies had no preload name (not queued).");
+                log("assets: preloading " + preloadNames.Count + " unique physics bodies by name");
+            }
+            if (preloadNames.Count > 0)
+            {
+                try
+                {
+                    for (int i = 0; i < preloadNames.Count; i++)
+                        PhysicsShape.AddPreloadQueueWithName(preloadNames[i], new Vec3(1f, 1f, 1f, -1f));
+                    PhysicsShape.ProcessPreloadQueue();
+                }
+                catch (Exception ex)
+                {
+                    if (log != null) log("assets: preload EXCEPTION " + Err(ex));
+                }
+            }
+            preloadWatch.Stop();
+            long preloadMs = preloadWatch.ElapsedMilliseconds;
+            if (log != null)
+                log("assets: preloaded " + preloadNames.Count + " bodies by name (preloadMs=" + preloadMs + ")");
+
+            // ---------------------------------------------------------------- pass 2
+            // Triangle read. Every native GetTriangle is now preceded (in trace mode) by a line
+            // naming the entity, so a crash log's last line identifies the culprit.
+            var verts = new List<float>();
+            var tris = new List<int>();
+            var largestTris = new List<int>();
+            var largestName = new List<string>();
+            var tri = new Vec3[3];
+
+            int included = 0, exEmpty = 0, shapesCapped = 0;
+            int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
+
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                Candidate c = candidates[i];
+                try
+                {
+                    int meshCount = SafeInt(() => c.Shape.TriangleMeshCount());
                     int shapeTris = 0;
                     for (int m = 0; m < meshCount; m++)
-                        shapeTris += SafeInt(() => shape.TriangleCountInTriangleMesh(m));
+                        shapeTris += SafeInt(() => c.Shape.TriangleCountInTriangleMesh(m));
+
+                    if (trace && log != null)
+                        log("assets: TRACE '" + c.Name + "' body='" + c.BodyName + "' flags=0x"
+                            + FlagsHex(c.Flags) + " mobility=" + c.Mobility + " dyn=" + c.IsDynamic
+                            + " meshCount=" + meshCount + " tris=" + shapeTris);
+
                     if (meshCount <= 0 || shapeTris <= 0)
                     {
                         exEmpty++;
                         continue;
                     }
 
-                    MatrixFrame frame = SafeFrame(e);
+                    MatrixFrame frame = SafeFrame(c.Entity);
                     int wrote = 0;
                     bool capped = false;
                     for (int m = 0; m < meshCount && !capped; m++)
                     {
-                        int tc = SafeInt(() => shape.TriangleCountInTriangleMesh(m));
+                        int tc = SafeInt(() => c.Shape.TriangleCountInTriangleMesh(m));
                         for (int t = 0; t < tc; t++)
                         {
                             if (wrote >= PerShapeTriCap)
@@ -150,7 +258,7 @@ namespace BetterBannerlordNavmeshing
                             }
                             try
                             {
-                                shape.GetTriangle(tri, m, t);
+                                c.Shape.GetTriangle(tri, m, t);
                             }
                             catch (Exception)
                             {
@@ -177,24 +285,28 @@ namespace BetterBannerlordNavmeshing
                     {
                         shapesCapped++;
                         if (log != null)
-                            log("assets: WARNING shape '" + name + "' capped at " + PerShapeTriCap
+                            log("assets: WARNING shape '" + c.Name + "' capped at " + PerShapeTriCap
                                 + " tris (had " + shapeTris + ")");
                     }
 
                     included++;
-                    TrackLargest(largestTris, largestName, name, wrote);
+                    TrackLargest(largestTris, largestName, c.Name, wrote);
 
-                    if (isStairs) cStairs++;
-                    else if (IsWall(name)) cWall++;
-                    else if (IsFloor(name)) cFloor++;
+                    if (c.IsStairs) cStairs++;
+                    else if (IsWall(c.Name)) cWall++;
+                    else if (IsFloor(c.Name)) cFloor++;
                     else cOther++;
                 }
                 catch (Exception ex)
                 {
-                    exExceptions++;
-                    if (log != null && exExceptions <= 8)
-                        log("assets: entity '" + SafeEntityName(e) + "' EXCEPTION " + Err(ex));
+                    exceptions++;
+                    if (log != null && exceptions <= 8)
+                        log("assets: entity '" + c.Name + "' EXCEPTION " + Err(ex));
                 }
+
+                if (log != null && ((i + 1) % ProgressEvery == 0 || i + 1 == candidates.Count))
+                    log("assets: progress entities=" + (i + 1) + "/" + candidates.Count
+                        + " included=" + included + " tris=" + (tris.Count / 3));
             }
 
             watch.Stop();
@@ -211,7 +323,7 @@ namespace BetterBannerlordNavmeshing
                 log("assets: entities=" + count + " physics=" + physics + " included=" + included
                     + " excluded=[flora=" + exFlora + " barrier=" + exBarrier + " terrain=" + exTerrain
                     + " ladder=" + exLadder + " dynamic=" + exDynamic + " noShape=" + exNoShape
-                    + " empty=" + exEmpty + " exceptions=" + exExceptions + "]"
+                    + " empty=" + exEmpty + " exceptions=" + exceptions + "]"
                     + " tris=" + result.TriangleCount + " cappedShapes=" + shapesCapped
                     + " scanMs=" + result.ScanMs);
                 log("assets: kinds stairs=" + cStairs + " wall=" + cWall + " floor=" + cFloor
@@ -222,6 +334,11 @@ namespace BetterBannerlordNavmeshing
         }
 
         // ---------------------------------------------------------------- helpers
+        private static string FlagsHex(BodyFlags f)
+        {
+            return unchecked((int)f).ToString("X8");
+        }
+
         private static bool IsWall(string name)
         {
             return name.IndexOf("wall", StringComparison.OrdinalIgnoreCase) >= 0
@@ -272,17 +389,30 @@ namespace BetterBannerlordNavmeshing
             return sb.ToString();
         }
 
+        private static string SafeRawEntityName(GameEntity e)
+        {
+            try { return e.Name ?? ""; }
+            catch (Exception) { return ""; }
+        }
+
         private static string SafeEntityName(GameEntity e)
+        {
+            string n = SafeRawEntityName(e);
+            return string.IsNullOrEmpty(n) ? "?" : n;
+        }
+
+        private static string SafeShapeName(PhysicsShape shape, string fallback)
         {
             try
             {
-                string n = e.Name;
-                return string.IsNullOrEmpty(n) ? "?" : n;
+                string n = shape.GetName();
+                if (!string.IsNullOrEmpty(n))
+                    return n;
             }
             catch (Exception)
             {
-                return "?";
             }
+            return fallback ?? "";
         }
 
         private static BodyFlags SafeFlags(Func<BodyFlags> getter)
