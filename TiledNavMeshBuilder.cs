@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using DotRecast.Core;
 using DotRecast.Core.Numerics;
@@ -407,6 +408,16 @@ namespace BetterBannerlordNavmeshing
             var tilesWatch = Stopwatch.StartNew();
             var parallelOptions = new ParallelOptions();
             parallelOptions.MaxDegreeOfParallelism = workers;
+
+            // Coarse progress for long builds: log every ~5% of tiles (and at the end),
+            // throttled to at most one line per ~2 s. Purely observational -- the counter
+            // and logs never influence the built output (determinism is unaffected).
+            int tilesCompleted = 0;
+            int progressStep = Math.Max(1, tileCount / 20);
+            long lastProgressMs = 0;
+            var progressLock = new object();
+            var progressWatch = Stopwatch.StartNew();
+
             Parallel.For(0, tileCount, parallelOptions, delegate (int index)
             {
                 int tx = index % tilesX;
@@ -415,6 +426,25 @@ namespace BetterBannerlordNavmeshing
                     originX, originZ, tileSpan, cellsPerTile, bminY, bmaxY, width, height, border, pad,
                     walkableHeight, walkableClimb, walkableRadius, maxSimplificationError,
                     minRegionArea, mergeRegionArea, areaMod);
+
+                if (log != null)
+                {
+                    int done = Interlocked.Increment(ref tilesCompleted);
+                    if (done == tileCount || done % progressStep == 0)
+                    {
+                        long elapsed = progressWatch.ElapsedMilliseconds;
+                        bool emit;
+                        lock (progressLock)
+                        {
+                            emit = done == tileCount || elapsed - lastProgressMs >= 2000;
+                            if (emit)
+                                lastProgressMs = elapsed;
+                        }
+                        if (emit)
+                            log("v2: progress tiles=" + done + "/" + tileCount
+                                + " (" + (done * 100 / tileCount) + "%) elapsedMs=" + elapsed);
+                    }
+                }
             });
             tilesWatch.Stop();
 

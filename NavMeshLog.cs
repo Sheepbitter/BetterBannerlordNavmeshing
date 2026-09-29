@@ -9,7 +9,10 @@ namespace BetterBannerlordNavmeshing
     // run trace is written to a real file as well as mirrored to the console.
     //
     // Thread-safe, and every file operation is wrapped: logging must never throw
-    // into the caller or interrupt a run.
+    // into the caller or interrupt a run. Write/Initialize/Shutdown take the same
+    // lock, so the async v2 build thread can log progress concurrently with the
+    // editor main thread (the writer is AutoFlush, and each line is written under
+    // the lock, so lines never interleave).
     public static class NavMeshLog
     {
         private static readonly object Sync = new object();

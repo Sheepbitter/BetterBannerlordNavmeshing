@@ -951,6 +951,14 @@ namespace BetterBannerlordNavmeshing
             public int CulledByHeight;
             public int BinByteCount;
             public bool ImportAttempted;
+
+            // Per-phase wall times (ms) from the write/import half; consumed by the
+            // async editor path's "v2: perf:" line. Not part of the on-disk contract.
+            public long WriteMs;
+            public long ObjMs;
+            public long ClearMs;
+            public long ImportMs;
+            public long FacesAfterMs;
         }
 
         public static ExportResult ExportAndImport(
@@ -1155,6 +1163,12 @@ namespace BetterBannerlordNavmeshing
                     + " importMs=" + importMs
                     + " facesAfterMs=" + facesAfterMs);
             }
+
+            result.WriteMs = writeMs;
+            result.ObjMs = objMs;
+            result.ClearMs = clearMs;
+            result.ImportMs = importMs;
+            result.FacesAfterMs = facesAfterMs;
 
             return result;
         }

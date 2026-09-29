@@ -168,7 +168,8 @@ actually goes (the editor felt slower than `totalMs`, which only covers our code
 
 **Not included:** everything the editor does around/after the import call - viewport refresh, scene
 save/compile, and any engine-side prefab-list rebuild. If `timings:` is small but the editor still feels slow,
-the cost is outside this pipeline (startup prefab list, viewport, or save).
+the cost is outside this pipeline (startup prefab list, viewport, or save). The v2 async path measures those
+separately with the `v2: perf:` lines - see *Async build & performance instrumentation* below.
 
 `faces after import` is the ground truth for whether the import added faces. Failures log `ERROR: <type>:
 <message>` plus a flattened `ERROR stack:` line; the pipeline never throws into the caller.
@@ -246,10 +247,10 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `ExportNavMesh` | button | Full pipeline: reads terrain, builds, writes the bin, imports. |
 | `ImportNavMeshOnly` | button | Imports the already-written prefab: no sampling/build. Use after a restart (see workflow). |
 | `ProbeGeometry` | button | Phase 1 diagnostic: dumps scene collision geometry to the log (see Probe Geometry). |
-| `NavMeshSampleStride` | `1` | **Finest** sampling: 1 = every terrain vertex. Refinement decides the coarser cells. |
+| `NavMeshSampleStride` | `2` | Terrain sampling decimation: 1 = every vertex, 2 = every other (the default; halves sample count with no practical fidelity loss). |
 | `NavMeshMaxErrorMeters` | `0.25` | Fidelity guarantee: mesh surface stays within this of the ground. |
 | `NavMeshCoarsestSpacing` | `16` | Largest cell size (m). Smaller = tighter bound, more faces. |
-| `NavMeshMaxSlopeDegrees` | `65` | Faces steeper than this are dropped. Lower it (~30) to actually trim steep ground. |
+| `NavMeshMaxSlopeDegrees` | `50` | Faces steeper than this are dropped; the v2 core auto-derives the agent climb so the configured slope is actually traversable. |
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
 | `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the emitted mesh. 0 = flush with the terrain. |
 | `NavMeshPrefabName` | `""` | Defaults to `<scene name>_navmesh`. |
@@ -257,16 +258,17 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
-| `NavMeshUseVoxelCore` | `false` | **Experimental:** run the v2 tiled voxel core instead of the v1 adaptive terrain mesher (terrain-only). See *Voxel core (experimental)*. |
+| `NavMeshUseVoxelCore` | `true` | Run the v2 tiled voxel core (terrain-only; the default since 2026-09-29). Set false for the v1 adaptive terrain mesher. See *Voxel core (experimental)*. |
 | `NavMeshVoxelCellSize` | `0.5` | Voxel cell size (m) for the v2 core. Smaller = finer mesh, more faces. |
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
 | `NavMeshVoxelDetailSampleDist` | `2` | v2 detail-mesh sampling distance (m). `0` = auto (`max(0.9, cellSize)`). The default cuts the tight/sliver faces Recast's detail edge tessellation makes along walkable boundaries. Lower = more surface detail (more faces). |
 | `NavMeshVoxelContourMaxError` | `1.3` | v2 contour simplification error (voxels). `0` = auto (`NavMeshMaxErrorMeters / cellSize`, i.e. 0.5). A simpler walkable boundary removes most remaining boundary slivers on boundary-rich maps, with no change to the surface-error budget. |
+| `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
-Mesher cost (default 3584x3584 m terrain, stride 1, coarsest 16, slope 65, Release, seed 12345): at
+Mesher cost (v1 path, measured on 3584x3584 m terrain at stride 1, coarsest 16, slope 65, Release, seed 12345): at
 `MaxErrorMeters = 0.25` ≈ 1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
 `2.0` ≈ 411 k faces / 35 MB / ~0.5 s; at `4.0` ≈ 121 k faces / 10 MB / ~0.3 s.
 
@@ -288,6 +290,48 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox). Agent
   radius/height are fixed at 0.35 / 1.8 m; **climb is auto-derived** so the slope setting is actually
   walkable (see below).
+
+### Async build & performance instrumentation
+
+With `NavMeshUseVoxelCore = true` and `NavMeshAsyncBuild = true` (the default), the Export button runs the
+pipeline in two halves:
+
+- **Main thread:** run header + settings, `faces before run`, the live terrain read (`SceneTerrainSampler`),
+  and prefab/folder resolution.
+- **Background thread:** `VoxelNavMeshGenerator.BuildExportMesh` only - the pure-managed build (terrain soup
+  -> `TiledNavMeshBuilder.Build` -> NMG8 serialization). It never touches `Scene`/game objects.
+- **Main thread (completion):** the **unchanged** `TerrainNavMeshGenerator.WriteAndImport` half - bin write,
+  `ClearNavMesh`, native `ImportNavigationMeshPrefab`, face-count verify.
+
+Completion is picked up on the editor tick. The editor calls `OnEditorTick(dt)` for every script component in
+the open scene each frame (decompiled 1.4.8 editor: `ManagedScriptHolder.SetScriptComponentHolder` adds the
+component to `_toTickForEditor`, and `ManagedScriptHolder.TickComponentsEditor` invokes `OnEditorTick`), so
+the component polls a completion flag there. The editor stays interactive for the whole build instead of
+blocking for 3-60 s. Pressing Export again while a build is running logs `v2: build already running - ignoring`
+and is ignored. A background failure is reported on the main thread and never tears the editor down; the
+invariant-gate abort keeps its old behaviour (no bin, no import).
+
+New log lines (async path only; v1 and **Import Only** are unchanged):
+
+```
+NavMesh: v2: async build started on a background thread; the editor stays responsive (progress lines follow).
+NavMesh: v2: progress tiles=<done>/<total> (<pct>%) elapsedMs=<n>          <- every ~5% of tiles, >=2 s apart
+NavMesh: v2: async build finished on the background thread.
+NavMesh: v2: perf: ticksDuringBuild=<n> maxTickMs=<n>                      <- editor stayed alive during the build
+NavMesh: v2: perf: clickToDoneMs=<n> sampleMs=<n> buildMs=<n> writeMs=<n> importMs=<n>
+NavMesh: v2: perf: postImportTickMs min=<a> avg=<b> max=<c> over 30 ticks  <- viewport cost of the new mesh
+```
+
+- `ticksDuringBuild` / `maxTickMs` - editor ticks observed while the build ran and the slowest frame; evidence
+  the UI stayed responsive. The frame time is the wall-clock gap between `OnEditorTick` calls (not the engine
+  `dt`), so a real hitch shows up.
+- `clickToDoneMs` - button press to import done; `sampleMs` is the terrain read, `buildMs` the background
+  build, `writeMs` the `.bin` write and `importMs` the native import.
+- `postImportTickMs` - the editor frame time sampled over the 30 ticks right after the import; this is the
+  first viewport-render measurement of a large imported navmesh (the `timings:` line excludes it).
+
+Determinism is untouched: the progress counter/logging is observational only, and the harness
+(`RESULT: DETERMINISM PASS`) is unchanged.
 
 ### Detail mesh (on by default)
 
