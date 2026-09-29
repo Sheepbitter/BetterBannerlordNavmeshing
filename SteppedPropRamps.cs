@@ -60,10 +60,10 @@ namespace BetterBannerlordNavmeshing
         public const float MaxBridgeRunMeters = 1.5f;
         // A chunk may span about this much rise (a single flight). The deviation rule below is the real
         // shaper; this is only a safety bound on how far one quad may reach.
-        public const float MaxRisePerRampMeters = 4.0f;
+        public const float MaxRisePerRampMeters = 2.0f;
         // How far the chord may sit from the sampled envelope before the chunk is cut shorter. Must stay
         // inside Recast's span merge reach (walkableClimb), or the ramp stops merging with the treads.
-        public const float MaxDeviationMeters = 0.40f;
+        // (unused by the holes-only emitter; kept for the record)
         // Chained sub-ramps per prop. A flight needing more is reported as capped and skipped.
         public const int MaxRampsPerProp = 4;
         // Horizontal run a single ramp may span (also rejects walkways the base geometry already
@@ -93,6 +93,8 @@ namespace BetterBannerlordNavmeshing
             public int Ramps;          // ramp quads emitted (the sloped part; aprons are extra quads)
             public int Stairs;         // HasSteps props that produced at least one ramp
             public int Ladders;        // Ladder props that produced at least one ramp
+            public int Holes;          // run stretches with no collision, considered for bridging
+            public int NoHoles;        // props with nothing to bridge (their treads are the path)
             public int SkippedFlat;    // rise < MinRiseMeters (or nothing walkable to follow)
             public int SkippedSteep;   // no chunk could obey the slope rule
             public int SkippedLong;    // no chunk could obey the run rule
@@ -133,7 +135,7 @@ namespace BetterBannerlordNavmeshing
             float slopeCap = Math.Min(MaxSlopeDegrees,
                 NavigableSlopeDegrees(cellSizeMeters, climbMeters, ledgeFilter));
             r.SlopeCapDegrees = slopeCap;
-            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r, slopeCap);
+            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r, slopeCap, climbMeters);
             return r;
         }
 
@@ -149,7 +151,7 @@ namespace BetterBannerlordNavmeshing
             return (float)(Math.Atan(t) * 180.0 / Math.PI);
         }
 
-        private static void AppendProp(Prop p, Result r, float slopeCapDegrees)
+        private static void AppendProp(Prop p, Result r, float slopeCapDegrees, float climbMeters)
         {
             if (p == null || p.VertsXyz == null || p.Tris == null) return;
             if (!IsSteppedOrLadder(p.Flags)) return;
@@ -230,7 +232,9 @@ namespace BetterBannerlordNavmeshing
             }
 
             // -------- run stations: is there collision at this station, and what is its top envelope?
-            float step = StationStepMeters;
+            // The step adapts to the flight's length: a short ladder has rungs on a ~0.3 m pitch, and a
+            // fixed 0.25 m step would miss the holes between them entirely.
+            float step = Math.Min(StationStepMeters, Math.Max(0.1f, runSpan / 32f));
             int stationCount = (int)Math.Floor(runSpan / step) + 1;
             if (stationCount < 2)
             {
@@ -313,42 +317,58 @@ namespace BetterBannerlordNavmeshing
                 return;
             }
 
-            // -------- greedy chunking over the supported stations: cut when the chord would rise too
-            // much, would deviate from the sampled envelope by more than the merge reach, or when the
-            // next station is separated by an air span too wide to bridge.
+            // -------- holes: maximal stretches of the run where the prop supplies NO collision. A ramp
+            // chunk bridges exactly one hole - from the last supported station before it to the first
+            // supported station after it - so a ramp can never hover over an existing tread. Where the
+            // prop does have geometry the treads themselves are the walkable path (the builder exempts a
+            // stepped prop's own triangles from the ledge trim).
             var starts = new List<int>();
             var ends = new List<int>();
-            int chunkStart = sup[0];
-            for (int j = 1; j < sup.Count; j++)
+            int lastSup = -1;
+            int holes = 0;
+            for (int i = 0; i < stationCount; i++)
             {
-                int prev = sup[j - 1];
-                int cur = sup[j];
-                float bridgeRun = (cur - prev) * step;
-                bool tooWide = bridgeRun > MaxBridgeRunMeters + 1e-3f;
-                bool cut = tooWide
-                    || stZ[cur] - stZ[chunkStart] > MaxRisePerRampMeters + 1e-3f
-                    || DeviationTooLarge(sup, chunkStart, cur, stZ, step);
-                if (!cut) continue;
-                if (prev > chunkStart)
+                if (stOk[i]) { lastSup = i; continue; }
+                while (i < stationCount && !stOk[i]) i++;
+                if (lastSup < 0 || i >= stationCount) continue;   // a hole reaching the run's own end
+                holes++;
+                // Bridge one station PAST each side so the ramp overlaps the geometry it lands on (that
+                // overlap is what merges the spans); the station grid quantises the gap, so the extra
+                // station also keeps the slope test honest.
+                int bStart = lastSup > 0 ? lastSup - 1 : lastSup;
+                int bEnd = i < stationCount - 1 ? i + 1 : i;
+                float gapRun = (bEnd - bStart) * step;
+                float gapRise = stZ[bEnd] - stZ[bStart];
+                if (gapRise <= climbMeters + 1e-3f)
                 {
-                    starts.Add(chunkStart);
-                    ends.Add(prev);
-                    chunkStart = prev;
+                    // Within a step: ordinary rasterisation already walks over it, no ramp needed.
+                    continue;
                 }
-                else if (tooWide)
+                if (gapRun > MaxBridgeRunMeters + 1e-3f)
                 {
-                    // The air span starts right here: break the chain instead of spanning it.
-                    chunkStart = cur;
+                    r.SkippedLong++;
+                    continue;
                 }
+                if (gapRise < MinChunkRiseMeters || gapRun < 1e-3f
+                    || gapRise > MaxRisePerRampMeters + 1e-3f)
+                {
+                    r.SkippedSteep++;
+                    continue;
+                }
+                if (Math.Atan2(gapRise, gapRun) * 180.0 / Math.PI > slopeCapDegrees)
+                {
+                    r.SkippedSteep++;
+                    continue;
+                }
+                starts.Add(bStart);
+                ends.Add(bEnd);
             }
-            if (sup[sup.Count - 1] > chunkStart)
-            {
-                starts.Add(chunkStart);
-                ends.Add(sup[sup.Count - 1]);
-            }
+            r.Holes += holes;
             if (starts.Count == 0)
             {
-                r.SkippedFlat++;
+                // No hole to bridge (or every hole was refused): the prop's own, now ledge-exempt treads
+                // are the path. This is NOT a skip - reporting it as one hid whole flights in V3.11.
+                r.NoHoles++;
                 return;
             }
             if (starts.Count > MaxRampsPerProp)
@@ -378,10 +398,7 @@ namespace BetterBannerlordNavmeshing
             }
             else if (r.SkippedSteep == steep0 && r.SkippedLong == long0)
             {
-                // Nothing walkable came out and no chunk even reached the slope/run guards: the flight is
-                // steeper than any ramp may be, or has no usable rise. Both are reported as steep/flat by
-                // whichever guard above already fired; this is the belt-and-braces case.
-                r.SkippedSteep++;
+                r.SkippedFlat++;   // no chunk even reached the slope / run guards
             }
         }
 
@@ -444,24 +461,6 @@ namespace BetterBannerlordNavmeshing
             if (i < 0) i = 0;
             if (i >= stationCount) i = stationCount - 1;
             return i;
-        }
-
-        // The chord from station a to station b must stay within MaxDeviationMeters of every sampled
-        // envelope height in between, or the ramp would hover over (or cut into) the treads.
-        private static bool DeviationTooLarge(List<int> sup, int a, int b, float[] stZ, float step)
-        {
-            float za = stZ[a], zb = stZ[b];
-            float span = (b - a) * step;
-            if (span < 1e-3f) return false;
-            for (int j = 0; j < sup.Count; j++)
-            {
-                int k = sup[j];
-                if (k <= a || k >= b) continue;
-                float t = ((k - a) * step) / span;
-                float chord = za + (zb - za) * t;
-                if (Math.Abs(stZ[k] - chord) > MaxDeviationMeters) return true;
-            }
-            return false;
         }
 
         // Emits one chunk (plus an end apron on the first / last chunk). Returns true when the sloped

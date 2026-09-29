@@ -50,6 +50,9 @@ namespace BetterBannerlordNavmeshing
             // Same length as Tris/3 when any ramp was synthesized; null otherwise. True = the triangle
             // is a synthesized stair/ladder ramp and must be walkable regardless of its slope.
             public bool[] ForceWalkableTris;
+            // Same length as Tris/3 when any HasSteps/Ladder prop was seen; null otherwise. True =
+            // that triangle belongs to a stepped prop, so the builder keeps it off the ledge trim.
+            public bool[] LedgeExemptTris;
         }
 
         // Per-entity view of the same collection, for the scene snapshot (offline test case).
@@ -81,8 +84,9 @@ namespace BetterBannerlordNavmeshing
                 ExExceptions, ExUnsolid;
             // Synthesized stair/ladder ramp triangles (SteppedPropRamps); null when none/disabled.
             public bool[] ForceWalkableTris;
-            public int RampQuads, RampStairs, RampLadders,
-                RampSkippedFlat, RampSkippedSteep, RampSkippedLong, RampCapped;
+            public bool[] LedgeExemptTris;
+            public int RampQuads, RampStairs, RampLadders, RampHoles, RampNoHoles, RampSkippedFlat,
+                RampSkippedSteep, RampSkippedLong, RampCapped;
         }
 
         // An included entity carried from the classification pass to the triangle-read pass.
@@ -113,6 +117,7 @@ namespace BetterBannerlordNavmeshing
             r.ShapesCapped = g.ShapesCapped;
             r.ScanMs = g.ScanMs;
             r.ForceWalkableTris = g.ForceWalkableTris;
+            r.LedgeExemptTris = g.LedgeExemptTris;
             return r;
         }
 
@@ -281,6 +286,7 @@ namespace BetterBannerlordNavmeshing
             // Triangle read. Every native GetTriangle is now preceded (in trace mode) by a line
             // naming the entity, so a crash log's last line identifies the culprit.
             var verts = new List<float>();
+            var ledgeExempt = new List<bool>();   // one entry per real triangle (stepped props)
             var tris = new List<int>();
             var largestTris = new List<int>();
             var largestName = new List<string>();
@@ -291,9 +297,8 @@ namespace BetterBannerlordNavmeshing
             // a build without ramps produces byte-identical soup to the pre-ramp code.
             var rampVerts = new List<float>();
             var rampTris = new List<int>();
-            int rampQuads = 0, rampStairs = 0, rampLadders = 0;
+            int rampQuads = 0, rampStairs = 0, rampLadders = 0, rampHoles = 0, rampNoHoles = 0;
             int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
-
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -302,6 +307,7 @@ namespace BetterBannerlordNavmeshing
                 Candidate c = candidates[i];
                 try
                 {
+                    bool isSteppedProp = (c.Flags & (BodyFlags.HasSteps | BodyFlags.Ladder)) != 0;
                     int meshCount = SafeInt(() => c.Shape.TriangleMeshCount());
                     int shapeTris = 0;
                     for (int m = 0; m < meshCount; m++)
@@ -354,6 +360,7 @@ namespace BetterBannerlordNavmeshing
                             tris.Add(b);
                             tris.Add(b + 1);
                             tris.Add(b + 2);
+                            ledgeExempt.Add(isSteppedProp);
                             wrote++;
                         }
                     }
@@ -420,6 +427,8 @@ namespace BetterBannerlordNavmeshing
                         rampSkippedLong += ramps.SkippedLong;
                         rampCapped += ramps.Capped;
 
+                        rampHoles += ramps.Holes;
+                        rampNoHoles += ramps.NoHoles;
                         if (ramps.Tris.Count > 0)
                         {
                             int rampBase = rampVerts.Count / 3;
@@ -475,6 +484,17 @@ namespace BetterBannerlordNavmeshing
                 for (int k = realTris; k < rampMask.Length; k++) rampMask[k] = true;
                 result.ForceWalkableTris = rampMask;
             }
+            bool anyExempt = false;
+            for (int k = 0; k < ledgeExempt.Count; k++)
+                if (ledgeExempt[k]) { anyExempt = true; break; }
+            if (anyExempt)
+            {
+                // A stepped prop's own triangles: the builder keeps their spans off the ledge trim.
+                var exemptMask = new bool[realTris + rampTriCount];
+                for (int k = 0; k < realTris && k < ledgeExempt.Count; k++)
+                    exemptMask[k] = ledgeExempt[k];
+                result.LedgeExemptTris = exemptMask;
+            }
             result.VertsXyz = verts.ToArray();
             result.Tris = tris.ToArray();
             result.VertexCount = verts.Count / 3;
@@ -497,6 +517,8 @@ namespace BetterBannerlordNavmeshing
             result.ExUnsolid = exUnsolid;
             result.RampQuads = rampQuads;
             result.RampStairs = rampStairs;
+            result.RampHoles = rampHoles;
+            result.RampNoHoles = rampNoHoles;
             result.RampLadders = rampLadders;
             result.RampSkippedFlat = rampSkippedFlat;
             result.RampSkippedSteep = rampSkippedSteep;
@@ -515,18 +537,18 @@ namespace BetterBannerlordNavmeshing
                     + " other=" + cOther + " (name heuristic; log only)");
                 if (propRamps)
                 {
-                    log("assets: ramps: synthesized=" + rampQuads + " stairs=" + rampStairs
-                        + " ladders=" + rampLadders + " skipped="
-                        + (rampSkippedFlat + rampSkippedSteep + rampSkippedLong)
-                        + " (walkable-if-steep)");
+                    log("assets: stepped: ramps=" + rampQuads + " stairs=" + rampStairs
+                        + " ladders=" + rampLadders + " holes=" + rampHoles + " noHoles=" + rampNoHoles
+                        + " skipped=" + (rampSkippedFlat + rampSkippedSteep + rampSkippedLong)
+                        + " (ramps bridge unsupported stretches only; treads are ledge-exempt)");
                     if (rampSkippedFlat > 0 || rampSkippedSteep > 0 || rampSkippedLong > 0 || rampCapped > 0)
-                        log("assets: ramps: skipped detail flat=" + rampSkippedFlat + " steep="
+                        log("assets: stepped: skipped detail flat=" + rampSkippedFlat + " steep="
                             + rampSkippedSteep + " long=" + rampSkippedLong + " capped=" + rampCapped
                             + "; " + SteppedPropRamps.Describe());
                 }
                 else
                 {
-                    log("assets: ramps: disabled (NavMeshVoxelPropRamps=false)");
+                    log("assets: stepped: disabled (NavMeshVoxelSteppedProps=false)");
                 }
                 log("assets: largest shapes: " + LargestString(largestTris, largestName));
             }
