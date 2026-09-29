@@ -49,6 +49,35 @@ namespace BetterBannerlordNavmeshing
             public long ScanMs;
         }
 
+        // Per-entity view of the same collection, for the scene snapshot (offline test case).
+        public sealed class AssetEntityRecord
+        {
+            public string Name;
+            public BodyFlags Flags;
+            public int Mobility;
+            public int TriCount;       // triangles actually read (capped)
+            public bool Capped;
+            public float[] VertsXyz;   // engine Z-up, 3 per vertex, entity-local indexing
+            public int[] Tris;         // 0-based into VertsXyz
+        }
+
+        public sealed class AssetGeometry
+        {
+            public float[] VertsXyz;   // merged soup, engine Z-up
+            public int[] Tris;
+            public int VertexCount;
+            public int TriangleCount;
+            public int EntitiesIncluded;
+            public int ShapesCapped;
+            public long ScanMs;
+            public List<AssetEntityRecord> Entities;
+            public List<int> LargestTris;
+            public List<string> LargestNames;
+            public int Count, Physics;
+            public int ExFlora, ExBarrier, ExTerrain, ExLadder, ExDynamic, ExNoShape, ExEmpty,
+                ExExceptions, ExUnsolid;
+        }
+
         // An included entity carried from the classification pass to the triangle-read pass.
         private sealed class Candidate
         {
@@ -65,9 +94,29 @@ namespace BetterBannerlordNavmeshing
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
             System.Action<string> log)
         {
-            var result = new AssetTriangles();
+            AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, log);
+            var r = new AssetTriangles();
+            r.VertsXyz = g.VertsXyz;
+            r.Tris = g.Tris;
+            r.VertexCount = g.VertexCount;
+            r.TriangleCount = g.TriangleCount;
+            r.EntitiesIncluded = g.EntitiesIncluded;
+            r.ShapesCapped = g.ShapesCapped;
+            r.ScanMs = g.ScanMs;
+            return r;
+        }
+
+        // recordEntities: also keep each entity's own vertices/indices (scene snapshot). The merged
+        // arrays and every policy/counter are identical either way.
+        public static AssetGeometry CollectDetailed(Scene scene, bool includeDynamic, bool includeFlora,
+            bool trace, bool recordEntities, System.Action<string> log)
+        {
+            var result = new AssetGeometry();
             result.VertsXyz = new float[0];
             result.Tris = new int[0];
+            result.Entities = new List<AssetEntityRecord>();
+            result.LargestTris = new List<int>();
+            result.LargestNames = new List<string>();
             if (scene == null)
             {
                 if (log != null) log("assets: no scene.");
@@ -250,6 +299,8 @@ namespace BetterBannerlordNavmeshing
                     }
 
                     MatrixFrame frame = SafeFrame(c.Entity);
+                    int firstVert = verts.Count / 3;
+                    int firstTri = tris.Count / 3;
                     int wrote = 0;
                     bool capped = false;
                     for (int m = 0; m < meshCount && !capped; m++)
@@ -296,7 +347,29 @@ namespace BetterBannerlordNavmeshing
                     }
 
                     included++;
-                    TrackLargest(largestTris, largestName, c.Name, wrote);
+                    TrackLargest(largestTris, largestName, c.Name, wrote, 20);
+
+                    if (recordEntities && wrote > 0)
+                    {
+                        var rec = new AssetEntityRecord();
+                        rec.Name = c.Name;
+                        rec.Flags = c.Flags;
+                        rec.Mobility = (int)c.Mobility;
+                        rec.TriCount = wrote;
+                        rec.Capped = capped;
+                        rec.VertsXyz = new float[wrote * 9];
+                        int vCount = verts.Count / 3 - firstVert;
+                        for (int v = 0; v < vCount; v++)
+                        {
+                            rec.VertsXyz[v * 3 + 0] = verts[(firstVert + v) * 3 + 0];
+                            rec.VertsXyz[v * 3 + 1] = verts[(firstVert + v) * 3 + 1];
+                            rec.VertsXyz[v * 3 + 2] = verts[(firstVert + v) * 3 + 2];
+                        }
+                        rec.Tris = new int[wrote * 3];
+                        for (int t = 0; t < wrote * 3; t++)
+                            rec.Tris[t] = tris[firstTri * 3 + t] - firstVert;
+                        result.Entities.Add(rec);
+                    }
 
                     if (c.IsStairs) cStairs++;
                     else if (IsWall(c.Name)) cWall++;
@@ -323,6 +396,19 @@ namespace BetterBannerlordNavmeshing
             result.EntitiesIncluded = included;
             result.ShapesCapped = shapesCapped;
             result.ScanMs = watch.ElapsedMilliseconds;
+            result.LargestTris = largestTris;
+            result.LargestNames = largestName;
+            result.Count = count;
+            result.Physics = physics;
+            result.ExFlora = exFlora;
+            result.ExBarrier = exBarrier;
+            result.ExTerrain = exTerrain;
+            result.ExLadder = exLadder;
+            result.ExDynamic = exDynamic;
+            result.ExNoShape = exNoShape;
+            result.ExEmpty = exEmpty;
+            result.ExExceptions = exceptions;
+            result.ExUnsolid = exUnsolid;
 
             if (log != null)
             {
@@ -362,9 +448,8 @@ namespace BetterBannerlordNavmeshing
                 || name.IndexOf("platform", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
-        private static void TrackLargest(List<int> tris, List<string> names, string name, int triCount)
+        private static void TrackLargest(List<int> tris, List<string> names, string name, int triCount, int cap)
         {
-            const int cap = 10;
             if (tris.Count < cap)
             {
                 tris.Add(triCount);

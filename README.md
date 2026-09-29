@@ -262,6 +262,8 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `ExportNavMesh` | button | Full pipeline: reads terrain, builds, writes the bin, imports. |
 | `ImportNavMeshOnly` | button | Imports the already-written prefab: no sampling/build. Use after a restart (see workflow). |
 | `ProbeGeometry` | button | Phase 1 diagnostic: dumps scene collision geometry to the log (see Probe Geometry). |
+| `DumpSceneSnapshot` | button | Writes the export's main-thread inputs as a scene snapshot (terrain grid + per-entity collision triangles + a readable header) next to the bin, so the standalone harness can rebuild the exact soup for this scene without the editor. See *Scene snapshot & offline harness*. |
+| `NavMeshSnapshotAssertPoints` | `""` | Extra assert points for the snapshot header, format `"x,y;x,y;..."`. The two Birtu probe spots are always included; the harness asserts each point is covered by a face on the largest island. |
 | `NavMeshSampleStride` | `2` | Terrain sampling decimation: 1 = every vertex, 2 = every other (the default; halves sample count with no practical fidelity loss). |
 | `NavMeshMaxErrorMeters` | `0.25` | Fidelity guarantee: mesh surface stays within this of the ground. |
 | `NavMeshCoarsestSpacing` | `16` | Largest cell size (m). Smaller = tighter bound, more faces. |
@@ -448,6 +450,58 @@ their output is byte-identical to before (harness `RESULT: DETERMINISM PASS`, un
   `NavMeshHeightOffsetMeters` lift and the detail phase's upstream `+ch` nudge; the whole mesh is lifted
   together, so structures do not sit lower than the terrain around them.
 
+### Scene snapshot & offline harness
+
+Iterating on a real map should not need the editor. The **`Dump Scene Snapshot`** button (Scene Nav Mesh
+Exporter) runs the same main-thread inputs the export uses - the terrain sampler (full grid) and
+`SceneCollisionGeometry` with the current include/dynamic/flora policy - and writes **three files next to the
+bin** (same folder resolution as the export). It never throws; the log reports the three paths, the counts and
+the elapsed time.
+
+```
+NavMesh: snapshot: scene=<name> machine=<name>
+NavMesh: snapshot: terrain=<folder>\<prefab>_snapshot_terrain.bin (385x385 spacing=1.563m stride=2 heights=148225)
+NavMesh: snapshot: assets=<folder>\<prefab>_snapshot_assets.bin (entities=4336 tris=591589 cappedShapes=0)
+NavMesh: snapshot: txt=<folder>\<prefab>_snapshot.txt (largest=20 assertPoints=2)
+NavMesh: snapshot: wrote 3 files in 1234ms terrainMs=... assetsMs=...
+```
+
+**Formats** (little-endian, version 1):
+
+- `<prefab>_snapshot_terrain.bin` - `int32 version, int32 width, int32 height, float32 spacing, int32 stride`,
+  then `width*height` float32 heights exactly as the sampler produced them.
+- `<prefab>_snapshot_assets.bin` - `int32 version, int32 entityCount`; per entity: `int32 nameLen` + UTF-8
+  name, `int32 flags`, `int32 mobility`, `int32 triCount`, `int32 capped`, then `triCount*3` vertices (9
+  float32 each = 3 vertices per triangle, engine Z-up world space), then `triCount*3` int32 indices
+  (0-based; trivial, the mesh is stored unindexed).
+- `<prefab>_snapshot.txt` - human-readable: scene, date, machine, the settings line, the grid
+  (dims/spacing/stride/fallback), asset counts and the exclusion stats, the 20 largest shapes by name, and an
+  `assert-points:` section (the two Birtu probe spots plus `NavMeshSnapshotAssertPoints`).
+
+**Offline harness mode** (the standalone harness, `--snapshot`):
+
+```
+TiledCoreHarness.exe --snapshot <prefix>                       # <prefix>_snapshot_{terrain,assets}.bin + .txt
+TiledCoreHarness.exe --snapshot <terrainBin> <assetsBin> <txt>
+```
+
+It loads the snapshot and rebuilds the **exact** soup the editor would: `BuildTerrainSoup` with the header's
+spacing/stride, then the assets merged through `BuildCombinedSoup` (engine Z-up -> Recast Y-up, winding
+reversal), with the recommended defaults (cs 0.25, radius 0.25, slope 50, detail on, gapFill 2, stitch 6,
+prune 400, climb auto, +0.5 m lift). It prints the usual diagnostics (`v2:` settings/params/gapfill/stitch/
+prune/weld/invariants/islands), then:
+
+- each **assert point** is checked against the **largest island** (`SNAPSHOT: PASS/FAIL`, exit code 0/1);
+  the two Birtu probe spots are always written, so on a different scene delete those two lines from the txt
+  (or ignore the exit code) if they are not expected to be covered;
+- the island count and the 10 largest islands are listed;
+- every asset whose name contains **"diag"** is reported as `tris=<n> facesInBBox=<n> -> present|pruned`
+  (its XZ bounding box plus a 1 m Y band), so a renamed problem asset can be tracked by name.
+
+The no-argument batch mode (all the regression tests) is unchanged. The round trip is itself validated:
+harness `Test 20` writes a snapshot from a scenario with the real writer, loads it back through the same
+helpers, and asserts the soup and the mesh are **identical face for face** to the in-process build.
+
 ### Narrow features & connectivity
 
 Doorways, walkways and thin stair treads fail when **erosion + quantization eat the whole feature**:
@@ -593,7 +647,7 @@ NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- eve
 NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=.. dyn=.. meshCount=.. tris=..   <- only when NavMeshVoxelAssetTrace=true
 NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=.. unsolid=..] tris=... cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
-NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 10 by triangle count)
+NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 20 by triangle count)
 NavMesh: v2: terrain hole mask applied: cells touching a hole are dropped from the soup   <- only when holes were found
 NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted uniformly by +0.5m)
 NavMesh: v2: soup verts=... tris=... (terrain only) stride=... spacing=...m      <- only when NavMeshVoxelIncludeAssets=false or no assets found
@@ -621,7 +675,7 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
   rasterized (higher than `input` near tile borders because each tile sees its neighbours' geometry).
 - `assets: ...` (main thread, before the build) - the collision-geometry scan: entity/physics/included counts,
   the per-reason exclusion counts, total triangles, any capped shapes and the scan time (`scanMs`); plus a
-  name-heuristic kind histogram and the ten largest shapes. `assetsMs` on the perf/`done:` lines is the same
+  name-heuristic kind histogram and the twenty largest shapes. `assetsMs` on the perf/`done:` lines is the same
   scan's wall time.
 - `v2: soup terrain=... + assets=...` - the merged Recast-space soup size; the uniform lift applied to the
   whole mesh (`NavMeshHeightOffsetMeters`) is stated in the line.

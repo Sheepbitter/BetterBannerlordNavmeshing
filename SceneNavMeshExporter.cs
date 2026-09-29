@@ -17,6 +17,11 @@ namespace BetterBannerlordNavmeshing
         public SimpleButton ExportNavMesh;
         public SimpleButton ImportNavMeshOnly;
         public SimpleButton ProbeGeometry;
+
+        // Offline test case: write the export's main-thread inputs (terrain grid + per-entity collision
+        // triangles) plus a human-readable header, so the standalone harness can rebuild the exact soup
+        // for this scene without the editor. See SceneSnapshot / README.
+        public SimpleButton DumpSceneSnapshot;
         public int NavMeshSampleStride = 2;
         public float NavMeshMaxErrorMeters = 0.25f;
         public float NavMeshCoarsestSpacing = 16f;
@@ -71,6 +76,10 @@ namespace BetterBannerlordNavmeshing
         // Prune small isolated islands after the merge (sealed-void lids, stray fragments).
         public bool NavMeshVoxelPruneIsolatedIslands = true;
         public int NavMeshVoxelPruneMaxIslandFaces = 400;
+
+        // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
+        // asserts each point is covered by a face on the largest island after the build.
+        public string NavMeshSnapshotAssertPoints = "";
 
         // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
         // the terrain surface instead of chording under hills/knolls; bounded by
@@ -216,6 +225,8 @@ namespace BetterBannerlordNavmeshing
                 ImportOnlyFromEditor();
             else if (variableName == nameof(ProbeGeometry))
                 ProbeFromEditor();
+            else if (variableName == nameof(DumpSceneSnapshot))
+                DumpSnapshotFromEditor();
         }
 
         // Imports an already-written prefab without sampling or building. This is
@@ -337,6 +348,136 @@ namespace BetterBannerlordNavmeshing
             catch (Exception ex)
             {
                 NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
+            }
+        }
+
+        // Offline test case: writes the export's main-thread inputs next to the bin so the harness can
+        // rebuild the exact soup without the editor. Never throws.
+        private void DumpSnapshotFromEditor()
+        {
+            try
+            {
+                NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
+                System.Action<string> log = NavMeshLog.Write;
+                Scene scene = Scene;
+                if (scene == null)
+                {
+                    log("ERROR: no scene.");
+                    return;
+                }
+
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                log("===== snapshot dump @ "
+                    + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " =====");
+                log("snapshot: scene=" + SafeName(scene) + " machine=" + Environment.MachineName);
+
+                string prefabName = TerrainNavMeshGenerator.ResolvePrefabName(scene, NavMeshPrefabName, log);
+                string folder = TerrainNavMeshGenerator.ResolveFolder(scene, NavMeshExportFolder, log);
+
+                // Terrain: the same sampler (and the same hole-audit setting) the export uses.
+                var terrainWatch = System.Diagnostics.Stopwatch.StartNew();
+                SceneTerrainSampler.TerrainGrid grid =
+                    SceneTerrainSampler.Read(scene, NavMeshVoxelTerrainHoleAudit, log);
+                terrainWatch.Stop();
+
+                var td = new SceneSnapshot.TerrainData();
+                td.Width = grid.Width;
+                td.Height = grid.Height;
+                td.Spacing = grid.Spacing;
+                td.Stride = NavMeshSampleStride;
+                td.Heights = grid.Heights;
+                string terrainPath = System.IO.Path.Combine(folder, prefabName + "_snapshot_terrain.bin");
+                SceneSnapshot.WriteTerrainBin(terrainPath, td);
+
+                // Assets: the same collector policy the export uses, keeping per-entity groups.
+                var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
+                SceneCollisionGeometry.AssetGeometry assets = SceneCollisionGeometry.CollectDetailed(
+                    scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, NavMeshVoxelAssetTrace,
+                    true, log);
+                assetsWatch.Stop();
+
+                var records = new System.Collections.Generic.List<SceneSnapshot.EntityRecord>();
+                for (int i = 0; i < assets.Entities.Count; i++)
+                {
+                    SceneCollisionGeometry.AssetEntityRecord src = assets.Entities[i];
+                    records.Add(SceneSnapshot.Expand(src.Name, unchecked((int)src.Flags), src.Mobility,
+                        src.Capped, src.VertsXyz, src.Tris));
+                }
+                string assetsPath = System.IO.Path.Combine(folder, prefabName + "_snapshot_assets.bin");
+                SceneSnapshot.WriteAssetsBin(assetsPath, records);
+
+                // Assert points: the two probe spots reported from Birtu, plus anything the user adds.
+                var points = new System.Collections.Generic.List<string>();
+                points.Add("329.336,285.954");
+                points.Add("273.119,313.297");
+                System.Collections.Generic.List<float[]> extra =
+                    SceneSnapshot.ParsePoints(NavMeshSnapshotAssertPoints);
+                for (int i = 0; i < extra.Count; i++)
+                    points.Add(extra[i][0].ToString("0.###", CultureInfo.InvariantCulture) + ","
+                        + extra[i][1].ToString("0.###", CultureInfo.InvariantCulture));
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("scene: " + SafeName(scene));
+                sb.AppendLine("date: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                sb.AppendLine("machine: " + Environment.MachineName);
+                sb.AppendLine("settings: stride=" + NavMeshSampleStride
+                    + " maxSlope=" + F(NavMeshMaxSlopeDegrees) + "deg"
+                    + " maxError=" + F(NavMeshMaxErrorMeters) + "m"
+                    + " coarsest=" + F(NavMeshCoarsestSpacing) + "m"
+                    + " heightOffset=" + F(NavMeshHeightOffsetMeters) + "m"
+                    + " cellSize=" + F(NavMeshVoxelCellSize) + "m"
+                    + " radius=" + F(NavMeshVoxelAgentRadius) + "m"
+                    + " climb=" + F(NavMeshVoxelAgentClimbMeters) + "m"
+                    + " detail=" + NavMeshVoxelDetailMesh
+                    + " detailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
+                    + " contourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
+                    + " gapFill=" + NavMeshVoxelGapFillCells
+                    + " stitch=" + NavMeshVoxelStitchMaxGapCells
+                    + " prune=" + (NavMeshVoxelPruneIsolatedIslands
+                        ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
+                    + " includeAssets=" + NavMeshVoxelIncludeAssets
+                    + " includeDynamic=" + NavMeshVoxelIncludeDynamic
+                    + " includeFlora=" + NavMeshVoxelIncludeFlora);
+                sb.AppendLine("grid: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
+                    + "m stride=" + NavMeshSampleStride + " fallback=" + grid.UsedPointFallback
+                    + " heights=" + grid.Heights.Length);
+                sb.AppendLine("assets: entities=" + records.Count + " included=" + assets.EntitiesIncluded
+                    + " tris=" + assets.TriangleCount + " cappedShapes=" + assets.ShapesCapped
+                    + " scanMs=" + assets.ScanMs);
+                sb.AppendLine("excluded: [flora=" + assets.ExFlora + " barrier=" + assets.ExBarrier
+                    + " terrain=" + assets.ExTerrain + " ladder=" + assets.ExLadder
+                    + " dynamic=" + assets.ExDynamic + " noShape=" + assets.ExNoShape
+                    + " empty=" + assets.ExEmpty + " exceptions=" + assets.ExExceptions
+                    + " unsolid=" + assets.ExUnsolid + "]"
+                    + " entitiesSeen=" + assets.Count + " physics=" + assets.Physics);
+                sb.AppendLine("largest:");
+                var order = new System.Collections.Generic.List<int>();
+                for (int i = 0; i < assets.LargestTris.Count; i++) order.Add(i);
+                order.Sort(delegate (int a, int b) { return assets.LargestTris[b].CompareTo(assets.LargestTris[a]); });
+                for (int i = 0; i < order.Count; i++)
+                    sb.AppendLine("  '" + assets.LargestNames[order[i]] + "'="
+                        + assets.LargestTris[order[i]].ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("assert-points:");
+                for (int i = 0; i < points.Count; i++)
+                    sb.AppendLine("  " + points[i]);
+                string txtPath = System.IO.Path.Combine(folder, prefabName + "_snapshot.txt");
+                SceneSnapshot.WriteText(txtPath, sb.ToString());
+
+                watch.Stop();
+                log("snapshot: terrain=" + terrainPath + " (" + td.Width + "x" + td.Height
+                    + " spacing=" + F(grid.Spacing) + "m stride=" + td.Stride + " heights=" + td.Heights.Length + ")");
+                log("snapshot: assets=" + assetsPath + " (entities=" + records.Count
+                    + " tris=" + assets.TriangleCount + " cappedShapes=" + assets.ShapesCapped + ")");
+                log("snapshot: txt=" + txtPath + " (largest=" + order.Count
+                    + " assertPoints=" + points.Count + ")");
+                log("snapshot: wrote 3 files in " + watch.ElapsedMilliseconds + "ms"
+                    + " terrainMs=" + terrainWatch.ElapsedMilliseconds
+                    + " assetsMs=" + assetsWatch.ElapsedMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                try { NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message)); }
+                catch (Exception) { }
             }
         }
 
