@@ -7,23 +7,28 @@ namespace BetterBannerlordNavmeshing
     // Stepped / ladder prop ramp synthesis (PURE: no TaleWorlds types)
     // ==================================================================
     // Thin stepped collision props are the one class of geometry the voxel core cannot represent
-    // faithfully. A wooden flight's boards or a ladder's rungs are thinner than a voxel in places, so
-    // the rasterizer merges a whole flight into a coarse surface whose walkable top sits well above
-    // the authored treads (measured on Birtu: the mesh rode 0.9-1.9 m above the treads of every
-    // european_castle_ladder flight), and where no span survives the erosion / region-minimum / ledge
-    // filters the flight carries no navmesh at all. The player sees a bare flight and the agent cannot
-    // cross it.
+    // faithfully. A wooden flight's boards or a ladder's rungs are thinner than a voxel in places, so the
+    // rasterizer loses their spans (erosion plus the region minimum eat narrow treads) and a whole flight
+    // can end up with no navmesh at all - the player sees a bare flight and the agent cannot cross it.
     //
-    // The fix is to give such a prop one honest walkable surface: a synthesized ramp from the flight's
-    // bottom anchor to its top anchor, with a short apron past each end so the ramp merges with the
-    // floor below and the landing above. The ramp is emitted as ordinary triangles into the same
-    // collision soup, so winding normalisation, rasterisation, stitching and the detail mesh all treat
-    // it like any other surface. One property is special: ramp triangles are FORCED walkable (area
-    // RC_WALKABLE_AREA) even when their slope exceeds MaxSlopeDegrees, because a stair or a ladder is
-    // meant to be traversed.
+    // The fix is one continuous walkable surface that RIDES the flight's own tread-top envelope: the run
+    // is sampled along the flight's direction, each station's height is the highest top surface there, and
+    // a chain of quads follows those stations (cut so the chord never deviates from the sampled envelope
+    // by more than the merge reach). Because the ramp sits ON the treads instead of hovering above them, a
+    // ramp span and the tread span under it merge into ONE span: the treads keep their navmesh, the ramp
+    // adds a surface exactly where the collision is thin or missing, and there is no floating plane for
+    // FilterWalkableLowHeightSpans to turn into a ceiling. A horizontal apron at each end reaches past the
+    // flight's own footprint so it overlaps the floor below and the landing above (a shared span is the
+    // connection). A stretch of air wider than MaxBridgeRunMeters is never bridged, so a landing platform
+    // that merely carries HasSteps does not get a magic ramp across its void.
     //
-    // Pure data in / data out on purpose: the editor collector and the offline harness/snapshot path
-    // both call it, so a recorded snapshot validates the shipped behaviour without re-dumping.
+    // Ramp triangles are emitted as ordinary geometry into the same collision soup, so winding
+    // normalisation, rasterisation, stitching and the detail mesh all treat them like any other surface -
+    // with one special property: they are FORCED walkable (area RC_WALKABLE_AREA) even when their slope
+    // exceeds MaxSlopeDegrees, because a stair or a ladder is meant to be traversed.
+    //
+    // Pure data in / data out on purpose: the editor collector and the offline harness/snapshot path both
+    // call it, so a recorded snapshot validates the shipped behaviour without re-dumping.
     public static class SteppedPropRamps
     {
         // Mirrors TaleWorlds.Engine.BodyFlags (kept as ints so this file stays engine-free).
@@ -31,34 +36,38 @@ namespace BetterBannerlordNavmeshing
         public const int FlagHasSteps = 0x00000800;
 
         // ---- tunables (documented in the README under "Stairs & ladders") --------------------------
-        // Height layer used to find a flight's two ends and to split tall flights into chunks.
+        // Height band used only to estimate the flight's direction (bottom / top band envelope centres).
         public const float LayerHeightMeters = 0.5f;
+        // Top-surface heights within this distance of a station's highest top count as its envelope.
+        public const float EnvelopeTolerance = 0.12f;
+        // Spacing of the run stations the envelope is sampled at.
+        public const float StationStepMeters = 0.25f;
+        private const int MaxStations = 1024;
         // A prop whose walkable height span is below this is not a flight: no ramp.
         public const float MinRiseMeters = 0.4f;
         // Above this implied slope the prop is a wall or a truly vertical ladder: no ramp.
         public const float MaxSlopeDegrees = 75f;
-        // The floor is the width a ramp needs to survive Recast's ledge filter (which trims a span
-        // next to a drop) plus erosion: walkableClimb + 2 x agent radius ~ 1.1 m, hence 1.2 m. A narrow
-        // ramp measures 0% covered on Birtu, purely because nothing of it survives.
-        // Ramp width = WidthFactor x the narrower end footprint, clamped to [MinWidth,MaxWidth].
+        // Ramp width = WidthFactor x the narrower end footprint, clamped. 1.2 m is the width a ramp needs
+        // to survive Recast's ledge filter (walkableClimb trimmed per side) plus erosion.
         public const float MinWidthMeters = 1.2f;
-        public const float MaxWidthMeters = 1.2f;
+        public const float MaxWidthMeters = 2.0f;
         public const float WidthFactor = 0.6f;
-        // Horizontal overhang past each anchor: the ramp's ends reach the floor / landing levels a
-        // little past the anchors instead of stopping on the first and last tread.
-        public const float ApronMeters = 0.4f;
-        // A tall flight (a tower stairwell, a long gatehouse stair) is split into chained sub-ramps that
-        // each obey the slope rule. Needing more chunks than this is reported as capped and skipped.
+        // Horizontal reach of an end apron PAST the flight's own footprint edge at that level, so the
+        // apron overlaps the floor/landing collision and shares a span with it (that is the connection).
+        public const float ApronMeters = 0.55f;
+        // Longest stretch of the run with no collision under the ramp that a chunk may bridge (a raster
+        // hole). Anything wider is left alone: that is air, not a flight section.
+        public const float MaxBridgeRunMeters = 1.5f;
+        // A chunk may span about this much rise (a single flight). The deviation rule below is the real
+        // shaper; this is only a safety bound on how far one quad may reach.
+        public const float MaxRisePerRampMeters = 4.0f;
+        // How far the chord may sit from the sampled envelope before the chunk is cut shorter. Must stay
+        // inside Recast's span merge reach (walkableClimb), or the ramp stops merging with the treads.
+        public const float MaxDeviationMeters = 0.40f;
+        // Chained sub-ramps per prop. A flight needing more is reported as capped and skipped.
         public const int MaxRampsPerProp = 4;
-        // Rise a single ramp may span. A ramp is a plane, so it only stays faithful to the collision
-        // Is one height layer (0.5 m) plus one more, so a chained ramp HUGS the flight: a longer
-        // chord would hover over the lower treads (making them a low ceiling that FilterWalkableLowHeightSpans deletes) and would leave navmesh nothing to stand on where the collision is thin. Measured on Birtu: 1 m chunks keep the mesh within 4 faces of the no-ramp build, 4 m chords changed it by thousands.
-        // plane (it would bridge over its own landings). Chaining and MaxRampsPerProp bound how far this
-        // may go; past that the prop is skipped rather than misrepresented.
-        public const float MaxRisePerRampMeters = 1.0f;
-        // Horizontal run a single ramp may span. A flight that needs more than this for a <= 4 m rise is
-        // a walkway or a curved ramp the base geometry already describes, and a prop whose collision
-        // carries detached far-away triangles would otherwise produce an absurd bridge across the map.
+        // Horizontal run a single ramp may span (also rejects walkways the base geometry already
+        // describes, and props whose collision carries detached far-away triangles).
         public const float MaxRunPerRampMeters = 12.0f;
         // Name suffix for the snapshot record that carries a prop's synthesized ramp triangles. The
         // harness uses it to tell synthesized geometry from real collision, and to avoid synthesizing
@@ -81,13 +90,14 @@ namespace BetterBannerlordNavmeshing
         {
             public readonly List<float> VertsXyz = new List<float>();
             public readonly List<int> Tris = new List<int>();
-            public int Ramps;          // ramp quads emitted
+            public int Ramps;          // ramp quads emitted (the sloped part; aprons are extra quads)
             public int Stairs;         // HasSteps props that produced at least one ramp
             public int Ladders;        // Ladder props that produced at least one ramp
-            public int SkippedFlat;    // rise < MinRiseMeters
-            public int SkippedSteep;   // implied slope > MaxSlopeDegrees at every chunk count
-            public int SkippedLong;    // implied run > MaxRunPerRampMeters
-            public int Capped;         // best chunk count hit MaxRampsPerProp
+            public int SkippedFlat;    // rise < MinRiseMeters (or nothing walkable to follow)
+            public int SkippedSteep;   // no chunk could obey the slope rule
+            public int SkippedLong;    // no chunk could obey the run rule
+            public int Capped;         // the flight needed more than MaxRampsPerProp chunks
+            public float SlopeCapDegrees;   // the steepest ramp the Recast build can keep walkable
             public readonly List<RampInfo> Infos = new List<RampInfo>();
         }
 
@@ -105,48 +115,75 @@ namespace BetterBannerlordNavmeshing
 
         public static string Describe()
         {
-            return "layer=" + LayerHeightMeters + "m minRise=" + MinRiseMeters + "m maxSlope="
-                + MaxSlopeDegrees + "deg width=" + MinWidthMeters + ".." + MaxWidthMeters + "m x"
-                + WidthFactor + " apron=" + ApronMeters + "m maxRamps=" + MaxRampsPerProp
-                + " maxRisePerRamp=" + MaxRisePerRampMeters + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m";
+            return "band=" + LayerHeightMeters + "m envTol=" + EnvelopeTolerance + "m station="
+                + StationStepMeters + "m minRise=" + MinRiseMeters + "m maxSlope=" + MaxSlopeDegrees
+                + "deg width=" + MinWidthMeters + ".." + MaxWidthMeters + "m x" + WidthFactor + " apron="
+                + ApronMeters + "m maxBridge=" + MaxBridgeRunMeters + "m maxRamps=" + MaxRampsPerProp
+                + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m (navigable cap applied per build)";
         }
 
         // Deterministic: no dictionary iteration order reaches the output.
-        public static Result Synthesize(IReadOnlyList<Prop> props)
+        // cellSize/climb/ledgeFilter describe the Recast build the ramp will be rasterized by: they set
+        // the steepest surface that can SURVIVE the ledge filter (see NavigableSlopeDegrees).
+        public static Result Synthesize(IReadOnlyList<Prop> props, float cellSizeMeters = 0.25f,
+            float climbMeters = 0.6f, bool ledgeFilter = true)
         {
             var r = new Result();
             if (props == null) return r;
-            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r);
+            float slopeCap = Math.Min(MaxSlopeDegrees,
+                NavigableSlopeDegrees(cellSizeMeters, climbMeters, ledgeFilter));
+            r.SlopeCapDegrees = slopeCap;
+            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r, slopeCap);
             return r;
         }
 
-        private static void AppendProp(Prop p, Result r)
+        // The steepest ramp that is worth synthesizing. Recast's ledge filter would delete a steep
+        // surface - but the builder exempts FORCED (ramp) spans from that trim (see BuildTile's marker
+        // pass), so a ramp only has to obey the per-cell climb rule, tan(slope) <= climb/cs (67.4 deg at
+        // cs 0.25 / climb 0.6). Ordinary geometry is untouched by that exemption and keeps the ledge cap
+        // atan(climb / (2*cs)) = 50.19 deg.
+        public static float NavigableSlopeDegrees(float cellSizeMeters, float climbMeters, bool ledgeFilter)
+        {
+            if (cellSizeMeters <= 1e-4f || climbMeters <= 1e-4f) return MaxSlopeDegrees;
+            float t = climbMeters / cellSizeMeters;
+            return (float)(Math.Atan(t) * 180.0 / Math.PI);
+        }
+
+        private static void AppendProp(Prop p, Result r, float slopeCapDegrees)
         {
             if (p == null || p.VertsXyz == null || p.Tris == null) return;
             if (!IsSteppedOrLadder(p.Flags)) return;
             int triCount = p.Tris.Length / 3;
             if (triCount <= 0) return;
+            int vertCount = p.VertsXyz.Length / 3;
 
-            // -------- per-triangle centroids (all the anchors need) and the prop's height span
+            // -------- pass 1: compact per-triangle data (centroid XZ, centroid Z, top surface height)
             var cx = new float[triCount];
-            var cy = new float[triCount];   // engine Y (horizontal)
-            var cz = new float[triCount];   // engine Z (up)
+            var cy = new float[triCount];
+            var cz = new float[triCount];
+            var topZ = new float[triCount];
+            var compactOf = new int[triCount];
             int used = 0;
             float zMin = float.MaxValue, zMax = float.MinValue;
-            int vertCount = p.VertsXyz.Length / 3;
             for (int t = 0; t < triCount; t++)
             {
+                compactOf[t] = -1;
                 int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
                 if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
                     continue;
                 float x = (p.VertsXyz[i0 * 3 + 0] + p.VertsXyz[i1 * 3 + 0] + p.VertsXyz[i2 * 3 + 0]) / 3f;
                 float y = (p.VertsXyz[i0 * 3 + 1] + p.VertsXyz[i1 * 3 + 1] + p.VertsXyz[i2 * 3 + 1]) / 3f;
                 float z = (p.VertsXyz[i0 * 3 + 2] + p.VertsXyz[i1 * 3 + 2] + p.VertsXyz[i2 * 3 + 2]) / 3f;
+                float za = p.VertsXyz[i0 * 3 + 2], zb = p.VertsXyz[i1 * 3 + 2], zc = p.VertsXyz[i2 * 3 + 2];
+                float tz = Math.Max(za, Math.Max(zb, zc));
+                float bz = Math.Min(za, Math.Min(zb, zc));
                 cx[used] = x;
                 cy[used] = y;
                 cz[used] = z;
-                if (z < zMin) zMin = z;
-                if (z > zMax) zMax = z;
+                topZ[used] = tz;
+                compactOf[t] = used;
+                if (bz < zMin) zMin = bz;
+                if (tz > zMax) zMax = tz;
                 used++;
             }
             if (used == 0) return;
@@ -156,166 +193,311 @@ namespace BetterBannerlordNavmeshing
                 return;
             }
 
-            // -------- height layers; each layer keeps its triangle indices so the end footprints can be
-            // measured exactly (perpendicular spread) once the ramp direction is known.
-            int layerCount = (int)Math.Floor((zMax - zMin) / LayerHeightMeters) + 1;
-            if (layerCount < 2) layerCount = 2;
-            if (layerCount > 8192) layerCount = 8192;
-            var layers = new List<int>[layerCount];
-            var lx = new double[layerCount];
-            var ly = new double[layerCount];
-            var lz = new double[layerCount];
+            // -------- the flight's horizontal direction (bottom band envelope centre -> top band's)
+            float dirX, dirY;
+            if (!FlightDirection(cx, cy, cz, topZ, used, zMin, zMax, out dirX, out dirY))
+            {
+                r.SkippedFlat++;
+                return;
+            }
+            float perpDirX = -dirY, perpDirY = dirX;
+
+            // -------- pass 2: per-triangle run projection window + perpendicular coordinate
+            var winLo = new float[used];
+            var winHi = new float[used];
+            var perp = new float[used];
+            float runMin = float.MaxValue, runMax = float.MinValue;
+            for (int k = 0; k < used; k++) { winLo[k] = float.MaxValue; winHi[k] = float.MinValue; }
+            for (int t = 0; t < triCount; t++)
+            {
+                int k = compactOf[t];
+                if (k < 0) continue;
+                int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
+                float a = p.VertsXyz[i0 * 3 + 0] * dirX + p.VertsXyz[i0 * 3 + 1] * dirY;
+                float b = p.VertsXyz[i1 * 3 + 0] * dirX + p.VertsXyz[i1 * 3 + 1] * dirY;
+                float c = p.VertsXyz[i2 * 3 + 0] * dirX + p.VertsXyz[i2 * 3 + 1] * dirY;
+                winLo[k] = Math.Min(a, Math.Min(b, c));
+                winHi[k] = Math.Max(a, Math.Max(b, c));
+                perp[k] = cx[k] * perpDirX + cy[k] * perpDirY;
+                if (winLo[k] < runMin) runMin = winLo[k];
+                if (winHi[k] > runMax) runMax = winHi[k];
+            }
+            float runSpan = runMax - runMin;
+            if (runSpan < 1e-3f)
+            {
+                r.SkippedSteep++;   // perfectly vertical (a true wall): nothing to walk on
+                return;
+            }
+
+            // -------- run stations: is there collision at this station, and what is its top envelope?
+            float step = StationStepMeters;
+            int stationCount = (int)Math.Floor(runSpan / step) + 1;
+            if (stationCount < 2)
+            {
+                r.SkippedFlat++;
+                return;
+            }
+            if (stationCount > MaxStations)
+            {
+                stationCount = MaxStations;
+                step = runSpan / (stationCount - 1);
+            }
+            var stOk = new bool[stationCount];
+            var stZ = new float[stationCount];
+            for (int i = 0; i < stationCount; i++) stZ[i] = float.MinValue;
             for (int k = 0; k < used; k++)
             {
-                int li = (int)((cz[k] - zMin) / LayerHeightMeters);
-                if (li < 0) li = 0;
-                if (li >= layerCount) li = layerCount - 1;
-                if (layers[li] == null) layers[li] = new List<int>();
-                layers[li].Add(k);
-                lx[li] += cx[k];
-                ly[li] += cy[k];
-                lz[li] += cz[k];
+                if (winLo[k] > winHi[k]) continue;
+                int a = StationIndex(winLo[k], runMin, step, stationCount);
+                int b = StationIndex(winHi[k], runMin, step, stationCount);
+                for (int i = a; i <= b; i++)
+                {
+                    stOk[i] = true;
+                    if (topZ[k] > stZ[i]) stZ[i] = topZ[k];
+                }
             }
 
-            var occ = new List<int>();
-            for (int k = 0; k < layerCount; k++)
-                if (layers[k] != null) occ.Add(k);
-            if (occ.Count < 2)
+            // -------- envelope centre (XZ) per station, so the ramp follows the flight's own centre line
+            var stSX = new double[stationCount];
+            var stSY = new double[stationCount];
+            var stN = new int[stationCount];
+            for (int k = 0; k < used; k++)
+            {
+                if (winLo[k] > winHi[k]) continue;
+                int a = StationIndex(winLo[k], runMin, step, stationCount);
+                int b = StationIndex(winHi[k], runMin, step, stationCount);
+                for (int i = a; i <= b; i++)
+                {
+                    if (!stOk[i]) continue;
+                    if (topZ[k] < stZ[i] - EnvelopeTolerance) continue;
+                    stSX[i] += cx[k];
+                    stSY[i] += cy[k];
+                    stN[i]++;
+                }
+            }
+            float cX = 0, cY = 0;
+            for (int k = 0; k < used; k++) { cX += cx[k]; cY += cy[k]; }
+            cX /= used;
+            cY /= used;
+            float cProj = cX * dirX + cY * dirY;
+            var stX = new float[stationCount];
+            var stY = new float[stationCount];
+            for (int i = 0; i < stationCount; i++)
+            {
+                if (stN[i] > 0)
+                {
+                    stX[i] = (float)(stSX[i] / stN[i]);
+                    stY[i] = (float)(stSY[i] / stN[i]);
+                }
+                else
+                {
+                    // Fall back to the run line through the prop's centroid (keeps the chain walkable).
+                    float proj = runMin + i * step;
+                    stX[i] = cX + dirX * (proj - cProj);
+                    stY[i] = cY + dirY * (proj - cProj);
+                }
+            }
+
+            // -------- supported stations, bottom to top
+            var sup = new List<int>();
+            for (int i = 0; i < stationCount; i++)
+                if (stOk[i]) sup.Add(i);
+            if (sup.Count < 2)
+            {
+                r.SkippedFlat++;
+                return;
+            }
+            if (stZ[sup[sup.Count - 1]] - stZ[sup[0]] < MinRiseMeters)
             {
                 r.SkippedFlat++;
                 return;
             }
 
-            float zBot = AnchorZ(lz, layers, occ[0]);
-            float zTop = AnchorZ(lz, layers, occ[occ.Count - 1]);
-            if (zTop - zBot < MinRiseMeters)
+            // -------- greedy chunking over the supported stations: cut when the chord would rise too
+            // much, would deviate from the sampled envelope by more than the merge reach, or when the
+            // next station is separated by an air span too wide to bridge.
+            var starts = new List<int>();
+            var ends = new List<int>();
+            int chunkStart = sup[0];
+            for (int j = 1; j < sup.Count; j++)
+            {
+                int prev = sup[j - 1];
+                int cur = sup[j];
+                float bridgeRun = (cur - prev) * step;
+                bool tooWide = bridgeRun > MaxBridgeRunMeters + 1e-3f;
+                bool cut = tooWide
+                    || stZ[cur] - stZ[chunkStart] > MaxRisePerRampMeters + 1e-3f
+                    || DeviationTooLarge(sup, chunkStart, cur, stZ, step);
+                if (!cut) continue;
+                if (prev > chunkStart)
+                {
+                    starts.Add(chunkStart);
+                    ends.Add(prev);
+                    chunkStart = prev;
+                }
+                else if (tooWide)
+                {
+                    // The air span starts right here: break the chain instead of spanning it.
+                    chunkStart = cur;
+                }
+            }
+            if (sup[sup.Count - 1] > chunkStart)
+            {
+                starts.Add(chunkStart);
+                ends.Add(sup[sup.Count - 1]);
+            }
+            if (starts.Count == 0)
             {
                 r.SkippedFlat++;
                 return;
             }
-
-            // -------- the fewest chained sub-ramps that each obey the slope rule
-            int chunks = 0;
-            for (int n = 1; n <= MaxRampsPerProp; n++)
+            if (starts.Count > MaxRampsPerProp)
             {
-                if (AllChunksWithinSlope(occ, lx, ly, lz, layers, n)) { chunks = n; break; }
-            }
-            if (chunks == 0)
-            {
-                if (WholeRun(lx, ly, layers, occ) > MaxRunPerRampMeters + 1e-3f) r.SkippedLong++;
-                else r.SkippedSteep++;
+                r.Capped++;
                 return;
             }
-            if (chunks == MaxRampsPerProp) r.Capped++;
+
+            float botReach = starts[0] * step + ApronMeters;
+            float topReach = (stationCount - 1 - ends[ends.Count - 1]) * step + ApronMeters;
 
             var keys = new List<string>();
             int emitted = 0;
-            int prev = occ[0];
-            for (int c = 1; c <= chunks; c++)
+            int steep0 = r.SkippedSteep, long0 = r.SkippedLong;
+            for (int c = 0; c < starts.Count; c++)
             {
-                int idx = (c == chunks)
-                    ? occ[occ.Count - 1]
-                    : occ[(int)Math.Round((double)c * (occ.Count - 1) / chunks)];
-                if (idx <= prev) { prev = idx; continue; }
-                if (AppendRamp(r, p.Name, cx, cy, cz, lx, ly, lz, layers, prev, idx, keys)) emitted++;
-                prev = idx;
+                bool first = c == 0;
+                bool last = c == starts.Count - 1;
+                if (EmitChunk(r, p.Name, perp, winLo, winHi, stX, stY, stZ, starts[c], ends[c],
+                    runMin, step, zMin, zMax, botReach, topReach, first, last, keys, slopeCapDegrees))
+                    emitted++;
             }
-
             if (emitted > 0)
             {
                 if ((p.Flags & FlagHasSteps) != 0) r.Stairs++;
                 if ((p.Flags & FlagLadder) != 0) r.Ladders++;
             }
-        }
-
-        private static float AnchorX(double[] lx, List<int>[] layers, int k)
-        {
-            return (float)(lx[k] / layers[k].Count);
-        }
-
-        private static float AnchorY(double[] ly, List<int>[] layers, int k)
-        {
-            return (float)(ly[k] / layers[k].Count);
-        }
-
-        private static float AnchorZ(double[] lz, List<int>[] layers, int k)
-        {
-            return (float)(lz[k] / layers[k].Count);
-        }
-
-        // Horizontal (engine X/Y) distance between two layer anchors.
-        private static float RunBetween(double[] lx, double[] ly, List<int>[] layers, int ka, int kb)
-        {
-            float dx = AnchorX(lx, layers, ka) - AnchorX(lx, layers, kb);
-            float dy = AnchorY(ly, layers, ka) - AnchorY(ly, layers, kb);
-            return (float)Math.Sqrt((double)dx * dx + (double)dy * dy);
-        }
-
-        // Horizontal distance between the flight's two extreme layer anchors.
-        private static float WholeRun(double[] lx, double[] ly, List<int>[] layers, List<int> occ)
-        {
-            return RunBetween(lx, ly, layers, occ[0], occ[occ.Count - 1]);
-        }
-
-        // Every chunk of an n-way split (by occupied-layer index, i.e. evenly across the flight's
-        // layers) must have a real rise and stay within the slope rule.
-        private static bool AllChunksWithinSlope(List<int> occ, double[] lx, double[] ly, double[] lz,
-            List<int>[] layers, int n)
-        {
-            int prev = occ[0];
-            for (int c = 1; c <= n; c++)
+            else if (r.SkippedSteep == steep0 && r.SkippedLong == long0)
             {
-                int idx = (c == n)
-                    ? occ[occ.Count - 1]
-                    : occ[(int)Math.Round((double)c * (occ.Count - 1) / n)];
-                if (idx <= prev) { prev = idx; continue; }
-                float rise = AnchorZ(lz, layers, idx) - AnchorZ(lz, layers, prev);
-                float run = RunBetween(lx, ly, layers, prev, idx);
-                if (rise < MinChunkRiseMeters || run < 1e-3f) return false;
-                if (rise > MaxRisePerRampMeters + 1e-3f) return false;
-                if (run > MaxRunPerRampMeters + 1e-3f) return false;
-                if (Math.Atan2(rise, run) * 180.0 / Math.PI > MaxSlopeDegrees) return false;
-                prev = idx;
+                // Nothing walkable came out and no chunk even reached the slope/run guards: the flight is
+                // steeper than any ramp may be, or has no usable rise. Both are reported as steep/flat by
+                // whichever guard above already fired; this is the belt-and-braces case.
+                r.SkippedSteep++;
             }
+        }
+
+        // The flight's horizontal direction, from the band envelope centres of its lowest and highest
+        // occupied 0.5 m bands. False when the prop has no usable rise.
+        private static bool FlightDirection(float[] cx, float[] cy, float[] cz, float[] topZ, int used,
+            float zMin, float zMax, out float dirX, out float dirY)
+        {
+            dirX = 0f;
+            dirY = 0f;
+            int bandCount = (int)Math.Floor((zMax - zMin) / LayerHeightMeters) + 1;
+            if (bandCount < 2) bandCount = 2;
+            if (bandCount > 8192) bandCount = 8192;
+            var bandZ = new float[bandCount];
+            for (int b = 0; b < bandCount; b++) bandZ[b] = float.MinValue;
+            for (int k = 0; k < used; k++)
+            {
+                int b = BandOf(cz[k], zMin, bandCount);
+                if (topZ[k] > bandZ[b]) bandZ[b] = topZ[k];
+            }
+            int bandLo = -1, bandHi = -1;
+            for (int b = 0; b < bandCount; b++)
+            {
+                if (bandZ[b] == float.MinValue) continue;
+                if (bandLo < 0) bandLo = b;
+                bandHi = b;
+            }
+            if (bandLo < 0 || bandHi <= bandLo) return false;
+            if (bandZ[bandHi] - bandZ[bandLo] < MinRiseMeters) return false;
+
+            float lx = 0, ly = 0, hx = 0, hy = 0;
+            int ln = 0, hn = 0;
+            for (int k = 0; k < used; k++)
+            {
+                int b = BandOf(cz[k], zMin, bandCount);
+                if (b == bandLo && topZ[k] >= bandZ[bandLo] - EnvelopeTolerance) { lx += cx[k]; ly += cy[k]; ln++; }
+                if (b == bandHi && topZ[k] >= bandZ[bandHi] - EnvelopeTolerance) { hx += cx[k]; hy += cy[k]; hn++; }
+            }
+            if (ln == 0 || hn == 0) return false;
+            float dX = hx / hn - lx / ln;
+            float dY = hy / hn - ly / ln;
+            float len = (float)Math.Sqrt((double)dX * dX + (double)dY * dY);
+            if (len < 1e-3f) return false;
+            dirX = dX / len;
+            dirY = dY / len;
             return true;
         }
 
-        // One planar ramp quad (2 triangles) from layer Kb up to layer Kt, with the per-prop dedupe.
-        // Engine axes: X and Y are horizontal, Z is up.
-        private static bool AppendRamp(Result r, string propName, float[] cx, float[] cy, float[] cz,
-            double[] lx, double[] ly, double[] lz, List<int>[] layers, int ka, int kb, List<string> keys)
+        private static int BandOf(float z, float zMin, int bandCount)
         {
-            float bX = AnchorX(lx, layers, ka), bY = AnchorY(ly, layers, ka), bZ = AnchorZ(lz, layers, ka);
-            float tX = AnchorX(lx, layers, kb), tY = AnchorY(ly, layers, kb), tZ = AnchorZ(lz, layers, kb);
+            int b = (int)((z - zMin) / LayerHeightMeters);
+            if (b < 0) b = 0;
+            if (b >= bandCount) b = bandCount - 1;
+            return b;
+        }
+
+        private static int StationIndex(float proj, float runMin, float step, int stationCount)
+        {
+            int i = step > 0f ? (int)((proj - runMin) / step) : 0;
+            if (i < 0) i = 0;
+            if (i >= stationCount) i = stationCount - 1;
+            return i;
+        }
+
+        // The chord from station a to station b must stay within MaxDeviationMeters of every sampled
+        // envelope height in between, or the ramp would hover over (or cut into) the treads.
+        private static bool DeviationTooLarge(List<int> sup, int a, int b, float[] stZ, float step)
+        {
+            float za = stZ[a], zb = stZ[b];
+            float span = (b - a) * step;
+            if (span < 1e-3f) return false;
+            for (int j = 0; j < sup.Count; j++)
+            {
+                int k = sup[j];
+                if (k <= a || k >= b) continue;
+                float t = ((k - a) * step) / span;
+                float chord = za + (zb - za) * t;
+                if (Math.Abs(stZ[k] - chord) > MaxDeviationMeters) return true;
+            }
+            return false;
+        }
+
+        // Emits one chunk (plus an end apron on the first / last chunk). Returns true when the sloped
+        // ramp quad itself was emitted.
+        private static bool EmitChunk(Result r, string propName, float[] perp, float[] winLo, float[] winHi,
+            float[] stX, float[] stY, float[] stZ, int sb, int eb, float runMin, float step,
+            float floorZ, float ceilZ, float botReach, float topReach, bool first, bool last,
+            List<string> keys, float slopeCapDegrees)
+        {
+            float bX = stX[sb], bY = stY[sb], bZ = stZ[sb];
+            float tX = stX[eb], tY = stY[eb], tZ = stZ[eb];
             float rise = tZ - bZ;
             float dX = tX - bX, dY = tY - bY;
             float run = (float)Math.Sqrt((double)dX * dX + (double)dY * dY);
-            if (rise < MinChunkRiseMeters || run < 1e-3f) return false;
-            if (run > MaxRunPerRampMeters + 1e-3f) return false;
-            if (Math.Atan2(rise, run) * 180.0 / Math.PI > MaxSlopeDegrees) return false;
+            if (rise < MinChunkRiseMeters || run < 1e-3f)
+                return false;                       // a degenerate chunk (a single station): nothing to emit
+            if (run > MaxRunPerRampMeters + 1e-3f)
+            {
+                r.SkippedLong++;
+                return false;
+            }
+            if (Math.Atan2(rise, run) * 180.0 / Math.PI > slopeCapDegrees)
+            {
+                r.SkippedSteep++;
+                return false;
+            }
 
-            float dirX = dX / run, dirY = dY / run;
-            float perpX = -dirY, perpY = dirX;
-
-            // Ramp width = WidthFactor x the NARROWER end footprint (perpendicular extent of that
-            // layer's triangle centroids), clamped. A single-triangle end has no spread of its own, so
-            // the other end (then the clamped floor) is used.
-            float wB = Spread(cx, cy, layers[ka], bX, bY, perpX, perpY);
-            float wT = Spread(cx, cy, layers[kb], tX, tY, perpX, perpY);
+            float perpX = -dY / run, perpY = dX / run;
+            float wB = EndSpread(perp, winLo, winHi, runMin + sb * step);
+            float wT = EndSpread(perp, winLo, winHi, runMin + eb * step);
             float w;
             if (wB > 0.02f && wT > 0.02f) w = Math.Min(wB, wT);
             else if (wB > 0.02f) w = wB;
             else if (wT > 0.02f) w = wT;
             else w = MinWidthMeters / WidthFactor;
             float width = Clamp(WidthFactor * w, MinWidthMeters, MaxWidthMeters);
-
-            // Three quads: a flat apron at the bottom level, the sloped ramp exactly through the two
-            // anchors, and a flat apron at the top level. The aprons are what let the ramp meet the
-            // floor and the landing; keeping them FLAT (instead of extending the sloped plane) keeps the
-            // ramp itself on the flight's chord, so it merges with the treads instead of hovering over
-            // the lower ones and acting as a ceiling (which would delete their navmesh).
-            float sX = bX - dirX * ApronMeters, sY = bY - dirY * ApronMeters;
-            float eX = tX + dirX * ApronMeters, eY = tY + dirY * ApronMeters;
             float hw = width * 0.5f;
             float hx = perpX * hw, hy = perpY * hw;
 
@@ -325,9 +507,21 @@ namespace BetterBannerlordNavmeshing
                 if (keys[i] == key) return false;
             keys.Add(key);
 
-            AppendQuad(r, sX, sY, bZ, bX, bY, bZ, hx, hy);    // bottom apron (flat)
-            AppendQuad(r, bX, bY, bZ, tX, tY, tZ, hx, hy);    // the ramp itself
-            AppendQuad(r, tX, tY, tZ, eX, eY, tZ, hx, hy);    // top apron (flat)
+            float rampDX = dX / run, rampDY = dY / run;
+            if (first && botReach > 1e-3f)
+            {
+                // Apron at the flight's own bottom level, reaching ApronMeters past the flight's
+                // footprint edge. Landing at zMin (not at the first station's envelope) is what makes the
+                // apron share a span with the FLOOR: the ramp meets solid ground where the agent stands.
+                AppendQuad(r, bX - rampDX * botReach, bY - rampDY * botReach, floorZ, bX, bY, bZ, hx, hy);
+            }
+            AppendQuad(r, bX, bY, bZ, tX, tY, tZ, hx, hy);
+            if (last && topReach > 1e-3f)
+            {
+                // Likewise the top apron sits on the landing level (the flight's own top).
+                AppendQuad(r, tX, tY, tZ, tX + rampDX * topReach, tY + rampDY * topReach, ceilZ, hx, hy);
+            }
+
             var info = new RampInfo();
             info.Prop = propName;
             info.BottomY = bZ;
@@ -338,6 +532,21 @@ namespace BetterBannerlordNavmeshing
             r.Infos.Add(info);
             r.Ramps++;
             return true;
+        }
+
+        // Perpendicular extent of the triangles that cover one run position.
+        private static float EndSpread(float[] perp, float[] winLo, float[] winHi, float proj)
+        {
+            float lo = float.MaxValue, hi = float.MinValue;
+            for (int k = 0; k < winLo.Length; k++)
+            {
+                if (winLo[k] > proj || winHi[k] < proj) continue;
+                float p = perp[k];
+                if (p < lo) lo = p;
+                if (p > hi) hi = p;
+            }
+            if (lo > hi) return 0f;
+            return hi - lo;
         }
 
         // One flat-or-sloped quad (2 triangles) between two centre-line points, of the given half-width
@@ -352,22 +561,6 @@ namespace BetterBannerlordNavmeshing
             r.VertsXyz.Add(x1 + hx); r.VertsXyz.Add(y1 + hy); r.VertsXyz.Add(z1);
             r.Tris.Add(b + 0); r.Tris.Add(b + 1); r.Tris.Add(b + 2);
             r.Tris.Add(b + 0); r.Tris.Add(b + 2); r.Tris.Add(b + 3);
-        }
-
-        // Perpendicular extent of one layer's triangle centroids about that layer's anchor.
-        private static float Spread(float[] cx, float[] cy, List<int> tris, float ax, float ay,
-            float perpX, float perpY)
-        {
-            if (tris == null || tris.Count < 2) return 0f;
-            float lo = float.MaxValue, hi = float.MinValue;
-            for (int i = 0; i < tris.Count; i++)
-            {
-                int t = tris[i];
-                float p = (cx[t] - ax) * perpX + (cy[t] - ay) * perpY;
-                if (p < lo) lo = p;
-                if (p > hi) hi = p;
-            }
-            return hi - lo;
         }
 
         private static float Clamp(float v, float lo, float hi)

@@ -409,7 +409,8 @@ namespace BetterBannerlordNavmeshing
                 var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                 SceneCollisionGeometry.AssetGeometry assets = SceneCollisionGeometry.CollectDetailed(
                     scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, NavMeshVoxelAssetTrace,
-                    true, NavMeshVoxelPropRamps, log);
+                    true, NavMeshVoxelPropRamps, log, NavMeshVoxelCellSize,
+                    ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, NavMeshMaxSlopeDegrees), NavMeshVoxelLedgeFilter);
                 assetsWatch.Stop();
 
                 var records = new System.Collections.Generic.List<SceneSnapshot.EntityRecord>();
@@ -496,6 +497,15 @@ namespace BetterBannerlordNavmeshing
                 try { NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message)); }
                 catch (Exception) { }
             }
+        }
+
+        // The ramp synthesizer needs the agent climb the build will actually use (0 = auto), because
+        // Recast's ledge filter caps the steepest navigable surface at atan(climb / (2 * cellSize)).
+        private static float ResolvedRampClimb(float climbSetting, float cellSize, float maxSlopeDegrees)
+        {
+            if (climbSetting > 0f) return climbSetting;
+            return TiledNavMeshBuilder.ResolveAgentClimbMeters(cellSize,
+                new TiledNavMeshBuilder.TiledNavMeshSettings().CellHeightMeters, maxSlopeDegrees, 0.4f);
         }
 
         private void ExportFromEditor()
@@ -669,7 +679,8 @@ namespace BetterBannerlordNavmeshing
                     {
                         SceneCollisionGeometry.AssetTriangles assets =
                             SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
-                                voxelAssetTrace, voxelPropRamps, log);
+                                voxelAssetTrace, voxelPropRamps, log, voxelCellSizeMeters,
+                                ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
                         assetForceWalkable = assets.ForceWalkableTris;
@@ -841,7 +852,8 @@ namespace BetterBannerlordNavmeshing
                     var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                     SceneCollisionGeometry.AssetTriangles assets =
                         SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
-                            NavMeshVoxelAssetTrace, NavMeshVoxelPropRamps, log);
+                            NavMeshVoxelAssetTrace, NavMeshVoxelPropRamps, log, NavMeshVoxelCellSize,
+                            ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
                     assetTris = assets.Tris;

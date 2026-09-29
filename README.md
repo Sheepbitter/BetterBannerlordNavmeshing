@@ -91,7 +91,7 @@ the **next** tick, so the input call never blocks. It runs the same pipeline on 
 
 - `bool scene.HasTerrainHeightmap` - a scene has terrain.
 - `void scene.GetTerrainData(out Vec2i nodeDimension, out float nodeSize, out int layerCount, out int layerVersion)`
-  → extent `xMeters = nodeSize * nodeDimension.Item1`, `yMeters = nodeSize * nodeDimension.Item2`.
+  Ã¢â€ â€™ extent `xMeters = nodeSize * nodeDimension.Item1`, `yMeters = nodeSize * nodeDimension.Item2`.
 - `void scene.GetTerrainNodeData(int xIndex, int yIndex, out int vertexCountAlongAxis, out float quadLength, out float minHeight, out float maxHeight)`
   - one terrain node's per-axis vertex count, vertex spacing and height range.
 - `float[] scene.GetTerrainHeightData(int nodeXIndex, int nodeYIndex)` - that node's full vertex grid in one native call.
@@ -291,7 +291,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
-| `NavMeshVoxelPropRamps` | `false` | **Off by default; read *Stairs & ladders* before enabling.** Synthesize a walkable ramp for every prop whose body carries `HasSteps` or `Ladder` (Birtu: 84 + 2 entities), so thin wooden flights and leaning ladders stop being swallowed by voxelization. The ramp triangles are appended to the collision soup and marked walkable even when steeper than `NavMeshMaxSlopeDegrees`. On Birtu it keeps the mesh within 4 faces of the no-ramp build (islands unchanged), the ramps themselves come out 60-93% covered, and 4 of 6 wooden flight instances gain coverage - but 2 lose native coverage and the synthetic ladder cases in harness `Test 23` do not connect yet, which is why the default is off. |
+| `NavMeshVoxelPropRamps` | `false` | **Off by default; read *Stairs & ladders* before enabling.** Synthesize a walkable ramp that rides a stepped/ladder prop's own tread-top envelope (body flags `HasSteps`/`Ladder`; Birtu: 84 + 2 entities). Ramp (forced-walkable) spans are **exempt from Recast's ledge trim** - a per-tile marker pass restores exactly the ramp spans the ledge filter nulled (`v2: ramps: markedCells=<n> restored=<n>`) - so a 62 deg ladder is traversable while ordinary geometry keeps the 50.19 deg cap and terrain-only output stays byte-identical. Default stays off: on Birtu the wooden `wooden_platform_stairs_a` flights are still skipped and the two `stairs_bo` clusters lose coverage (45.7 -> 38.3 %, 39.1 -> 35.0 %); see the README section for the numbers. |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -299,8 +299,8 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
 Mesher cost (v1 path, measured on 3584x3584 m terrain at stride 1, coarsest 16, slope 65, Release, seed 12345): at
-`MaxErrorMeters = 0.25` ≈ 1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
-`2.0` ≈ 411 k faces / 35 MB / ~0.5 s; at `4.0` ≈ 121 k faces / 10 MB / ~0.3 s.
+`MaxErrorMeters = 0.25` Ã¢â€°Ë† 1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
+`2.0` Ã¢â€°Ë† 411 k faces / 35 MB / ~0.5 s; at `4.0` Ã¢â€°Ë† 121 k faces / 10 MB / ~0.3 s.
 
 ## Voxel core (experimental)
 
@@ -629,62 +629,63 @@ platform island is pruned with the default and kept when the cap is 0.
 ### Stairs & ladders (prop ramps) - `NavMeshVoxelPropRamps`, **off by default**
 
 Thin stepped collision is the one class of geometry the voxel core cannot represent faithfully. A wooden
-flight's boards or a ladder's rungs are thinner than a voxel in places, so the rasterizer merges a whole
-flight into a coarse surface whose walkable top sits well above the authored treads (measured on Birtu: the
-mesh rode 0.9-1.9 m above the treads of every `european_castle_ladder` flight), and where no span survives the
-erosion / region-minimum / ledge filters the flight carries no navmesh at all - the prop's own collision
-card should arguably be walkable, and an agent cannot cross it.
+flight's boards or a ladder's rungs are thinner than a voxel in places, so the rasterizer loses their spans
+(erosion eats treads shallower than the agent radius) - on Birtu every `european_castle_ladder` flight keeps
+only 30-60% of its own surface covered and the agent cannot cross it.
 
-`NavMeshVoxelPropRamps` gives such props one honest walkable surface. For every entity whose body flags include
-`HasSteps` (`0x800`) or `Ladder` (`0x40`) - Birtu has 84 of the former and 2 of the latter - the pure module
-`SteppedPropRamps.cs` builds a ramp from the flight's own triangles:
+`NavMeshVoxelPropRamps` gives such props a synthesized walkable surface. For every entity whose body flags
+include `HasSteps` (`0x800`) or `Ladder` (`0x40`) - Birtu has 84 of the former and 2 of the latter - the pure
+module `SteppedPropRamps.cs` builds it from the prop's own triangles:
 
-- the flight's ends come from its **height layers** (0.5 m): the bottom anchor is the mean centroid of the
-  lowest occupied layer, the top anchor the same for the highest;
-- the ramp is a chain of quads (**at most 1 m of rise each**, so it hugs the flight rather than bridging it with
-  one long chord) of width `clamp(0.6 x narrower end footprint, 1.2, 1.2) m`, with flat 0.4 m aprons at both
-  ends so it meets the floor below and the landing above;
-- a prop is skipped when its rise is < 0.4 m (`flat`), when the implied slope exceeds 75 deg or the run
-  exceeds 12 m (`steep` / `long` - a vertical ladder or a wall), or when it would need more than 4 chained
-  ramps (`capped` - a 16 m tower stairwell is not bridged by a straight ramp);
-- the ramp triangles are appended after every real triangle and **marked walkable regardless of slope**
-  (`area = RC_WALKABLE_AREA`), which is the whole point: a ladder or a stair is meant to be traversed. The
-  builder takes a per-triangle `forceWalkableTriangles` mask; with no ramps it is `null` and the build path is
-  byte-identical to before.
+- the flight's run is sampled along its direction (0.25 m stations) and each station's height is the **upper
+  envelope** of the collision there (the highest top surface), so the ramp RIDES the treads instead of
+  hovering above them; a ramp span and the tread span under it merge into one span, so the treads keep their
+  navmesh and there is no floating plane for `FilterWalkableLowHeightSpans` to turn into a ceiling;
+- the chain is cut into chunks that each keep the chord within 0.4 m of the sampled envelope (or cut shorter)
+  and may bridge at most a 1.5 m stretch of air (a raster hole); a landing platform that merely carries
+  `HasSteps` never gets a magic ramp across its void;
+- each end gets an apron that reaches 0.55 m past the flight's own footprint and lands on the flight's own
+  bottom / top level, so the ramp shares a span with the floor below and the landing above (that is the
+  connection);
+- the ramp triangles are appended after every real triangle and **forced walkable** (`area =
+  RC_WALKABLE_AREA`). The builder takes a per-triangle `forceWalkableTriangles` mask; with no ramps it is
+  `null` and the build path is byte-identical to before.
 
-Deterministic (no dictionary order reaches the output), pure (no TaleWorlds types), and shared by the collector
-and the offline harness/snapshot path, so a recorded snapshot validates the shipped behaviour without
-re-dumping. Ramp triangles are written to the scene snapshot as their own `'<entity>#ramp'` records, so tooling
-can tell them from real collision and a snapshot taken with ramps on is never double-ramped.
+**The ledge-trim exemption (this is what makes a steep ramp possible).** `forceWalkableTriangles`
+against `FilterLedgeSpans` alone does not work: the ledge filter runs *after* the area override and deletes
+any span whose walkable neighbours' floor spread exceeds `walkableClimb`, i.e. anything steeper than
+`atan(walkableClimb / (2 x cellSize))` = 50.19 deg at cs 0.25 / climb 0.6 - and it overwrites the area id it
+was given, so a ramp span cannot be recognised afterwards. The builder therefore, when a force-walkable mask
+is present, runs a **marker pass per tile** between the low-hanging-obstacle filter and the ledge filter:
+every heightfield cell a forced triangle covers in XZ is marked, and the spans in those cells that are
+walkable at that moment are remembered. After `FilterLedgeSpans` exactly those spans are restored
+(`v2: ramps: markedCells=<n> restored=<n> (ledge-trim exemption)`); `FilterWalkableLowHeightSpans` still runs
+*after* the restore, so clearance rules keep applying to ramp surfaces (a ramp may not become a low ceiling).
+The exemption is per **synthesized ramp triangle only**: ordinary geometry in the same tile, and every build
+without a mask, keeps the exact current 50.19 deg cap, and terrain-only output stays byte-identical
+(neutrality `MATCH`). With the trim lifted, the ramp's own cap is the per-cell climb rule
+`tan(slope) <= climb/cs` = 67.4 deg, so a 62 deg leaning ladder becomes synthesizable.
 
-**Measured on the recorded Birtu snapshot** (harness `--ramps on` vs `--ramps off`):
+**Measured on the recorded Birtu snapshot** (`--ramps on` vs `--ramps off`, shipped defaults):
 
 | | ramps off | ramps on |
 |---|---|---|
-| soup | 1 812 016 v / 665 317 t | 1 815 724 v / 666 553 t (+86 ramps) |
-| mesh | V=32 836 F=50 957 E=84 531 | V=32 835 F=50 953 E=84 526 |
+| ramps | - | 64 from 62 props (12 skipped flat, 0 steep, 10 capped) |
+| soup | 1 812 016 v / 665 317 t | 1 813 120 v / 665 685 t (+368 force-walkable tris) |
+| mesh | V=32 836 F=50 957 E=84 531 | V=32 673 F=50 792 E=84 202 |
 | islands | 5 | 5 |
-| prune | 899 islands / 13 524 faces | 899 islands / 13 579 faces |
-| levels (1 m bands) | - | face counts move by <= 6 per band, no new band |
+| exemption | - | `markedCells=9642 restored=2955` |
 
-So the setting is **mesh-safe**: the ramps replace or join existing spans and the build changes by a handful of
-faces. The `--coverage` table for the wooden flights (`wooden_platform_stairs_a`, 6 instances) is **mixed**:
-native coverage 53.8/55.9/58.9/59.1 -> 43.9/50.7/52.4/54.3 % on the four tower flights while the synthesized
-ramps themselves are 60-93% covered and the total (native + ramp) rises on 4 of 6; the two standalone flights
-drop from 30.2/35.3 % to 26.0/39.2 %. The residual mechanism is that a ramp over a flight is a thin hovering
-surface: Recast's ledge filter trims its edges (`walkableClimb` each side) and `FilterWalkableLowHeightSpans`
-then deletes the tread spans it covers, so on a narrow or strongly curved flight the ramp can take away more
-than it adds.
+Harness `Test 23` now connects the ladder cases - `b` (62 deg ladder floor->floor) and `d` (chained ladders,
+apron to base) go from broken to connected through the exemption, and `c` (two `>50 deg` ladders sharing a
+platform) likewise. `a` (a stair with a 1.05 m mid-flight hole) gets its ramp but still does not link to the
+small *floating* landing box in that synthetic scene. On Birtu the setting is still **not a net win**: the
+wooden `wooden_platform_stairs_a` flights are skipped (`flat`, no chunks formed) and the two `stairs_bo`
+clusters *lose* coverage (45.7 -> 38.3 % and 39.1 -> 35.0 %) because their chained ramps now survive the trim
+while sitting above the treads. **The default therefore stays off** until both are fixed; the exemption itself
+is measured and safe (no level band moves by more than 10 faces, islands and invariants unchanged).
 
-Harness `Test 23` covers the ladder cases the setting exists for (a steep stair with a mid-flight hole, a 62 deg
-ladder between two floors, two ladders sharing a platform, chained ladders). **Those cases do not connect yet**,
-which is the reason the default is off. The next lever is at the ramp's ends: the anchor is a layer centroid, so
-the aprons currently stop ~0.2 m inside the flight and the ramp never quite reaches the floor/landing level;
-making the end aprons reach the flight's true bottom / top level is the first thing to try, then re-run
-`Test 23`. Wider ramps were tried and are *not* the lever (1.6 and 2.0 m clamp changes moved the numbers by
-<= 0.2 points on Birtu).
-
-
+### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
 built from can still span it, producing a **false walkable lid** over the void - an agent standing on it falls
@@ -699,7 +700,7 @@ through. Decompiled evidence (dnSpy, 1.4.8 assemblies):
   **no** hole parameter and **no** hole array. A full dump of `Scene`'s terrain methods shows no hole/carve/
   mask/enumeration API at all (only `GetTerrain*`, `SetLandscapeRainMaskData`, `HasTerrainHeightmap`,
   `ContainsTerrain`, terrain raycasts).
-- ⇒ Terrain holes are **not enumerable and not representable in the bulk node arrays**; the only observable
+- Ã¢â€¡â€™ Terrain holes are **not enumerable and not representable in the bulk node arrays**; the only observable
   signal is a per-point disagreement between the stored height and the hole-aware query.
 
 So the fix is: audit the sampled vertices against the hole-aware point query and **drop the terrain cells that
@@ -748,6 +749,7 @@ NavMesh: soup OBJ written: <folder>\<prefab>_soup_assets.obj
 NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
 NavMesh: v2: gap fill: filled=<n> emptyColumns=<n> (cap=2 cells, before erosion)   <- only when NavMeshVoxelGapFillCells>0
 NavMesh: v2: stitch: added=<n> faces across tiles (cap=6 cells)                     <- only when NavMeshVoxelStitchMaxGapCells>0
+NavMesh: v2: ramps: markedCells=<n> restored=<n> (ledge-trim exemption)   <- only when NavMeshVoxelPropRamps=true and ramps are present
 NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
 NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands

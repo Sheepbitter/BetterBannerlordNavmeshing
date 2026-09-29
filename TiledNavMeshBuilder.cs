@@ -152,6 +152,8 @@ namespace BetterBannerlordNavmeshing
             public int GapFilled;      // columns filled by the gap-fill pre-pass (before erosion)
             public int GapEmptyColumns; // own-area columns with no walkable span that the fill scanned
             public int Stitched;       // connector faces added by the per-tile stitch pass
+            public int RampMarkedCells;    // heightfield cells covered by forced (ramp) triangles
+            public int RampRestoredSpans;  // ramp spans the ledge filter nulled and the exemption restored
         }
 
         public sealed class VoxelMeshResult
@@ -173,6 +175,8 @@ namespace BetterBannerlordNavmeshing
             public int InputTriangles;
             public int CulledByAabb;
             public int RasterizedTriangles;
+            public int RampMarkedCells;     // cells covered by forced (ramp) triangles, all tiles
+            public int RampRestoredSpans;   // ramp spans restored after the ledge trim, all tiles
 
             public long TilesMs;
             public long MergeMs;
@@ -683,6 +687,19 @@ namespace BetterBannerlordNavmeshing
                         stitched += results[i].Stitched;
                 Log(log, "v2: stitch: added=" + stitched + " faces across tiles (cap=" + s.StitchMaxGapCells
                     + " cells" + (stitched > 0 ? "" : " - no near-miss cuts found") + ")");
+            }
+
+            if (forceWalkableTriangles != null)
+            {
+                int markedCells = 0, restoredSpans = 0;
+                for (int i = 0; i < results.Length; i++)
+                    if (results[i] != null && !results[i].Failed)
+                    {
+                        markedCells += results[i].RampMarkedCells;
+                        restoredSpans += results[i].RampRestoredSpans;
+                    }
+                Log(log, "v2: ramps: markedCells=" + markedCells + " restored=" + restoredSpans
+                    + " (ledge-trim exemption)");
             }
 
             // --- merge in sorted order (deterministic) ---
@@ -1567,6 +1584,72 @@ namespace BetterBannerlordNavmeshing
             return sum;
         }
 
+        // Marks the heightfield cells covered by the forced (synthesized ramp) triangles of one tile, in
+        // XZ only. A cell is marked when its centre - or any of its four corners - lies inside a forced
+        // triangle, which covers sub-cell slivers as well as multi-cell footprints without reimplementing
+        // the rasterizer's edge walk. ~O(forced triangles x their cells), per tile.
+        private static bool[] MarkForcedCells(RcHeightfield hf, float[] vertsXyz, int[] subTris,
+            List<int> tileList, bool[] forceWalkableTriangles, float cellSize)
+        {
+            int w = hf.width, h = hf.height;
+            var marked = new bool[w * h];
+            float minX = hf.bmin.X, minZ = hf.bmin.Z;
+            float half = 0.5f * cellSize;
+            for (int k = 0; k < tileList.Count; k++)
+            {
+                int src = tileList[k];
+                if (src < 0 || src >= forceWalkableTriangles.Length) continue;
+                if (!forceWalkableTriangles[src]) continue;
+                int ia = subTris[k * 3 + 0], ib = subTris[k * 3 + 1], ic = subTris[k * 3 + 2];
+                float ax = vertsXyz[ia * 3], az = vertsXyz[ia * 3 + 2];
+                float bx = vertsXyz[ib * 3], bz = vertsXyz[ib * 3 + 2];
+                float cx = vertsXyz[ic * 3], cz = vertsXyz[ic * 3 + 2];
+                float tMinX = Math.Min(ax, Math.Min(bx, cx)), tMaxX = Math.Max(ax, Math.Max(bx, cx));
+                float tMinZ = Math.Min(az, Math.Min(bz, cz)), tMaxZ = Math.Max(az, Math.Max(bz, cz));
+                int x0 = CellIndex(tMinX, minX, cellSize, w);
+                int x1 = CellIndex(tMaxX, minX, cellSize, w);
+                int z0 = CellIndex(tMinZ, minZ, cellSize, h);
+                int z1 = CellIndex(tMaxZ, minZ, cellSize, h);
+                for (int z = z0; z <= z1; z++)
+                {
+                    for (int x = x0; x <= x1; x++)
+                    {
+                        int ci = z * w + x;
+                        if (marked[ci]) continue;
+                        float px = minX + (x + 0.5f) * cellSize;
+                        float pz = minZ + (z + 0.5f) * cellSize;
+                        if (PointInTriXZ(px, pz, ax, az, bx, bz, cx, cz)
+                            || PointInTriXZ(px - half, pz - half, ax, az, bx, bz, cx, cz)
+                            || PointInTriXZ(px + half, pz - half, ax, az, bx, bz, cx, cz)
+                            || PointInTriXZ(px - half, pz + half, ax, az, bx, bz, cx, cz)
+                            || PointInTriXZ(px + half, pz + half, ax, az, bx, bz, cx, cz))
+                            marked[ci] = true;
+                    }
+                }
+            }
+            return marked;
+        }
+
+        private static int CellIndex(float p, float min, float cellSize, int count)
+        {
+            int i = cellSize > 0f ? (int)Math.Floor((p - min) / cellSize) : 0;
+            if (i < 0) i = 0;
+            if (i >= count) i = count - 1;
+            return i;
+        }
+
+        // Inside-or-on-edge test for a point against a triangle projected to XZ.
+        private static bool PointInTriXZ(float px, float pz, float ax, float az, float bx, float bz,
+            float cx, float cz)
+        {
+            float d1 = (px - bx) * (az - bz) - (ax - bx) * (pz - bz);
+            float d2 = (px - cx) * (bz - cz) - (bx - cx) * (pz - cz);
+            float d3 = (px - ax) * (cz - az) - (cx - ax) * (pz - az);
+            bool neg = d1 < 0f || d2 < 0f || d3 < 0f;
+            bool pos = d1 > 0f || d2 > 0f || d3 > 0f;
+            return !(neg && pos);
+        }
+
         private static VoxelTileResult BuildTile(int index, int tx, int ty,
             float[] vertsXyz, int[] tris, List<int> tileList, TiledNavMeshSettings s,
             float originX, float originZ, float tileSpan, int cellsPerTile, float bminY, float bmaxY,
@@ -1620,6 +1703,7 @@ namespace BetterBannerlordNavmeshing
 
                 int[] areaIds = RcRecast.MarkWalkableTriangles(ctx, s.MaxSlopeDegrees, vertsXyz, subTris,
                     assigned, areaMod);
+                int forcedInTile = 0;
                 if (forceWalkableTriangles != null)
                 {
                     // Synthesized ramps are walkable by design even when steeper than MaxSlopeDegrees
@@ -1628,12 +1712,46 @@ namespace BetterBannerlordNavmeshing
                     {
                         int src = tileList[k];
                         if (src >= 0 && src < forceWalkableTriangles.Length && forceWalkableTriangles[src])
+                        {
                             areaIds[k] = RcRecast.RC_WALKABLE_AREA;
+                            forcedInTile++;
+                        }
                     }
                 }
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
+
+                // Synthesized ramp spans are exempt from the ledge trim (NOT from the clearance rules
+                // below): FilterLedgeSpans deletes any span steeper than atan(walkableClimb / (2*cs)) by
+                // nulling its area, and it runs after the walkable-area marking, so the only way to keep a
+                // ramp is to remember which spans its cells held as walkable just before that filter and
+                // restore exactly those afterwards. Identifying ramp spans by area id is impossible - the
+                // filter overwrites the id it was given.
+                List<RcSpan>[] rampSpans = null;
+                if (forcedInTile > 0 && s.UseLedgeFilter)
+                {
+                    bool[] rampCells = MarkForcedCells(hf, vertsXyz, subTris, tileList,
+                        forceWalkableTriangles, s.VoxelCellSizeMeters);
+                    int marked = 0;
+                    for (int ci = 0; ci < rampCells.Length; ci++)
+                        if (rampCells[ci]) marked++;
+                    if (marked > 0)
+                    {
+                        rampSpans = new List<RcSpan>[rampCells.Length];
+                        for (int ci = 0; ci < rampCells.Length; ci++)
+                        {
+                            if (!rampCells[ci]) continue;
+                            for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+                            {
+                                if (sp.area == RcRecast.RC_NULL_AREA) continue;
+                                if (rampSpans[ci] == null) rampSpans[ci] = new List<RcSpan>();
+                                rampSpans[ci].Add(sp);
+                            }
+                        }
+                        r.RampMarkedCells = marked;
+                    }
+                }
                 if (s.GapFillCells > 0)
                 {
                     // Must run before the ledge filter: FilterLedgeSpans reads an in-bounds EMPTY
@@ -1647,6 +1765,26 @@ namespace BetterBannerlordNavmeshing
                 }
                 if (s.UseLedgeFilter)
                     RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
+                if (rampSpans != null)
+                {
+                    // Restore only spans that were walkable before the ledge filter and that it nulled:
+                    // ordinary geometry in the same tile keeps the exact current cap.
+                    int restored = 0;
+                    for (int ci = 0; ci < rampSpans.Length; ci++)
+                    {
+                        List<RcSpan> list = rampSpans[ci];
+                        if (list == null) continue;
+                        for (int i = 0; i < list.Count; i++)
+                        {
+                            RcSpan sp = list[i];
+                            if (sp.area != RcRecast.RC_NULL_AREA) continue;
+                            sp.area = RcRecast.RC_WALKABLE_AREA;
+                            restored++;
+                        }
+                    }
+                    r.RampRestoredSpans = restored;
+                }
+                // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
 
                 RcCompactHeightfield chf = RcCompacts.BuildCompactHeightfield(ctx, walkableHeight, walkableClimb, hf);

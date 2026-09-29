@@ -99,9 +99,11 @@ namespace BetterBannerlordNavmeshing
         }
 
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
-            bool propRamps, System.Action<string> log)
+            bool propRamps, System.Action<string> log, float rampCellSize = 0.25f, float rampClimb = 0.6f,
+            bool rampLedge = true)
         {
-            AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, propRamps, log);
+            AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, propRamps, log,
+                rampCellSize, rampClimb, rampLedge);
             var r = new AssetTriangles();
             r.VertsXyz = g.VertsXyz;
             r.Tris = g.Tris;
@@ -118,7 +120,8 @@ namespace BetterBannerlordNavmeshing
         // arrays and every policy/counter are identical either way.
         // propRamps: synthesize a walkable ramp for HasSteps/Ladder props (SteppedPropRamps).
         public static AssetGeometry CollectDetailed(Scene scene, bool includeDynamic, bool includeFlora,
-            bool trace, bool recordEntities, bool propRamps, System.Action<string> log)
+            bool trace, bool recordEntities, bool propRamps, System.Action<string> log,
+            float rampCellSize = 0.25f, float rampClimb = 0.6f, bool rampLedge = true)
         {
             var result = new AssetGeometry();
             result.VertsXyz = new float[0];
@@ -407,7 +410,8 @@ namespace BetterBannerlordNavmeshing
                             prop.Tris[t] = tris[firstTri * 3 + t] - firstVert;
 
                         SteppedPropRamps.Result ramps = SteppedPropRamps.Synthesize(
-                            new SteppedPropRamps.Prop[] { prop });
+                            new SteppedPropRamps.Prop[] { prop },
+                            rampCellSize, rampClimb, rampLedge);
                         rampQuads += ramps.Ramps;
                         rampStairs += ramps.Stairs;
                         rampLadders += ramps.Ladders;
