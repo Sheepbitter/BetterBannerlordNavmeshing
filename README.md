@@ -670,7 +670,7 @@ Harness `Test 23` with the setting on - all four now connect, and all four contr
 |---|---|---|
 | `v2: stepped tris:` | - | `forced-walkable=0 ledge-exempt=14474/665317` |
 | ramps | - | 0 synthesized (18 props: 12 flat, 2 steep, 4 long - no bridgeable holes on Birtu) |
-| `v2: stepped: markedCells=...` | - | `markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5` |
+| `v2: stepped: markedCells=...` | - | `markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5 droppedPlane=0 aboveNear=0 aboveFar=16394` |
 | mesh | V=32 836 F=50 957 E=84 531 | V=33 408 **F=51 643** E=85 817 |
 | islands | 5 | **6** (one extra island) |
 
@@ -707,6 +707,32 @@ was dropped. **The default therefore stays off**; the remaining lever is to have
 coarse plane span above it (drop the plane where the tread is authored), which is safe only where that plane is
 the flight's own merge artefact and not a legitimate storey above it - that rule needs a per-span authorship
 signal the heightfield does not carry today.
+
+**V3.14: plane suppression, and the measurement that closes the question.** The same pass now suppresses the
+merge plane: when a stepped-prop span is restored, any *other* walkable span in that cell that belongs to the
+same prop (i.e. is remembered for that cell), sits within `walkableClimb` above the restored span, and is
+therefore the rasterizer's merged top of the same boards, has its area nulled *and* is unlinked from the column
+- nulling the area alone cannot work, because `FilterWalkableLowHeightSpans` reads `span.next.smin` regardless
+of area and would null the restored span right back. Neighbouring props and legitimately separate storeys are
+never touched; `droppedPlane=<n>` reports what was suppressed. Test 23 stays 4/4 with the controls unchanged
+and neutrality stays `MATCH`, but on Birtu the counters show the rule has nothing to fire on:
+
+```
+v2: stepped: markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5
+             droppedPlane=0 aboveNear=0 aboveFar=16394
+```
+
+`aboveNear=0` means **no** restored span has a walkable span within `walkableClimb` above it: the restored span
+*is* the merged plane (its own top is the boards' merged top for that column), and every span above a restored
+span is a legitimate storey at least `walkableClimb` up (16394 of them). The ~0.2 m sag is therefore not a
+same-column plane at all - it is the *region* builder joining the restored cells with that storey's cells across
+columns, so the contour spans two levels and the poly interpolates. A same-column rule cannot see that, and
+nulling the storey is exactly what this rule must not do (it would delete real floors). The build is unchanged
+by the rule (`F=51643 islands=6`, identical to V3.12), the two `wooden_platform_stairs_a` regressions and the
+extra island remain, and **`NavMeshVoxelSteppedProps` stays `false`**. Closing this needs a different lever:
+either region-level separation (keep restored ramp/tread cells out of an existing region that is more than
+`walkableClimb` above them) or a per-span authorship tag from rasterisation so a storey can be told from a
+merge artefact by construction rather than by height.
 
 ### Terrain holes (false lids)
 
@@ -773,7 +799,7 @@ NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
 NavMesh: v2: gap fill: filled=<n> emptyColumns=<n> (cap=2 cells, before erosion)   <- only when NavMeshVoxelGapFillCells>0
 NavMesh: v2: stitch: added=<n> faces across tiles (cap=<n> cells)                     <- only when NavMeshVoxelStitchMaxGapCells>0
 NavMesh: v2: stepped tris: forced-walkable=<n> ledge-exempt=<n>/<m> (ramps walkable regardless of slope; stepped-prop treads kept off the ledge trim)   <- only when NavMeshVoxelSteppedProps=true
-NavMesh: v2: stepped: markedCells=<n> restored=<n> droppedClearance=<n> droppedOrphan=<n> (ledge-trim exemption, gated per span)   <- only when NavMeshVoxelSteppedProps=true and stepped props are present
+NavMesh: v2: stepped: markedCells=<n> restored=<n> droppedClearance=<n> droppedOrphan=<n> droppedPlane=<n> aboveNear=<n> aboveFar=<n> (ledge-trim exemption, gated per span)   <- only when NavMeshVoxelSteppedProps=true and stepped props are present
 NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
 NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands

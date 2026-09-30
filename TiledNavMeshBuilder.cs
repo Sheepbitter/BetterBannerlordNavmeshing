@@ -156,6 +156,9 @@ namespace BetterBannerlordNavmeshing
             public int SteppedRestoredSpans;  // ramp spans the ledge filter nulled and the exemption restored
             public int SteppedDroppedClearance; // remembered spans left nulled: no headroom above them
             public int SteppedDroppedOrphan;    // remembered spans left nulled: they would be orphans
+            public int SteppedDroppedPlane;     // merge-plane spans suppressed above a restored span
+            public int SteppedAboveNear;        // restored spans with a walkable span within climb above
+            public int SteppedAboveFar;         // restored spans with a walkable span further above
         }
 
         public sealed class VoxelMeshResult
@@ -181,6 +184,9 @@ namespace BetterBannerlordNavmeshing
             public int SteppedRestoredSpans;   // ramp spans restored after the ledge trim, all tiles
             public int SteppedDroppedClearance; // remembered spans not restored: no headroom
             public int SteppedDroppedOrphan;    // remembered spans not restored: would be orphans
+            public int SteppedDroppedPlane;     // merge-plane spans suppressed above a restored span
+            public int SteppedAboveNear;        // restored spans with a walkable span within climb above
+            public int SteppedAboveFar;         // restored spans with a walkable span further above
 
             public long TilesMs;
             public long MergeMs;
@@ -705,6 +711,7 @@ namespace BetterBannerlordNavmeshing
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
                 int markedCells = 0, restoredSpans = 0, droppedClearance = 0, droppedOrphan = 0;
+                int droppedPlane = 0, aboveNear = 0, aboveFar = 0;
                 for (int i = 0; i < results.Length; i++)
                     if (results[i] != null && !results[i].Failed)
                     {
@@ -712,10 +719,14 @@ namespace BetterBannerlordNavmeshing
                         restoredSpans += results[i].SteppedRestoredSpans;
                         droppedClearance += results[i].SteppedDroppedClearance;
                         droppedOrphan += results[i].SteppedDroppedOrphan;
+                        droppedPlane += results[i].SteppedDroppedPlane;
+                        aboveNear += results[i].SteppedAboveNear;
+                        aboveFar += results[i].SteppedAboveFar;
                     }
                 Log(log, "v2: stepped: markedCells=" + markedCells + " restored=" + restoredSpans
                     + " droppedClearance=" + droppedClearance + " droppedOrphan=" + droppedOrphan
-                    + " (ledge-trim exemption, gated per span)");
+                    + " droppedPlane=" + droppedPlane + " aboveNear=" + aboveNear
+                    + " aboveFar=" + aboveFar + " (ledge-trim exemption, gated per span)");
             }
 
             // --- merge in sorted order (deterministic) ---
@@ -1661,11 +1672,14 @@ namespace BetterBannerlordNavmeshing
         // Cost is one pass over the remembered spans plus a 4-neighbour flood over the tile's columns.
         private static void RestoreSteppedSpans(RcHeightfield hf, List<RcSpan>[] remembered,
             int walkableHeight, int walkableClimb, out int restored, out int droppedClearance,
-            out int droppedOrphan)
+            out int droppedOrphan, out int droppedPlane, out int aboveNear, out int aboveFar)
         {
             restored = 0;
             droppedClearance = 0;
             droppedOrphan = 0;
+            droppedPlane = 0;
+            aboveNear = 0;
+            aboveFar = 0;
             int w = hf.width, h = hf.height;
 
             // pass 1: clearance gate, and tentatively restore the survivors
@@ -1686,6 +1700,39 @@ namespace BetterBannerlordNavmeshing
                     sp.area = RcRecast.RC_WALKABLE_AREA;
                     restoredSpans.Add(sp);
                     restored++;
+
+                    // Suppress the merge plane: the rasterizer merges a thin flight's boards into one
+                    // coarse span per column, and where that artefact sits within walkableClimb above the
+                    // span just restored it IS the same boards. Leaving it walkable puts two levels in the
+                    // column; the region builder joins them and the contour interpolates between them, so
+                    // the surface sags (measured ~0.2 m on two wooden flights). Nulling its area is not
+                    // enough - FilterWalkableLowHeightSpans reads span.next.smin regardless of area and
+                    // would null the restored span right back - so the artefact span is unlinked as well.
+                    // Only spans of THIS stepped prop (i.e. remembered for this cell) are touched, so a
+                    // neighbouring prop's platform is never removed.
+                    RcSpan prev = sp;
+                    for (RcSpan up = sp.next; up != null; )
+                    {
+                        RcSpan next = up.next;
+                        if (up.area != RcRecast.RC_NULL_AREA && up.smax - sp.smax <= walkableClimb)
+                        {
+                            aboveNear++;
+                            if (Contains(list, up))
+                            {
+                                up.area = RcRecast.RC_NULL_AREA;
+                                prev.next = next;            // unlink: it must not stay the ceiling
+                                droppedPlane++;
+                                up = next;
+                                continue;
+                            }
+                        }
+                        else if (up.area != RcRecast.RC_NULL_AREA)
+                        {
+                            aboveFar++;
+                        }
+                        prev = up;
+                        up = next;
+                    }
                 }
             }
             if (restored == 0) return;
@@ -1746,6 +1793,13 @@ namespace BetterBannerlordNavmeshing
                     droppedOrphan++;
                 }
             }
+        }
+
+        private static bool Contains(List<RcSpan> list, RcSpan sp)
+        {
+            for (int i = 0; i < list.Count; i++)
+                if (ReferenceEquals(list[i], sp)) return true;
+            return false;
         }
 
         private static void EnqueueColumn(bool[] connected, Queue<int> queue, int x, int z, int w, int h)
@@ -1924,12 +1978,16 @@ namespace BetterBannerlordNavmeshing
                 {
                     // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
                     // current cap, and a remembered span comes back only when doing so is sound.
-                    int restored, droppedClearance, droppedOrphan;
+                    int restored, droppedClearance, droppedOrphan, droppedPlane, aboveNear, aboveFar;
                     RestoreSteppedSpans(hf, steppedSpans, walkableHeight, walkableClimb,
-                        out restored, out droppedClearance, out droppedOrphan);
+                        out restored, out droppedClearance, out droppedOrphan, out droppedPlane,
+                        out aboveNear, out aboveFar);
                     r.SteppedRestoredSpans = restored;
                     r.SteppedDroppedClearance = droppedClearance;
                     r.SteppedDroppedOrphan = droppedOrphan;
+                    r.SteppedDroppedPlane = droppedPlane;
+                    r.SteppedAboveNear = aboveNear;
+                    r.SteppedAboveFar = aboveFar;
                 }
                 // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
