@@ -78,6 +78,19 @@ namespace BetterBannerlordNavmeshing
         // Per-prop dedupe rounding.
         private const float DedupeQuantum = 0.05f;
 
+        // ---- offset symbolic connector (ladders only) ----------------------------------------------
+        // A ladder that cannot be connected within its own footprint (a true vertical ladder has no
+        // run at all) still has to be navmeshed or bots never traverse it. The connector is a SYMBOLIC
+        // LINK, not a surface an agent stands on beside the ladder: its bottom anchor is offset
+        // horizontally from the ladder's top so the slope is shallow enough to rasterise (never 90 deg),
+        // and the whole link sits near the geometry (the navmesh may sit inside the ladder's own
+        // plank/hatch headroom - that is what the clearance exemption in the builder is for).
+        public const float ConnectorSlopeDegrees = 62f;   // target slope of the offset connector
+        public const float ConnectorMinRunMeters = 0.5f;  // never emit a degenerate near-vertical quad
+        public const float ConnectorWidthMeters = 3.4f;   // wide enough to survive erosion (2 cells/side)
+        public const float ConnectorFootPadMeters = 1.0f; // flat pad on the floor below the foot anchor
+        public const float ConnectorTopPadMeters = 0.5f;  // flat pad on the landing at the top anchor
+
         public sealed class Prop
         {
             public string Name;
@@ -101,6 +114,10 @@ namespace BetterBannerlordNavmeshing
             public int Capped;         // the flight needed more than MaxRampsPerProp chunks
             public float SlopeCapDegrees;   // the steepest ramp the Recast build can keep walkable
             public readonly List<RampInfo> Infos = new List<RampInfo>();
+            // Indices into Tris of the offset symbolic connector's triangles (ladder-flag only). The
+            // collector marks these in BOTH the force-walkable and ledge-exempt masks, so the builder can
+            // single out the connector (force && exempt) for its clearance exemption. Empty otherwise.
+            public readonly List<int> ConnectorTris = new List<int>();
             // One entry per prop that produced no ramp, with the reason and the key numbers. Diagnostic
             // only (never used by the geometry); the caller logs them, capped.
             public readonly List<Skip> Skips = new List<Skip>();
@@ -203,6 +220,128 @@ namespace BetterBannerlordNavmeshing
             return true;
         }
 
+        // Offset symbolic connector for a ladder the ordinary synthesis could not connect. Pure: the
+        // geometry is derived from the prop alone; the builder's clearance exemption keeps it alive where
+        // the ladder's own plank/hatch is within head height. See the header constants for the rationale.
+        private static bool TryLadderOffsetConnector(Result r, Prop p, float slopeCapDegrees, Skip skip)
+        {
+            if (p == null || p.VertsXyz == null || p.Tris == null) return false;
+            if ((p.Flags & FlagLadder) == 0) return false;
+            int triCount = p.Tris.Length / 3;
+            if (triCount <= 0) return false;
+            int vertCount = p.VertsXyz.Length / 3;
+
+            var cx = new float[triCount];
+            var cy = new float[triCount];
+            var cz = new float[triCount];
+            var topZ = new float[triCount];
+            int used = 0;
+            float zMin = float.MaxValue, zMax = float.MinValue;
+            float boxX0 = float.MaxValue, boxX1 = float.MinValue, boxY0 = float.MaxValue, boxY1 = float.MinValue;
+            for (int t = 0; t < triCount; t++)
+            {
+                int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
+                    continue;
+                float x = (p.VertsXyz[i0 * 3 + 0] + p.VertsXyz[i1 * 3 + 0] + p.VertsXyz[i2 * 3 + 0]) / 3f;
+                float y = (p.VertsXyz[i0 * 3 + 1] + p.VertsXyz[i1 * 3 + 1] + p.VertsXyz[i2 * 3 + 1]) / 3f;
+                float z = (p.VertsXyz[i0 * 3 + 2] + p.VertsXyz[i1 * 3 + 2] + p.VertsXyz[i2 * 3 + 2]) / 3f;
+                float tz = Math.Max(p.VertsXyz[i0 * 3 + 2],
+                    Math.Max(p.VertsXyz[i1 * 3 + 2], p.VertsXyz[i2 * 3 + 2]));
+                float bz = Math.Min(p.VertsXyz[i0 * 3 + 2],
+                    Math.Min(p.VertsXyz[i1 * 3 + 2], p.VertsXyz[i2 * 3 + 2]));
+                cx[used] = x; cy[used] = y; cz[used] = z; topZ[used] = tz;
+                for (int k = 0; k < 3; k++)
+                {
+                    int vi = p.Tris[t * 3 + k];
+                    float vx = p.VertsXyz[vi * 3 + 0], vy = p.VertsXyz[vi * 3 + 1];
+                    if (vx < boxX0) boxX0 = vx;
+                    if (vx > boxX1) boxX1 = vx;
+                    if (vy < boxY0) boxY0 = vy;
+                    if (vy > boxY1) boxY1 = vy;
+                }
+                if (bz < zMin) zMin = bz;
+                if (tz > zMax) zMax = tz;
+                used++;
+            }
+            if (used == 0) return false;
+            float rise = zMax - zMin;
+            if (rise < MinRiseMeters) return false;
+
+            float bx, by, tx, ty;
+            if (!BandCentres(cx, cy, cz, topZ, used, zMin, zMax, out bx, out by, out tx, out ty))
+            {
+                // No usable bands: use the prop's centroid for both ends (degenerate but safe).
+                float gx = 0f, gy = 0f;
+                for (int k = 0; k < used; k++) { gx += cx[k]; gy += cy[k]; }
+                bx = gx / used; by = gy / used; tx = bx; ty = by;
+            }
+
+            float dirX = tx - bx, dirY = ty - by;
+            float len = (float)Math.Sqrt((double)dirX * dirX + (double)dirY * dirY);
+            if (len < 0.35f * rise)
+            {
+                // A near-vertical ladder (run well under its rise) has no usable own run direction: the
+                // band centres sit almost on top of each other and their tiny offset is noise. The
+                // connector must live where the ladder climbs - the ladder's own rung plane - so offset
+                // along the prop's SHORTER horizontal box axis (the panel's thickness): that steps off
+                // the panel's face on the climbing side rather than sideways along the rungs.
+                float extX = boxX1 - boxX0, extY = boxY1 - boxY0;
+                if (extX <= extY) { dirX = 1f; dirY = 0f; }
+                else { dirX = 0f; dirY = 1f; }
+            }
+            else
+            {
+                dirX /= len; dirY /= len;
+            }
+
+            float target = ConnectorSlopeDegrees;
+            if (slopeCapDegrees > 0f && slopeCapDegrees < target) target = slopeCapDegrees;
+            if (target < 20f) target = 20f;
+            float run = rise / (float)Math.Tan(target * Math.PI / 180.0);
+            if (run < ConnectorMinRunMeters) run = ConnectorMinRunMeters;
+            if (run > MaxRunPerRampMeters) run = MaxRunPerRampMeters;
+
+            float footX = tx - dirX * run, footY = ty - dirY * run;
+            float hw = 0.5f * ConnectorWidthMeters;
+            float px = -dirY * hw, py = dirX * hw;   // perpendicular half-width of the centre line
+
+            // Foot pad (flat on the floor), ramp, top pad (flat on the landing). All three are forced
+            // walkable; the pads are deliberately short - just long enough to share a span with the
+            // floor / landing so the link merges there.
+            AppendConnectorQuad(r, footX - dirX * ConnectorFootPadMeters,
+                footY - dirY * ConnectorFootPadMeters, zMin, footX, footY, zMin, px, py);
+            AppendConnectorQuad(r, footX, footY, zMin, tx, ty, zMax, px, py);
+            AppendConnectorQuad(r, tx, ty, zMax,
+                tx + dirX * ConnectorTopPadMeters, ty + dirY * ConnectorTopPadMeters, zMax, px, py);
+
+            var info = new RampInfo();
+            info.Prop = p.Name;
+            info.BottomY = zMin;
+            info.TopY = zMax;
+            info.Run = run;
+            info.Width = ConnectorWidthMeters;
+            info.SlopeDeg = (float)(Math.Atan2(rise, run) * 180.0 / Math.PI);
+            info.FootX = footX; info.FootHz = footY;
+            info.HeadX = tx; info.HeadHz = ty;
+            r.Infos.Add(info);
+            r.Ramps++;
+            r.Ladders++;
+            if (skip != null) UndoSkip(r, skip);
+            return true;
+        }
+
+        // One connector quad, recording its two triangle indices so the builder can single the connector
+        // out (force-walkable AND ledge-exempt) for the clearance exemption.
+        private static void AppendConnectorQuad(Result r, float x0, float y0, float z0, float x1, float y1,
+            float z1, float hx, float hy)
+        {
+            int t0 = r.Tris.Count / 3;
+            AppendQuad(r, x0, y0, z0, x1, y1, z1, hx, hy);
+            r.ConnectorTris.Add(t0);
+            r.ConnectorTris.Add(t0 + 1);
+        }
+
         public static string DescribeSkip(Skip s)
         {
             var sb = new System.Text.StringBuilder();
@@ -229,6 +368,9 @@ namespace BetterBannerlordNavmeshing
         {
             public string Prop;
             public float BottomY, TopY, Run, Width, SlopeDeg;
+            // Engine-space horizontal endpoints of the centre line (X and the second horizontal axis).
+            // Only set by the offset symbolic connector; zero for the ordinary ramp path.
+            public float FootX, FootHz, HeadX, HeadHz;
         }
 
         public static bool IsSteppedOrLadder(int flags)
@@ -243,7 +385,10 @@ namespace BetterBannerlordNavmeshing
                 + "deg width=" + MinWidthMeters + ".." + MaxWidthMeters + "m x" + WidthFactor + " apron="
                 + ApronMeters + "m (capped to the prop's own footprint) maxBridge=" + MaxBridgeRunMeters
                 + "m maxRamps=" + MaxRampsPerProp
-                + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m (navigable cap applied per build)";
+                + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m (navigable cap applied per build);"
+                + " ladder offset connector slope=" + ConnectorSlopeDegrees + "deg width="
+                + ConnectorWidthMeters + "m footPad=" + ConnectorFootPadMeters + "m topPad="
+                + ConnectorTopPadMeters + "m";
         }
 
         // Deterministic: no dictionary iteration order reaches the output.
@@ -273,7 +418,22 @@ namespace BetterBannerlordNavmeshing
             return (float)(Math.Atan(t) * 180.0 / Math.PI);
         }
 
+        // The normalized entry point: run the ordinary synthesis; when a LADDER prop produced no ramp at
+        // all (a true vertical ladder exits before the station machinery exists), fall back to the offset
+        // symbolic connector. Every failure exit of the core is covered by this one wrapper.
         private static void AppendProp(Prop p, Result r, float slopeCapDegrees, float climbMeters,
+            float cellSizeMeters)
+        {
+            int rampsBefore = r.Ramps;
+            int skipsBefore = r.Skips.Count;
+            AppendPropCore(p, r, slopeCapDegrees, climbMeters, cellSizeMeters);
+            if (r.Ramps > rampsBefore) return;                 // the ordinary path emitted
+            if (p == null || (p.Flags & FlagLadder) == 0) return;   // connectors are ladder-flag only
+            Skip skip = r.Skips.Count > skipsBefore ? r.Skips[r.Skips.Count - 1] : null;
+            TryLadderOffsetConnector(r, p, slopeCapDegrees, skip);
+        }
+
+        private static void AppendPropCore(Prop p, Result r, float slopeCapDegrees, float climbMeters,
             float cellSizeMeters)
         {
             if (p == null || p.VertsXyz == null || p.Tris == null) return;
@@ -802,6 +962,10 @@ namespace BetterBannerlordNavmeshing
             info.Run = run;
             info.Width = width;
             info.SlopeDeg = (float)(Math.Atan2(rise, run) * 180.0 / Math.PI);
+            // The chunk's own centre-line endpoints, so a caller can tell whether a ladder's chain
+            // actually reaches the prop's own top (see AppendProp's shortfall fallback).
+            info.FootX = bX; info.FootHz = bY;
+            info.HeadX = tX; info.HeadHz = tY;
             r.Infos.Add(info);
             r.Ramps++;
             return true;

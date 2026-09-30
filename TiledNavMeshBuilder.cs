@@ -159,6 +159,11 @@ namespace BetterBannerlordNavmeshing
             public int SteppedDroppedPlane;     // merge-plane spans suppressed above a restored span
             public int SteppedAboveNear;        // restored spans with a walkable span within climb above
             public int SteppedAboveFar;         // restored spans with a walkable span further above
+            public int ConnectorForcedInTile;   // forced triangle entries in this tile that are ALSO ledge-exempt
+                                                // (i.e. offset symbolic connectors; force && exempt)
+            public int ConnectorMarkedCells;    // cells the connector marker covered in this tile
+            public int ConnectorClearedCeilings; // real spans the clearance exemption unlinked above a connector
+            public int ConnectorErosionExempt;  // connector spans erosion nulled that the erosion exemption restored
             public List<float> SteppedRestoredCellXz;  // world XZ of cells whose span the exemption restored
         }
 
@@ -188,6 +193,10 @@ namespace BetterBannerlordNavmeshing
             public int SteppedDroppedPlane;     // merge-plane spans suppressed above a restored span
             public int SteppedAboveNear;        // restored spans with a walkable span within climb above
             public int SteppedAboveFar;         // restored spans with a walkable span further above
+            public int ConnectorForcedInTile;   // forced connector triangles in tiles, all tiles
+            public int ConnectorMarkedCells;    // cells covered by the connector marker, all tiles
+            public int ConnectorClearedCeilings; // real spans unlinked above a restored connector, all tiles
+            public int ConnectorErosionExempt;  // connector spans erosion nulled that the erosion exemption restored
 
             public long TilesMs;
             public long MergeMs;
@@ -709,25 +718,39 @@ namespace BetterBannerlordNavmeshing
                     + " cells" + (stitched > 0 ? "" : " - no near-miss cuts found") + ")");
             }
 
+            int aggMarkedCells = 0, aggRestoredSpans = 0, aggDroppedClearance = 0, aggDroppedOrphan = 0;
+            int aggDroppedPlane = 0, aggAboveNear = 0, aggAboveFar = 0;
+            int aggConnectorForcedInTile = 0, aggConnectorMarkedCells = 0, aggConnectorClearedCeilings = 0;
+            int aggConnectorErosionExempt = 0;
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
-                int markedCells = 0, restoredSpans = 0, droppedClearance = 0, droppedOrphan = 0;
-                int droppedPlane = 0, aboveNear = 0, aboveFar = 0;
                 for (int i = 0; i < results.Length; i++)
                     if (results[i] != null && !results[i].Failed)
                     {
-                        markedCells += results[i].SteppedMarkedCells;
-                        restoredSpans += results[i].SteppedRestoredSpans;
-                        droppedClearance += results[i].SteppedDroppedClearance;
-                        droppedOrphan += results[i].SteppedDroppedOrphan;
-                        droppedPlane += results[i].SteppedDroppedPlane;
-                        aboveNear += results[i].SteppedAboveNear;
-                        aboveFar += results[i].SteppedAboveFar;
+                        aggMarkedCells += results[i].SteppedMarkedCells;
+                        aggRestoredSpans += results[i].SteppedRestoredSpans;
+                        aggDroppedClearance += results[i].SteppedDroppedClearance;
+                        aggDroppedOrphan += results[i].SteppedDroppedOrphan;
+                        aggDroppedPlane += results[i].SteppedDroppedPlane;
+                        aggAboveNear += results[i].SteppedAboveNear;
+                        aggAboveFar += results[i].SteppedAboveFar;
+                        aggConnectorForcedInTile += results[i].ConnectorForcedInTile;
+                        aggConnectorMarkedCells += results[i].ConnectorMarkedCells;
+                        aggConnectorClearedCeilings += results[i].ConnectorClearedCeilings;
+                        aggConnectorErosionExempt += results[i].ConnectorErosionExempt;
                     }
-                Log(log, "v2: stepped: markedCells=" + markedCells + " restored=" + restoredSpans
-                    + " droppedClearance=" + droppedClearance + " droppedOrphan=" + droppedOrphan
-                    + " droppedPlane=" + droppedPlane + " aboveNear=" + aboveNear
-                    + " aboveFar=" + aboveFar + " (ledge-trim exemption, gated per span)");
+                Log(log, "v2: stepped: markedCells=" + aggMarkedCells + " restored=" + aggRestoredSpans
+                    + " droppedClearance=" + aggDroppedClearance + " droppedOrphan=" + aggDroppedOrphan
+                    + " droppedPlane=" + aggDroppedPlane + " aboveNear=" + aggAboveNear
+                    + " aboveFar=" + aggAboveFar + " (ledge-trim exemption, gated per span)");
+                // Connector diagnostics: connectorForced counts the forced triangle entries in tiles;
+                // connectorMarked is how many cells the connector marker covered; clearedCeilings is how
+                // many real spans the clearance exemption unlinked above a restored connector span;
+                // erosionExempt is how many connector spans erosion nulled that were restored after it.
+                Log(log, "v2: connector: forcedInTile=" + aggConnectorForcedInTile + " markedCells="
+                    + aggConnectorMarkedCells + " clearedCeilings=" + aggConnectorClearedCeilings
+                    + " erosionExempt=" + aggConnectorErosionExempt
+                    + " (symbolic ladder links exempted from FilterWalkableLowHeightSpans and erosion)");
             }
 
             // --- merge in sorted order (deterministic) ---
@@ -806,6 +829,17 @@ namespace BetterBannerlordNavmeshing
             result.InputTriangles = inputTris;
             result.CulledByAabb = culledByAabb;
             result.RasterizedTriangles = rasterizedTris;
+            result.SteppedMarkedCells = aggMarkedCells;
+            result.SteppedRestoredSpans = aggRestoredSpans;
+            result.SteppedDroppedClearance = aggDroppedClearance;
+            result.SteppedDroppedOrphan = aggDroppedOrphan;
+            result.SteppedDroppedPlane = aggDroppedPlane;
+            result.SteppedAboveNear = aggAboveNear;
+            result.SteppedAboveFar = aggAboveFar;
+            result.ConnectorForcedInTile = aggConnectorForcedInTile;
+            result.ConnectorMarkedCells = aggConnectorMarkedCells;
+            result.ConnectorClearedCeilings = aggConnectorClearedCeilings;
+            result.ConnectorErosionExempt = aggConnectorErosionExempt;
             result.TilesMs = tilesWatch.ElapsedMilliseconds;
             result.MergeMs = mergeWatch.ElapsedMilliseconds;
             result.TileMsMin = tileMsMin;
@@ -1805,11 +1839,22 @@ namespace BetterBannerlordNavmeshing
         // XZ only. A cell is marked when its centre - or any of its four corners - lies inside a forced
         // triangle, which covers sub-cell slivers as well as multi-cell footprints without reimplementing
         // the rasterizer's edge walk. ~O(forced triangles x their cells), per tile.
+        // connectorCells (out) flags the cells covered by a CONNECTOR triangle - one that is BOTH forced
+        // walkable and ledge-exempt, the pair the collector sets for a ladder's offset symbolic link.
+        // connectorTop (out) is the rasterised surface height (world Y) of the connector at each such
+        // cell, so the clearance pass can find the connector's own span among a column's layers.
         private static bool[] MarkSteppedCells(RcHeightfield hf, float[] vertsXyz, int[] subTris,
-            List<int> tileList, bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles, float cellSize)
+            List<int> tileList, bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles, float cellSize,
+            out bool[] connectorCells, out float[] connectorTop, out int connectorMarked)
         {
             int w = hf.width, h = hf.height;
             var marked = new bool[w * h];
+            var conn = new bool[w * h];
+            var ctop = new float[w * h];
+            for (int ci = 0; ci < ctop.Length; ci++) ctop[ci] = float.MinValue;
+            connectorCells = conn;
+            connectorTop = ctop;
+            connectorMarked = 0;
             float minX = hf.bmin.X, minZ = hf.bmin.Z;
             float half = 0.5f * cellSize;
             for (int k = 0; k < tileList.Count; k++)
@@ -1820,10 +1865,11 @@ namespace BetterBannerlordNavmeshing
                 bool exempt = ledgeExemptTriangles != null && src >= 0
                     && src < ledgeExemptTriangles.Length && ledgeExemptTriangles[src];
                 if (!forced && !exempt) continue;
+                bool isConnector = forced && exempt;
                 int ia = subTris[k * 3 + 0], ib = subTris[k * 3 + 1], ic = subTris[k * 3 + 2];
-                float ax = vertsXyz[ia * 3], az = vertsXyz[ia * 3 + 2];
-                float bx = vertsXyz[ib * 3], bz = vertsXyz[ib * 3 + 2];
-                float cx = vertsXyz[ic * 3], cz = vertsXyz[ic * 3 + 2];
+                float ax = vertsXyz[ia * 3], ay = vertsXyz[ia * 3 + 1], az = vertsXyz[ia * 3 + 2];
+                float bx = vertsXyz[ib * 3], by = vertsXyz[ib * 3 + 1], bz = vertsXyz[ib * 3 + 2];
+                float cx = vertsXyz[ic * 3], cy = vertsXyz[ic * 3 + 1], cz = vertsXyz[ic * 3 + 2];
                 float tMinX = Math.Min(ax, Math.Min(bx, cx)), tMaxX = Math.Max(ax, Math.Max(bx, cx));
                 float tMinZ = Math.Min(az, Math.Min(bz, cz)), tMaxZ = Math.Max(az, Math.Max(bz, cz));
                 int x0 = CellIndex(tMinX, minX, cellSize, w);
@@ -1835,19 +1881,57 @@ namespace BetterBannerlordNavmeshing
                     for (int x = x0; x <= x1; x++)
                     {
                         int ci = z * w + x;
-                        if (marked[ci]) continue;
+                        if (marked[ci] && !isConnector) continue;
                         float px = minX + (x + 0.5f) * cellSize;
                         float pz = minZ + (z + 0.5f) * cellSize;
-                        if (PointInTriXZ(px, pz, ax, az, bx, bz, cx, cz)
+                        bool hit = PointInTriXZ(px, pz, ax, az, bx, bz, cx, cz)
                             || PointInTriXZ(px - half, pz - half, ax, az, bx, bz, cx, cz)
                             || PointInTriXZ(px + half, pz - half, ax, az, bx, bz, cx, cz)
                             || PointInTriXZ(px - half, pz + half, ax, az, bx, bz, cx, cz)
-                            || PointInTriXZ(px + half, pz + half, ax, az, bx, bz, cx, cz))
+                            || PointInTriXZ(px + half, pz + half, ax, az, bx, bz, cx, cz);
+                        if (!hit) continue;
+                        if (!marked[ci])
+                        {
                             marked[ci] = true;
+                            if (isConnector) conn[ci] = true;
+                        }
+                        else if (isConnector && !conn[ci])
+                        {
+                            conn[ci] = true;
+                        }
+                        if (isConnector)
+                        {
+                            // The connector surface height at the cell: the interpolated triangle height
+                            // at whichever probe points land inside, taking the highest (the rasterised
+                            // span's top). Keeps the clearance pass from mistaking the deck above for it.
+                            float h0 = TriHeightAtXZ(px, pz, ax, ay, az, bx, by, bz, cx, cy, cz);
+                            float h1 = TriHeightAtXZ(px - half, pz - half, ax, ay, az, bx, by, bz, cx, cy, cz);
+                            float h2 = TriHeightAtXZ(px + half, pz - half, ax, ay, az, bx, by, bz, cx, cy, cz);
+                            float h3 = TriHeightAtXZ(px - half, pz + half, ax, ay, az, bx, by, bz, cx, cy, cz);
+                            float h4 = TriHeightAtXZ(px + half, pz + half, ax, ay, az, bx, by, bz, cx, cy, cz);
+                            float hm = Math.Max(h0, Math.Max(h1, Math.Max(h2, Math.Max(h3, h4))));
+                            if (!float.IsNaN(hm) && hm > ctop[ci]) ctop[ci] = hm;
+                        }
                     }
                 }
             }
+            for (int ci = 0; ci < conn.Length; ci++)
+                if (conn[ci]) connectorMarked++;
             return marked;
+        }
+
+        // Barycentric height of a triangle at an XZ point (NaN when the XZ projection is degenerate).
+        // The caller only uses this for points it already knows are inside the triangle.
+        private static float TriHeightAtXZ(float px, float pz, float ax, float ay, float az,
+            float bx, float by, float bz, float cx, float cy, float cz)
+        {
+            float den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+            if (den > -1e-12f && den < 1e-12f) return float.NaN;
+            float inv = 1f / den;
+            float wa = ((bz - cz) * (px - cx) + (cx - bx) * (pz - cz)) * inv;
+            float wb = ((cz - az) * (px - cx) + (ax - cx) * (pz - cz)) * inv;
+            float wc = 1f - wa - wb;
+            return wa * ay + wb * by + wc * cy;
         }
 
         // Restores only the remembered stepped-prop spans that the ledge trim nulled, and only where doing
@@ -1861,9 +1945,9 @@ namespace BetterBannerlordNavmeshing
         //    itself is left nulled rather than becoming an orphan island.
         // Cost is one pass over the remembered spans plus a 4-neighbour flood over the tile's columns.
         private static void RestoreSteppedSpans(RcHeightfield hf, List<RcSpan>[] remembered,
-            int walkableHeight, int walkableClimb, List<int> restoredCells, out int restored,
-            out int droppedClearance, out int droppedOrphan, out int droppedPlane, out int aboveNear,
-            out int aboveFar)
+            bool[] connectorCells, int walkableHeight, int walkableClimb, List<int> restoredCells,
+            out int restored, out int droppedClearance, out int droppedOrphan, out int droppedPlane,
+            out int aboveNear, out int aboveFar, out int clearedCeilings)
         {
             restored = 0;
             droppedClearance = 0;
@@ -1871,6 +1955,7 @@ namespace BetterBannerlordNavmeshing
             droppedPlane = 0;
             aboveNear = 0;
             aboveFar = 0;
+            clearedCeilings = 0;
             int w = hf.width, h = hf.height;
 
             // pass 1: clearance gate, and tentatively restore the survivors
@@ -1883,7 +1968,9 @@ namespace BetterBannerlordNavmeshing
                 {
                     RcSpan sp = list[i];
                     if (sp.area != RcRecast.RC_NULL_AREA) continue;   // never nulled: nothing to do
-                    if (sp.next != null && sp.next.smin - sp.smax < walkableHeight)
+                    bool isConnectorCell = connectorCells != null && ci < connectorCells.Length
+                        && connectorCells[ci];
+                    if (!isConnectorCell && sp.next != null && sp.next.smin - sp.smax < walkableHeight)
                     {
                         droppedClearance++;                          // no headroom: leave it nulled
                         continue;
@@ -1902,6 +1989,11 @@ namespace BetterBannerlordNavmeshing
                     // would null the restored span right back - so the artefact span is unlinked as well.
                     // Only spans of THIS stepped prop (i.e. remembered for this cell) are touched, so a
                     // neighbouring prop's platform is never removed.
+                    //
+                    // A CONNECTOR cell goes further: the symbolic link must survive even when a real span
+                    // (the ladder's plank line, a deck slab, the hatch jamb) sits within walkableHeight
+                    // above it - that is the whole point of the clearance exemption - so any remembered
+                    // walkable span that is a low ceiling over it is unlinked too.
                     RcSpan prev = sp;
                     for (RcSpan up = sp.next; up != null; )
                     {
@@ -1921,6 +2013,15 @@ namespace BetterBannerlordNavmeshing
                         else if (up.area != RcRecast.RC_NULL_AREA)
                         {
                             aboveFar++;
+                        }
+                        if (isConnectorCell && up.area != RcRecast.RC_NULL_AREA
+                            && up.smin - sp.smax < walkableHeight && Contains(list, up))
+                        {
+                            up.area = RcRecast.RC_NULL_AREA;
+                            prev.next = next;                // unlink the low ceiling over the link
+                            clearedCeilings++;
+                            up = next;
+                            continue;
                         }
                         prev = up;
                         up = next;
@@ -1992,6 +2093,104 @@ namespace BetterBannerlordNavmeshing
             for (int i = 0; i < list.Count; i++)
                 if (ReferenceEquals(list[i], sp)) return true;
             return false;
+        }
+
+        // The connector's own span in one column. Recast rasterises a SLOPED quad as per-column spans
+        // whose smax is the cell's lower triangle edge, so the span can sit up to a slope-run BELOW the
+        // triangle's interpolated surface height at the cell centre. Matching the nearest smax to that
+        // surface height is therefore wrong: it picks the real ceiling above (e.g. the deck slab's
+        // underside) instead of the connector's own span. The connector's span is instead the highest
+        // walkable span that is still at or below the surface height (plus the climb tolerance), i.e. the
+        // span the connector surface is standing on. Returns null when no such span exists.
+        private static RcSpan ConnectorSpanAt(RcHeightfield hf, int ci, float top, int walkableClimb,
+            float cellHeight)
+        {
+            if (top == float.MinValue) return null;
+            // Span smin/smax are voxel indices RELATIVE to the heightfield's bmin.Y.
+            int target = cellHeight > 0f ? (int)Math.Round((top - hf.bmin.Y) / cellHeight) : 0;
+            int limit = target + walkableClimb;
+            RcSpan conn = null;
+            int best = int.MinValue;
+            for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+            {
+                if (sp.area == RcRecast.RC_NULL_AREA) continue;
+                if (sp.smax > limit) continue;              // this span is the ceiling, not the connector
+                if (sp.smax > best) { best = sp.smax; conn = sp; }
+            }
+            return conn;
+        }
+
+        // Clears low ceilings above the connector's own span in each connector cell, so the symbol link
+        // survives FilterWalkableLowHeightSpans. Only spans within walkableHeight above the connector are
+        // unlinked; returns how many were.
+        private static int ClearConnectorCeilings(RcHeightfield hf, bool[] connectorCells,
+            float[] connectorTop, int walkableHeight, int walkableClimb, float cellHeight)
+        {
+            int cleared = 0;
+            for (int ci = 0; ci < connectorCells.Length; ci++)
+            {
+                if (!connectorCells[ci]) continue;
+                float top = connectorTop != null && ci < connectorTop.Length ? connectorTop[ci]
+                    : float.MinValue;
+                RcSpan conn = ConnectorSpanAt(hf, ci, top, walkableClimb, cellHeight);
+                if (conn == null) continue;
+                RcSpan prev = conn;
+                for (RcSpan up = conn.next; up != null; )
+                {
+                    RcSpan next = up.next;
+                    if (up.area != RcRecast.RC_NULL_AREA && up.smin - conn.smax < walkableHeight)
+                    {
+                        up.area = RcRecast.RC_NULL_AREA;
+                        prev.next = next;         // unlink: it must not stay the ceiling
+                        cleared++;
+                        up = next;
+                        continue;
+                    }
+                    prev = up;
+                    up = next;
+                }
+            }
+            return cleared;
+        }
+
+        // Restores the walkable area of the connector's OWN compact spans after ErodeWalkableArea nulled
+        // them. A symbolic link is not a surface agents stand on, so the erosion inset that keeps ordinary
+        // geometry off ledges must not eat it away (measured: the middle of a 62 deg connector eroded to
+        // area=0 with ~2 neighbour connections while ordinary cells kept many). ErodeWalkableArea only
+        // writes compactHeightfield.areas[spanIndex] - it never unlinks span neighbours or changes span
+        // geometry (verified in RcAreas.cs) - so restoring the area alone is enough to bring the span
+        // back. Scoped connector-only: stepped-prop treads and ordinary geometry keep erosion exactly as
+        // before. Returns how many spans were restored.
+        private static int RestoreConnectorErosion(RcCompactHeightfield chf, bool[] connectorCells,
+            float[] connectorTop, int walkableClimb, float cellHeight)
+        {
+            int restored = 0;
+            int w = chf.width, h = chf.height;
+            for (int ci = 0; ci < connectorCells.Length && ci < w * h; ci++)
+            {
+                if (!connectorCells[ci]) continue;
+                float top = connectorTop != null && ci < connectorTop.Length ? connectorTop[ci]
+                    : float.MinValue;
+                if (top == float.MinValue) continue;
+                // A compact span's walkable surface is its BOTTOM (y); the connector surface funds the
+                // span's own floor, so match the nearest y (not y+h). See ConnectorSpanAt for why the
+                // surface-to-span mapping is not a simple smax match.
+                int target = cellHeight > 0f ? (int)Math.Round((top - chf.bmin.Y) / cellHeight) : 0;
+                RcCompactCell cell = chf.cells[ci];
+                int bestSpan = -1;
+                int best = int.MaxValue;
+                for (int i = cell.index; i < cell.index + cell.count; i++)
+                {
+                    int y = chf.spans[i].y;
+                    int d = Math.Abs(y - target);
+                    if (d < best) { best = d; bestSpan = i; }
+                }
+                if (bestSpan < 0 || best > walkableClimb) continue;
+                if (chf.areas[bestSpan] != RcRecast.RC_NULL_AREA) continue;   // erosion did not kill it
+                chf.areas[bestSpan] = RcRecast.RC_WALKABLE_AREA;
+                restored++;
+            }
+            return restored;
         }
 
         private static void EnqueueColumn(bool[] connected, Queue<int> queue, int x, int z, int w, int h)
@@ -2092,7 +2291,7 @@ namespace BetterBannerlordNavmeshing
 
                 int[] areaIds = RcRecast.MarkWalkableTriangles(ctx, s.MaxSlopeDegrees, vertsXyz, subTris,
                     assigned, areaMod);
-                int forcedInTile = 0, exemptInTile = 0;
+                int forcedInTile = 0, exemptInTile = 0, connectorForTile = 0;
                 if (forceWalkableTriangles != null)
                 {
                     // Synthesized ramps are walkable by design even when steeper than MaxSlopeDegrees
@@ -2118,6 +2317,19 @@ namespace BetterBannerlordNavmeshing
                             exemptInTile++;
                     }
                 }
+                if (forceWalkableTriangles != null && ledgeExemptTriangles != null)
+                {
+                    // A ladder's offset symbolic connector is the one triangle class flagged in BOTH
+                    // masks (forced walkable AND ledge-exempt); the pair singles it out for the clearance
+                    // exemption below. Ordinary ramp / tread triangles are only ever in one mask.
+                    for (int k = 0; k < assigned; k++)
+                    {
+                        int src = tileList[k];
+                        if (src >= 0 && src < forceWalkableTriangles.Length && src < ledgeExemptTriangles.Length
+                            && forceWalkableTriangles[src] && ledgeExemptTriangles[src])
+                            connectorForTile++;
+                    }
+                }
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
@@ -2130,10 +2342,17 @@ namespace BetterBannerlordNavmeshing
                 // exactly those afterwards. Identifying them by area id is impossible: the filter
                 // overwrites the id it was given.
                 List<RcSpan>[] steppedSpans = null;
+                bool[] connectorCells = null;
+                float[] connectorTop = null;
                 if ((forcedInTile > 0 || exemptInTile > 0) && s.UseLedgeFilter)
                 {
-                    bool[] steppedCells = MarkSteppedCells(hf, vertsXyz, subTris, tileList,
-                        forceWalkableTriangles, ledgeExemptTriangles, s.VoxelCellSizeMeters);
+                    bool[] steppedCells;
+                    int connectorMarked;
+                    steppedCells = MarkSteppedCells(hf, vertsXyz, subTris, tileList,
+                        forceWalkableTriangles, ledgeExemptTriangles, s.VoxelCellSizeMeters,
+                        out connectorCells, out connectorTop, out connectorMarked);
+                    r.ConnectorForcedInTile = connectorForTile;
+                    r.ConnectorMarkedCells = connectorMarked;
                     int marked = 0;
                     for (int ci = 0; ci < steppedCells.Length; ci++)
                         if (steppedCells[ci]) marked++;
@@ -2171,16 +2390,18 @@ namespace BetterBannerlordNavmeshing
                     // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
                     // current cap, and a remembered span comes back only when doing so is sound.
                     int restored, droppedClearance, droppedOrphan, droppedPlane, aboveNear, aboveFar;
+                    int clearedCeilings;
                     var restoredCells = new List<int>();
-                    RestoreSteppedSpans(hf, steppedSpans, walkableHeight, walkableClimb, restoredCells,
-                        out restored, out droppedClearance, out droppedOrphan, out droppedPlane,
-                        out aboveNear, out aboveFar);
+                    RestoreSteppedSpans(hf, steppedSpans, connectorCells, walkableHeight, walkableClimb,
+                        restoredCells, out restored, out droppedClearance, out droppedOrphan,
+                        out droppedPlane, out aboveNear, out aboveFar, out clearedCeilings);
                     r.SteppedRestoredSpans = restored;
                     r.SteppedDroppedClearance = droppedClearance;
                     r.SteppedDroppedOrphan = droppedOrphan;
                     r.SteppedDroppedPlane = droppedPlane;
                     r.SteppedAboveNear = aboveNear;
                     r.SteppedAboveFar = aboveFar;
+                    r.ConnectorClearedCeilings = clearedCeilings;
                     if (restoredCells.Count > 0)
                     {
                         // World XZ of the restored cells: the prune pass uses them as per-face provenance
@@ -2196,11 +2417,28 @@ namespace BetterBannerlordNavmeshing
                         r.SteppedRestoredCellXz = cellXz;
                     }
                 }
+                if (connectorCells != null)
+                {
+                    // A ladder's symbolic connector must not die under the ladder's own plank / a deck
+                    // slab / the hatch jamb, and it must not turn the floor beneath it into a low ceiling:
+                    // unlink any walkable span within walkableHeight above the connector's OWN span in
+                    // its columns, BEFORE FilterWalkableLowHeightSpans runs. This is the clearance
+                    // exemption; it is scoped to the connector's cells and to the connector's own span.
+                    r.ConnectorClearedCeilings += ClearConnectorCeilings(hf, connectorCells, connectorTop,
+                        walkableHeight, walkableClimb, s.CellHeightMeters);
+                }
                 // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
 
                 RcCompactHeightfield chf = RcCompacts.BuildCompactHeightfield(ctx, walkableHeight, walkableClimb, hf);
                 RcAreas.ErodeWalkableArea(ctx, walkableRadius, chf);
+                if (connectorCells != null)
+                {
+                    // Erosion must not eat the symbolic connector: a link is not a surface agents stand
+                    // on, so the ledge keep-out inset does not apply to it. Area-only restore.
+                    r.ConnectorErosionExempt = RestoreConnectorErosion(chf, connectorCells, connectorTop,
+                        walkableClimb, s.CellHeightMeters);
+                }
                 RcRegions.BuildRegionsMonotone(ctx, chf, minRegionArea, mergeRegionArea);
 
                 RcContourSet cset = RcContours.BuildContours(ctx, chf, maxSimplificationError,
