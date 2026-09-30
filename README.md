@@ -604,12 +604,50 @@ becomes a **1.25 m = 5-cell mesh gap** after erosion and the contour inset. The 
 the measured case with margin (`5` is the minimum that works; `4` is one cell short and can serve as a
 conservative cap if a bridge ever appears where it should not). `0` disables stitching.
 
+**V3.17: the cross-tile (merge-level) clearance probe is obstacle-dense.** The merge-stitch runs after the merge
+and re-checks clearance against the *input soup* (a coarse XZ grid of soup triangles); the per-tile pass above
+checks the tile's *heightfield spans* instead, which do represent solids. The soup probe only had surface
+triangles to work with, and it sampled a single line at up to one cell (0.25 m) spacing, so it missed obstacles
+two ways: a thin block could fall between samples or lie beside the line, and - because a solid's interior is
+covered by no triangle at all (a box's vertical faces project to a degenerate segment in XZ) - a sample *inside*
+the block was seen by nothing. The probe now:
+
+1. samples the stitch line at `StitchProbeSpacingMeters` = **0.1 m** (never coarser),
+2. also samples 4 parallel lines **±0.1 / ±0.2 m** perpendicular (`StitchProbeOffsets`), i.e. across the width of
+   the stitch quad, where a thin obstacle under the bridge would hide,
+3. and for each 0.1 m sub-segment additionally refuses when a triangle that spans the envelope is **crossed** by
+   it (`SegSegCross2`, proper interior crossings; mere touches are left to the inclusive point tests).
+
+The envelope rule itself is unchanged (`envLo = soupFloor + 0.6*ch`, `envHi = soupFloor + walkableHeight*ch`), the
+pass stays deterministic, and with the stitch off nothing runs.
+
+Measured on the recorded Birtu snapshot (`--ramps on|off`, cap 6):
+
+| | pairs | added | refused | mesh | islands |
+|---|---|---|---|---|---|
+| before (V3.16) | 745/747 | 158/164 | 666/665 | V=32836/32930 F=50957/51131 | 5 |
+| after (V3.17) | 748/750 | **0/0** | 748/750 | V=32405/32499 F=50525/50699 | 5 |
+
+The probe now *finds* the same pairs and refuses all of them, because every seam it proposes on Birtu sits over
+terrain that rises more than `0.6*ch` inside the gap - the rule as written refuses that, and the old `added=164`
+were pairs that passed only because the sparse samples happened to miss the rising ground. Nothing observable
+regressed: `--pair` on the two previously-fixed gap locations
+(`268.46,309.348,20.5|274.718,316.501,20.5` and `327.099,285.436,20.5|331.135,286.884,20.5`) still reports
+`PASS`, `coverage=100.0%`, `gapMaxRun=0`, `ratio=1.065`/`1.131` - and they pass with the stitch *off* too, so
+they never depended on it; and the `--coverage` tables for all 18 `stairs_bo` / `european_castle_ladder` /
+`wooden_platform_stairs_a` instances are **bit-identical** before and after in both modes. The 164 faces the pass
+used to add were what kept 82 small fragments (268 faces) out of the pruner (ON: `prune: removed 882 islands,
+13704 faces` -> `964 islands, 13972 faces`); those fragments are pruned now since the only thing ever joining them
+was an unverified stitch. If the merge-stitch is to keep bridging seams on *sloping* ground, the lever is the
+envelope's lower bound (`0.6*ch` sits below `walkableClimb`, so a step up to the climb counts as an obstacle) -
+that is a rule change, deliberately not made here.
+
+
 Harness `Test 18` (union-find connectivity):
 
 | scenario | cap | result |
 |---|---|---|
-| 1-cell raster seam, clear air | 5 | connected (2 faces added) |
-| same seam | 4 | broken (calibration row: one cell short of the 5-cell gap) |
+| 1-cell raster seam, clear air | 5 | connected (2 faces added) || same seam | 4 | broken (calibration row: one cell short of the 5-cell gap) |
 | same seam | 0 (off) | broken |
 | same seam with a wall in the gap | 5 | broken (refused) |
 | same seam with a low ceiling | 5 | broken (refused) |
@@ -817,6 +855,7 @@ through the doorway plus a walled-shut control:
 | b) door open, ramps on | connected: lower->threshold, threshold->upper, lower->upper |
 | c) door walled shut, ramps on, 2.0 m wall | **not connected** |
 | d) door walled shut, ramps on, 0.5 m wall, stitch off | **not connected** (the ramp does not tunnel) |
+| e) door walled shut, ramps on, 0.5 m wall, stitch on | **not connected** (V3.17: the merge-stitch refuses) |
 | f) door open, ramps on, stitch off | connected (both threshold legs) |
 
 The connection in (b)/(f) is made by the doorway **sill** (the top of the wall under the opening, i.e. the floor
@@ -827,11 +866,9 @@ their spans merge with what the prop stands on, and a pad authored inside whatev
 fabricate a walkable surface there (over a thin partition it would sit in the next room's air). They now reach at
 most half a cell past the prop's own bottom / top-band footprint.
 
-One pre-existing behaviour showed up while pinning this down and is **reported, not fixed**: the merge-stitch pass
-(cap 4-6 cells) bridges a ~0.3 m air gap between two surfaces at the same level *over* a thin (0.5 m) wall block,
-because the block's solid volume carries no walkable span at that level (case (e); case (d) with the stitch off
-proves the ramp is not the cause). Case (c) is therefore asserted at a realistic 2.0 m castle-wall thickness, which
-is beyond the stitch cap.
+Case (e) was the V3.16 residual and is fixed in V3.17 (see *Stitching*): the merge-stitch pass used to bridge the
+~0.3 m air gap over the wall block because its clearance probe sampled the stitch line too sparsely and could not
+see the block's solid volume at all.
 
 ### Terrain holes (false lids)
 
@@ -901,7 +938,7 @@ NavMesh: v2: stitch: added=<n> faces across tiles (cap=<n> cells)               
 NavMesh: v2: stepped tris: forced-walkable=<n> ledge-exempt=<n>/<m> (ramps walkable regardless of slope; stepped-prop treads kept off the ledge trim)   <- only when NavMeshVoxelSteppedProps=true
 NavMesh: v2: stepped: markedCells=<n> restored=<n> droppedClearance=<n> droppedOrphan=<n> droppedPlane=<n> aboveNear=<n> aboveFar=<n> (ledge-trim exemption, gated per span)   <- only when NavMeshVoxelSteppedProps=true and stepped props are present
 NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
-NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
+NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune (clearance probe: 0.1 m line sampling + a +/-0.2 m perpendicular band + crossing test, see Stitching)
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands
 NavMesh: v2: prune: exempt-formed islands=<n> faces=<n> largest=<n> at (x,y,z) (restored stepped-prop leftovers, pruned regardless of the cap)   <- only when NavMeshVoxelSteppedProps=true and such an island exists
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)

@@ -1459,43 +1459,111 @@ namespace BetterBannerlordNavmeshing
             }
         }
 
-        // Walks the straight line between the two stitch edges and refuses when solid geometry spans the
-        // envelope OVER that line (a wall/door in the gap, or a ceiling within walkableHeight). Testing
-        // the line rather than a box keeps walls beside the corridor from refusing a valid stitch.
+        // Walks the stitch line (plus parallel lines across the bridge's own footprint) and refuses when
+        // solid geometry spans the envelope OVER it (a wall/door in the gap, or a ceiling within
+        // walkableHeight). Testing thin lines rather than a box keeps walls beside the corridor from
+        // refusing a valid stitch. The spacing is well under a cell and the offsets cover the width of
+        // the stitch quad, so a thin obstacle cannot sit between samples or beside the centre line; each
+        // sub-segment is additionally tested for *crossing* the triangle's XZ projection, because a
+        // solid's interior is covered by no triangle at all (a box's vertical faces project to a
+        // degenerate segment, so a point test inside the solid can never see them).
+        private const float StitchProbeSpacingMeters = 0.1f;
+        private static readonly float[] StitchProbeOffsets = { -0.2f, -0.1f, 0.1f, 0.2f };
+
         private static bool GapEnvelopeSolid(float[] soupVerts, int[] soupTris,
             Dictionary<long, List<int>> grid, List<int> bigList, float cellSize,
             float x0, float z0, float x1, float z1, float cs, float yLo, float yHi)
         {
             float dx = x1 - x0, dz = z1 - z0;
-            int steps = Math.Max(1, (int)Math.Ceiling(Math.Max(Math.Abs(dx), Math.Abs(dz)) / cs));
-            if (steps <= 1)
+            float len = (float)Math.Sqrt((double)dx * dx + (double)dz * dz);
+            if (len < 1e-6f)
                 return false;
-            for (int k = 1; k < steps; k++)
+            int steps = Math.Max(2, (int)Math.Ceiling(len / StitchProbeSpacingMeters));
+            // Perpendicular unit vector of the gap direction: offsetting along it moves across the
+            // stitch quad's own width, which is where a thin obstacle under the bridge would hide.
+            float nx = -dz / len, nz = dx / len;
+            for (int band = -1; band < StitchProbeOffsets.Length; band++)
             {
-                float px = x0 + dx * k / steps;
-                float pz = z0 + dz * k / steps;
-                List<int> list;
-                if (grid.TryGetValue(SoupCellKey((int)Math.Floor(px / cellSize), (int)Math.Floor(pz / cellSize)),
-                        out list))
+                float off = band < 0 ? 0f : StitchProbeOffsets[band];
+                float sx = x0 + nx * off, sz = z0 + nz * off;
+                float ex = x1 + nx * off, ez = z1 + nz * off;
+                for (int k = 0; k < steps; k++)
                 {
-                    for (int i = 0; i < list.Count; i++)
-                        if (TriCoversPoint(soupVerts, soupTris, list[i], px, pz, yLo, yHi))
+                    float ax = sx + (ex - sx) * k / steps;
+                    float az = sz + (ez - sz) * k / steps;
+                    float bx = sx + (ex - sx) * (k + 1) / steps;
+                    float bz = sz + (ez - sz) * (k + 1) / steps;
+                    // Candidate triangles: the coarse cells this sub-segment (<= 0.1 m) touches.
+                    for (int e = 0; e < 3; e++)
+                    {
+                        float qx = e == 0 ? ax : (e == 1 ? bx : (ax + bx) * 0.5f);
+                        float qz = e == 0 ? az : (e == 1 ? bz : (az + bz) * 0.5f);
+                        List<int> list;
+                        if (!grid.TryGetValue(SoupCellKey((int)Math.Floor(qx / cellSize),
+                                (int)Math.Floor(qz / cellSize)), out list))
+                            continue;
+                        for (int i = 0; i < list.Count; i++)
+                            if (TriBlocksSpan(soupVerts, soupTris, list[i], ax, az, bx, bz, yLo, yHi))
+                                return true;
+                    }
+                    for (int i = 0; i < bigList.Count; i++)
+                        if (TriBlocksSpan(soupVerts, soupTris, bigList[i], ax, az, bx, bz, yLo, yHi))
                             return true;
                 }
             }
-            for (int i = 0; i < bigList.Count; i++)
-            {
-                float tdx = x1 - x0, tdz = z1 - z0;
-                int tsteps = Math.Max(1, (int)Math.Ceiling(Math.Max(Math.Abs(tdx), Math.Abs(tdz)) / cs));
-                for (int k = 1; k < tsteps; k++)
-                {
-                    float px = x0 + tdx * k / tsteps;
-                    float pz = z0 + tdz * k / tsteps;
-                    if (TriCoversPoint(soupVerts, soupTris, bigList[i], px, pz, yLo, yHi))
-                        return true;
-                }
-            }
             return false;
+        }
+
+        // The triangle spans the envelope vertically AND its XZ projection covers the sub-segment (a
+        // sample point inside it, or one of its edges crossing the sub-segment).
+        private static bool TriBlocksSpan(float[] v, int[] tris, int t,
+            float ax, float az, float bx, float bz, float yLo, float yHi)
+        {
+            if (!TriSpansEnvelope(v, tris, t, yLo, yHi))
+                return false;
+            if (TriCoversPoint(v, tris, t, ax, az, yLo, yHi))
+                return true;
+            if (TriCoversPoint(v, tris, t, bx, bz, yLo, yHi))
+                return true;
+            int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+            if (SegSegCross2(ax, az, bx, bz, v[a * 3], v[a * 3 + 2], v[b * 3], v[b * 3 + 2]))
+                return true;
+            if (SegSegCross2(ax, az, bx, bz, v[b * 3], v[b * 3 + 2], v[c * 3], v[c * 3 + 2]))
+                return true;
+            if (SegSegCross2(ax, az, bx, bz, v[c * 3], v[c * 3 + 2], v[a * 3], v[a * 3 + 2]))
+                return true;
+            return false;
+        }
+
+        private static bool TriSpansEnvelope(float[] v, int[] tris, int t, float yLo, float yHi)
+        {
+            int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+            float minY = Math.Min(v[a * 3 + 1], Math.Min(v[b * 3 + 1], v[c * 3 + 1]));
+            float maxY = Math.Max(v[a * 3 + 1], Math.Max(v[b * 3 + 1], v[c * 3 + 1]));
+            return maxY >= yLo && minY <= yHi;
+        }
+
+        // 2D cross product of (b - a) x (p - a).
+        private static double Cross2(float ax, float az, float bx, float bz, float px, float pz)
+        {
+            return (double)(bx - ax) * (pz - az) - (double)(bz - az) * (px - ax);
+        }
+
+        // Segment/segment intersection in XZ. Only a proper (interior) crossing counts; a mere touch or
+        // a collinear overlap is left to the inclusive point tests above, which keeps the probe from
+        // refusing a stitch over a triangle it only grazes.
+        private static bool SegSegCross2(float ax, float az, float bx, float bz,
+            float cx, float cz, float dx, float dz)
+        {
+            double d1 = Cross2(cx, cz, dx, dz, ax, az);
+            double d2 = Cross2(cx, cz, dx, dz, bx, bz);
+            if ((d1 >= 0.0 && d2 >= 0.0) || (d1 <= 0.0 && d2 <= 0.0))
+                return false;
+            double d3 = Cross2(ax, az, bx, bz, cx, cz);
+            double d4 = Cross2(ax, az, bx, bz, dx, dz);
+            if ((d3 >= 0.0 && d4 >= 0.0) || (d3 <= 0.0 && d4 <= 0.0))
+                return false;
+            return true;
         }
 
         // Conservative point test: the triangle's Y range spans the envelope and its XZ bbox covers the
