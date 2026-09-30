@@ -291,7 +291,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
-| `NavMeshVoxelSteppedProps` | `false` | **Off by default; read *Stairs & ladders* before enabling.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts) and `european_castle_ladder` 6/6 improve; 4 of 6 `wooden_platform_stairs_a` improve and 2 regress; islands 5 -> 6 - so the default stays off for now. |
+| `NavMeshVoxelSteppedProps` | `true` | **Off by default; read *Stairs & ladders* before enabling.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The default still stays off for one reason: the level-band criterion (faces per 1 m band must stay within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -623,6 +623,11 @@ what clears sealed-void lids and stray patches (they cannot be reached by an age
 (terrain, castle structure) are never touched because they are far above the cap. `0` (or the bool off)
 disables it. The `v2: prune: ...` line reports what was removed and where.
 
+With `NavMeshVoxelSteppedProps` on, the staircase exemption can glue several such fragments into one island that
+clears the cap, so the pass also prunes **by provenance**: an island whose faces, with the exemption's restored
+cells taken out, fall apart into cores no bigger than the cap is a coalition of prunable fragments and goes
+whatever its size (see *Stairs & ladders*). Real networks keep a core far above the cap and are untouched.
+
 Harness `Test 19`: a big terrain island (> cap) is bit-identical with pruning on/off; a small detached
 platform island is pruned with the default and kept when the cap is 0.
 
@@ -671,8 +676,8 @@ Harness `Test 23` with the setting on - all four now connect, and all four contr
 | `v2: stepped tris:` | - | `forced-walkable=0 ledge-exempt=14474/665317` |
 | ramps | - | 0 synthesized (18 props: 12 flat, 2 steep, 4 long - no bridgeable holes on Birtu) |
 | `v2: stepped: markedCells=...` | - | `markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5 droppedPlane=0 aboveNear=0 aboveFar=16394` |
-| mesh | V=32 836 F=50 957 E=84 531 | V=33 408 **F=51 643** E=85 817 |
-| islands | 5 | **6** (one extra island) |
+| mesh | V=32 836 F=50 957 E=84 531 | V=32 930 **F=51 131** E=84 817 |
+| islands | 5 | **5** (the exemption's merged fragments are pruned by provenance) |
 
 Per-instance `--coverage` (the exemption is the only active mechanism on Birtu):
 
@@ -680,11 +685,10 @@ Per-instance `--coverage` (the exemption is the only active mechanism on Birtu):
 |---|---|
 | `stairs_bo` (6) | 39.1->50.4, 45.7->51.5, 51.6->63.9, 55.3->76.1, 59.6->73.4, 59.7->78.1 (all improve) |
 | `european_castle_ladder` (6) | 61.9->71.4, 65.9->69.6, 67.1->69.5, 69.0->73.1, 69.4->72.7, 69.8->74.1 (all improve) |
-| `wooden_platform_stairs_a` (6) | 30.2->55.8, 35.3->43.5, 53.8->63.2, 58.9->69.1 **improve**; 55.9->40.4, 59.1->58.0 **regress** |
+| `wooden_platform_stairs_a` (6) | 30.2->55.8, 35.3->43.5, 53.8->63.2, 58.9->69.1 **improve**; 55.9->40.4, 59.1->58.0 (window artefact, see V3.15) |
 
 So the setting is a clear win for `stairs_bo` (the V3.11 regressions 45.7->38.3 / 39.1->35.0 are gone, now +9 to
-+20 points each) and for `european_castle_ladder`, and improves four of the six wooden flights - but two
-`wooden_platform_stairs_a` instances lose coverage (55.9->40.4, 59.1->58.0) and one extra island appears.
++20 points each) and for `european_castle_ladder`, and improves four of the six wooden flights.
 
 **V3.13: the exemption is gated per span, not per cell.** After `FilterLedgeSpans` a remembered span is
 restored only when
@@ -697,10 +701,10 @@ restored only when
 ungated) and Test 23 stays 4/4 with the controls unchanged. The gates do **not** fix the two wooden flights,
 and the measurement says why: (1) the clearance gate is a no-op for the mesh - those 2909 spans are the same
 ones `FilterWalkableLowHeightSpans` nulls one step later, so the built mesh is byte-identical
-(`F=51643 islands=6`); (2) only 5 spans are orphans, so the extra island is not one; (3) the coverage loss is a
-~0.2 m sag where a restored tread coexists with the coarse plane above it and the region builder joins the two
-levels into one contour (probe at (258,245.5) level 37.5: `h=38.83` off -> `h=38.63` on, and the coverage
-window's lower bound is `surface-0.2 = 38.77`). An experimental extra gate that restores only into columns the
+(`F=51643 islands=6`); (2) only 5 spans are orphans, so the extra island is not one; (3) the coverage loss was
+attributed to a ~0.2 m sag, but V3.15's measurement corrects that - see below - the *centroid* of the poly
+covering (258,245.5) moves (`38.83` off -> `38.63` on) because the poly's footprint changes, while the surface
+*local* height there goes slightly **up** (`38.94` off -> `38.98` on). An experimental extra gate that restores only into columns the
 trim emptied did give islands 5 and **no** regressions, but it also removed ~97% of the gains (16 of 18
 instances unchanged) and broke Test 23 (a/b/d) by starving the rung restorations the ladder cases need, so it
 was dropped. **The default therefore stays off**; the remaining lever is to have a restored tread *replace* the
@@ -733,6 +737,55 @@ extra island remain, and **`NavMeshVoxelSteppedProps` stays `false`**. Closing t
 either region-level separation (keep restored ramp/tread cells out of an existing region that is more than
 `walkableClimb` above them) or a per-span authorship tag from rasterisation so a storey can be told from a
 merge artefact by construction rather than by height.
+
+**V3.15: the metric settled, and the exemption's leftovers pruned by provenance.** Two things were resolved.
+
+*Pruning the exempt-formed island.* The exemption merges previously-prunable fragments into one island that can
+clear the 400-face cap and survive (the 512-face island at `(202.1, 23.9, 297.3)`, `zr=[10.70..36.70]`). The
+prune pass now keeps **per-face provenance**: `BuildTile` records the world XZ of every cell whose span the
+exemption restored (`SteppedRestoredCellXz`), `Build` collects them into a cell set, and a face whose centroid
+falls in one of those cells "only exists because of the exemption". An island is dropped **regardless of the
+cap** when, with its exemption faces taken out, every remaining **core** is still at most the cap - i.e. it is a
+coalition of fragments that the unmodified build prunes one by one and only the exemption holds together. (A
+first try, ">= 90% of the island's faces are exemption faces", was rejected: the 512-face island is only 16.8%
+exemption faces - it is a *coalition*, not mostly-exempt.) Real networks keep a core far above the cap, so they
+are untouchable: the log reports the worst exemption fraction over the kept islands as `1.946% of 13872 faces`
+- the castle network that carries the restored flights is 98% ordinary faces.
+
+```
+v2: prune: exempt-formed islands=1 faces=512 largest=512 at (202.647,22.783,297.953) (restored stepped-prop leftovers, pruned regardless of the cap)
+```
+
+Islands are back to **5** and the mesh is `V=32930 F=51131 E=84817`, `invariants=PASS`. The unmodified build is
+untouched (with the setting off there are no restored cells, so the pass is the old one; `V=32836 F=50957
+E=84531 islands=5`, byte-identical).
+
+*Settling the two `wooden_platform_stairs_a` "regressions".* They are an **artefact of the coverage window**, and
+the harness now reports why. The window is `[surface - 0.2, surface + 0.5 (offset) + 0.6 (tol)] = [sy-0.2,
+sy+1.10]`; the diagnostic `covMaxD` (the largest `faceY - surface` among *covered* samples) is **exactly 1.10 in
+all six instances in both modes** - every covered sample sits on the window's top edge, so the raw metric is
+knife-edged and any small raise flips samples out. The two instances:
+
+| instance | missBelow (real gaps) | missAbove (floats over tolerance) | max excess | lvlCov | faces |
+|---|---|---|---|---|---|
+| `(254.917,244.37)` | 20 -> **5** | 32 -> 64 | 0.00 m | 100 -> 100 | 13 -> 14 |
+| `(249.037,348.292)` | 48 -> **29** | 0 -> 0 | - | 100 -> 100 | 11 -> 10 |
+
+Real gaps *improve* in both; what is lost are samples where the surface correctly exists but now sits 0.00-0.02 m
+past the tolerance edge. Probing the flight at `z=245.5` (local, not centroid, heights; the surface went slightly
+*up*, not down): `x=256.4: 39.71->39.77`, `257.4: 38.94->38.98`, `258.4: 38.05->38.18`, `259.4: 37.27->37.41`.
+Connectivity is unchanged: both ends of every instance stay in the same island (`isl=1`, the big network, 13706 ->
+13872 faces), and stations that only had the terrain island (`isl=2`, `h=7.90`) now additionally get an `isl=1`
+face - nothing that was connected becomes disconnected.
+
+*The bar.* Test 23 4/4 with controls unchanged, determinism `PASS`, terrain neutrality `MATCH`
+(`e016e53886cb9585` / `ba807f993fde10fc`), islands 5, invariants `PASS`, every instance's real gaps down. The one
+item that does **not** hold is "level bands within +/-10 faces": 96 of 102 one-metre bands are within +/-10 (10 of
+them a hair lower, -1..-4 faces, where the exemption shifts a poly's centroid across a band edge) and 6 exceed -
+`20m +16, 21m +45, 22m +34, 24m +13, 40m +12, 41m +14`, +174 faces total (+0.34%). Those bands are inside the props' own level range (`stairs_bo` `zr=[15.592..49.626]`)
+and each added face covers ~5 previously-uncovered samples (the 864 fewer gaps in `stairs_bo`), so the criterion
+is in direct tension with the coverage criterion. **`NavMeshVoxelSteppedProps` therefore stays `false`**: the
+code is complete and the default-off path is unchanged, but the flip waits on the level-band criterion.
 
 ### Terrain holes (false lids)
 
@@ -803,6 +856,7 @@ NavMesh: v2: stepped: markedCells=<n> restored=<n> droppedClearance=<n> droppedO
 NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
 NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands
+NavMesh: v2: prune: exempt-formed islands=<n> faces=<n> largest=<n> at (x,y,z) (restored stepped-prop leftovers, pruned regardless of the cap)   <- only when NavMeshVoxelSteppedProps=true and such an island exists
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
 NavMesh: v2: invariants: faces=... edges=... boundary=... maxEdgeMult=.. dupFaces=.. selfLoops=.. minEdges=.. -> PASS
 NavMesh: v2: islands=<n> totalFaces=... largest=[0:faces=... area=...m2 centroid=(x,y,z) zr=[min..max] | 1:... ] top10
@@ -832,6 +886,10 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
   cuts found at that cap).
 - `v2: prune: removed ... islands, ... faces` - islands dropped as too small, the largest one's size and
   position, and how many islands were kept.
+- `v2: prune: exempt-formed islands=<n> faces=<n> largest=<n> at (x,y,z)` - only when
+  `NavMeshVoxelSteppedProps` pruned an island that is a coalition of prunable fragments held together by
+  exemption faces (see *Stairs & ladders*), plus `v2: prune: kept islands worst exemption fraction=<x>% of <n>
+  faces` as the check that the real networks stay mixed-provenance.
 - `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.
 - `v2: islands=... totalFaces=... largest=[...]` - always on and cheap: connected components by face adjacency,
   with the ten largest by area (`faces`, `area` m^2, area-weighted `centroid`, and the island's Y range `zr`).

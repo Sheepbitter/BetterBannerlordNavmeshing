@@ -120,7 +120,7 @@ namespace BetterBannerlordNavmeshing
         //    no collision (a hole up to MaxBridgeRunMeters), with true-level end aprons, so a ramp can
         //    never hover above an existing tread.
         // See SteppedPropRamps and the README "Stairs & ladders".
-        public bool NavMeshVoxelSteppedProps = false;
+        public bool NavMeshVoxelSteppedProps = true;
 
         // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
         // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance

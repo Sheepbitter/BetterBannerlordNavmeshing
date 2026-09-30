@@ -159,6 +159,7 @@ namespace BetterBannerlordNavmeshing
             public int SteppedDroppedPlane;     // merge-plane spans suppressed above a restored span
             public int SteppedAboveNear;        // restored spans with a walkable span within climb above
             public int SteppedAboveFar;         // restored spans with a walkable span further above
+            public List<float> SteppedRestoredCellXz;  // world XZ of cells whose span the exemption restored
         }
 
         public sealed class VoxelMeshResult
@@ -760,14 +761,36 @@ namespace BetterBannerlordNavmeshing
             // unreachable fragment never reaches the engine. Never touches the big networks.
             if (s.PruneIsolatedIslands && s.PruneMaxIslandFaces > 0 && merged.Tris.Count >= 3)
             {
-                int prunedIslands, prunedFaces, prunedLargest, keptIslands;
-                float px, py, pz;
-                PruneSmallIslands(merged, s.PruneMaxIslandFaces, out prunedIslands, out prunedFaces,
-                    out prunedLargest, out px, out py, out pz, out keptIslands);
-                Log(log, "v2: prune: removed " + prunedIslands + " islands, " + prunedFaces
+                // Per-face provenance for the exemption: the cells whose walkable span only exists because
+                // the stepped-props exemption restored it. An island that is (almost) all such faces is a
+                // merged stepped-prop leftover rather than a walkable network, and is pruned whatever its
+                // size; an island that merely contains some restored faces (the castle network with its
+                // flights) stays mixed provenance and is kept.
+                HashSet<long> steppedCells = null;
+                float qcs = s.VoxelCellSizeMeters;
+                for (int i = 0; i < results.Length; i++)
+                {
+                    List<float> cellXz = results[i] != null ? results[i].SteppedRestoredCellXz : null;
+                    if (cellXz == null) continue;
+                    if (steppedCells == null) steppedCells = new HashSet<long>();
+                    for (int k = 0; k + 1 < cellXz.Count; k += 2)
+                        steppedCells.Add(CellKey(cellXz[k], cellXz[k + 1], qcs));
+                }
+                var pst = new PruneStats();
+                PruneSmallIslands(merged, s.PruneMaxIslandFaces, steppedCells, qcs, pst);
+                Log(log, "v2: prune: removed " + pst.RemovedIslands + " islands, " + pst.RemovedFaces
                     + " faces (<=" + s.PruneMaxIslandFaces + " faces each); largest removed="
-                    + prunedLargest + " at (" + F(px) + "," + F(py) + "," + F(pz) + "); kept="
-                    + keptIslands + " islands");
+                    + pst.LargestRemoved + " at (" + F(pst.LargestX) + "," + F(pst.LargestY) + ","
+                    + F(pst.LargestZ) + "); kept=" + pst.KeptIslands + " islands");
+                if (pst.ExemptIslands > 0)
+                    Log(log, "v2: prune: exempt-formed islands=" + pst.ExemptIslands + " faces="
+                        + pst.ExemptFaces + " largest=" + pst.ExemptLargest + " at (" + F(pst.ExemptX)
+                        + "," + F(pst.ExemptY) + "," + F(pst.ExemptZ)
+                        + ") (restored stepped-prop leftovers, pruned regardless of the cap)");
+                if (pst.MaxKeptFaces > 0)
+                    Log(log, "v2: prune: kept islands worst exemption fraction="
+                        + F((float)(pst.MaxKeptExemptFraction * 100.0)) + "% of " + pst.MaxKeptFaces
+                        + " faces (mixed provenance, no kept island is exempt-formed)");
             }
 
             int mergedVertices = merged.X.Count;
@@ -949,89 +972,188 @@ namespace BetterBannerlordNavmeshing
         // Removes every face-adjacency island with at most maxFaces faces and compacts the vertex array.
         // Reports the removed island/face counts, the largest removed island (faces + centroid) and the
         // islands kept. Vertex/face removal only, so the invariant gate is unaffected.
-        private static void PruneSmallIslands(MergeOutput o, int maxFaces,
-            out int removedIslands, out int removedFaces, out int largestRemoved, out float largestX,
-            out float largestY, out float largestZ, out int keptIslands)
+        private static void IslandCentroid(MergeOutput o, int[] fp, int nf, int root,
+            ref float x, ref float y, ref float z)
         {
-            removedIslands = 0;
-            removedFaces = 0;
-            largestRemoved = 0;
-            largestX = 0f;
-            largestY = 0f;
-            largestZ = 0f;
-            keptIslands = 0;
+            double sx = 0, sy = 0, sz = 0;
+            int n = 0;
+            for (int f = 0; f < nf; f++)
+            {
+                if (FaceFind(fp, f) != root)
+                    continue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int v = o.Tris[f * 3 + k];
+                    sx += o.X[v];
+                    sy += o.Y[v];
+                    sz += o.Z[v];
+                    n++;
+                }
+            }
+            if (n > 0)
+            {
+                x = (float)(sx / n);
+                y = (float)(sy / n);
+                z = (float)(sz / n);
+            }
+        }
+
+        private static long CellKey(float x, float z, float cs)
+        {
+            int ix = (int)Math.Floor(x / cs);
+            int iz = (int)Math.Floor(z / cs);
+            return unchecked(((long)ix << 32) | (uint)iz);
+        }
+
+        private sealed class PruneStats
+        {
+            public int RemovedIslands, RemovedFaces, LargestRemoved, KeptIslands;
+            public float LargestX, LargestY, LargestZ;
+            public int ExemptIslands, ExemptFaces, ExemptLargest;
+            public float ExemptX, ExemptY, ExemptZ;
+            public double MaxKeptExemptFraction;
+            public int MaxKeptFaces;
+        }
+
+        private static void PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,
+            float cs, PruneStats st)
+        {
+            st.RemovedIslands = 0;
+            st.RemovedFaces = 0;
+            st.LargestRemoved = 0;
+            st.LargestX = 0f;
+            st.LargestY = 0f;
+            st.LargestZ = 0f;
+            st.KeptIslands = 0;
+            st.ExemptIslands = 0;
+            st.ExemptFaces = 0;
+            st.ExemptLargest = 0;
+            st.ExemptX = 0f;
+            st.ExemptY = 0f;
+            st.ExemptZ = 0f;
+            st.MaxKeptExemptFraction = 0.0;
+            st.MaxKeptFaces = 0;
 
             int nf = o.Tris.Count / 3;
             if (nf == 0)
                 return;
 
             var fp = new int[nf];
-            for (int i = 0; i < nf; i++) fp[i] = i;
+            var fpCore = new int[nf];
+            for (int i = 0; i < nf; i++) { fp[i] = i; fpCore[i] = i; }
             var edgeFirst = new Dictionary<long, int>();
+            var edgeFirstCore = new Dictionary<long, int>();
+            var exemptFace = new bool[nf];
             for (int f = 0; f < nf; f++)
             {
                 int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
                 FaceUnionEdge(edgeFirst, fp, f, a, b);
                 FaceUnionEdge(edgeFirst, fp, f, b, c);
                 FaceUnionEdge(edgeFirst, fp, f, c, a);
+                if (steppedCells != null)
+                {
+                    float cx = 0, cz = 0;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int v = o.Tris[f * 3 + k];
+                        cx += o.X[v];
+                        cz += o.Z[v];
+                    }
+                    exemptFace[f] = steppedCells.Contains(CellKey(cx / 3f, cz / 3f, cs));
+                }
+                if (exemptFace[f]) continue;
+                FaceUnionEdge(edgeFirstCore, fpCore, f, a, b);
+                FaceUnionEdge(edgeFirstCore, fpCore, f, b, c);
+                FaceUnionEdge(edgeFirstCore, fpCore, f, c, a);
             }
 
             var count = new Dictionary<int, int>();
+            var coreCount = new Dictionary<int, int>();
+            var exemptCount = new Dictionary<int, int>();
             for (int f = 0; f < nf; f++)
             {
                 int root = FaceFind(fp, f);
                 int c;
                 count.TryGetValue(root, out c);
                 count[root] = c + 1;
+                if (exemptFace[f])
+                {
+                    int e;
+                    exemptCount.TryGetValue(root, out e);
+                    exemptCount[root] = e + 1;
+                    continue;
+                }
+                int cr = FaceFind(fpCore, f);
+                int cc;
+                coreCount.TryGetValue(cr, out cc);
+                coreCount[cr] = cc + 1;
+            }
+            var islandCoreMax = new Dictionary<int, int>();
+            for (int f = 0; f < nf; f++)
+            {
+                if (exemptFace[f]) continue;
+                int ir = FaceFind(fp, f);
+                int cr = FaceFind(fpCore, f);
+                int cs2;
+                coreCount.TryGetValue(cr, out cs2);
+                int cur;
+                islandCoreMax.TryGetValue(ir, out cur);
+                if (cs2 > cur) islandCoreMax[ir] = cs2;
             }
 
             var dropped = new Dictionary<int, bool>();
             int largestRoot = -1;
+            int exemptRoot = -1;
             foreach (KeyValuePair<int, int> kv in count)
             {
-                if (kv.Value <= maxFaces)
+                // Coalition test: with the exemption faces taken out, what is left of this island? If every
+                // remaining core is at most the cap, then the island is a chain of fragments the unmodified
+                // build prunes one by one and only the exemption holds it together - leftover, not a
+                // network - so it goes whatever its size. Real networks keep a core far above the cap.
+                int coreMax;
+                islandCoreMax.TryGetValue(kv.Key, out coreMax);
+                bool coalition = kv.Value >= 3 && coreMax <= maxFaces;
+                if (kv.Value <= maxFaces || coalition)
                 {
                     dropped[kv.Key] = true;
-                    removedIslands++;
-                    removedFaces += kv.Value;
-                    if (kv.Value > largestRemoved)
+                    st.RemovedIslands++;
+                    st.RemovedFaces += kv.Value;
+                    if (coalition && kv.Value > maxFaces)
                     {
-                        largestRemoved = kv.Value;
+                        st.ExemptIslands++;
+                        st.ExemptFaces += kv.Value;
+                        if (kv.Value > st.ExemptLargest)
+                        {
+                            st.ExemptLargest = kv.Value;
+                            exemptRoot = kv.Key;
+                        }
+                    }
+                    if (kv.Value > st.LargestRemoved)
+                    {
+                        st.LargestRemoved = kv.Value;
                         largestRoot = kv.Key;
                     }
                 }
                 else
                 {
-                    keptIslands++;
-                }
-            }
-            if (removedIslands == 0)
-                return;
-
-            if (largestRoot >= 0)
-            {
-                double sx = 0, sy = 0, sz = 0;
-                int n = 0;
-                for (int f = 0; f < nf; f++)
-                {
-                    if (FaceFind(fp, f) != largestRoot)
-                        continue;
-                    for (int k = 0; k < 3; k++)
+                    st.KeptIslands++;
+                    int e;
+                    exemptCount.TryGetValue(kv.Key, out e);
+                    double frac = kv.Value > 0 ? (double)e / kv.Value : 0.0;
+                    if (frac > st.MaxKeptExemptFraction)
                     {
-                        int v = o.Tris[f * 3 + k];
-                        sx += o.X[v];
-                        sy += o.Y[v];
-                        sz += o.Z[v];
-                        n++;
+                        st.MaxKeptExemptFraction = frac;
+                        st.MaxKeptFaces = kv.Value;
                     }
                 }
-                if (n > 0)
-                {
-                    largestX = (float)(sx / n);
-                    largestY = (float)(sy / n);
-                    largestZ = (float)(sz / n);
-                }
             }
+            if (st.RemovedIslands == 0)
+                return;
+
+            if (exemptRoot >= 0)
+                IslandCentroid(o, fp, nf, exemptRoot, ref st.ExemptX, ref st.ExemptY, ref st.ExemptZ);
+            if (largestRoot >= 0)
+                IslandCentroid(o, fp, nf, largestRoot, ref st.LargestX, ref st.LargestY, ref st.LargestZ);
 
             var remap = new int[o.X.Count];
             for (int i = 0; i < remap.Length; i++) remap[i] = -1;
@@ -1671,8 +1793,9 @@ namespace BetterBannerlordNavmeshing
         //    itself is left nulled rather than becoming an orphan island.
         // Cost is one pass over the remembered spans plus a 4-neighbour flood over the tile's columns.
         private static void RestoreSteppedSpans(RcHeightfield hf, List<RcSpan>[] remembered,
-            int walkableHeight, int walkableClimb, out int restored, out int droppedClearance,
-            out int droppedOrphan, out int droppedPlane, out int aboveNear, out int aboveFar)
+            int walkableHeight, int walkableClimb, List<int> restoredCells, out int restored,
+            out int droppedClearance, out int droppedOrphan, out int droppedPlane, out int aboveNear,
+            out int aboveFar)
         {
             restored = 0;
             droppedClearance = 0;
@@ -1700,6 +1823,7 @@ namespace BetterBannerlordNavmeshing
                     sp.area = RcRecast.RC_WALKABLE_AREA;
                     restoredSpans.Add(sp);
                     restored++;
+                    if (restoredCells != null) restoredCells.Add(ci);   // provenance for the prune pass
 
                     // Suppress the merge plane: the rasterizer merges a thin flight's boards into one
                     // coarse span per column, and where that artefact sits within walkableClimb above the
@@ -1979,7 +2103,8 @@ namespace BetterBannerlordNavmeshing
                     // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
                     // current cap, and a remembered span comes back only when doing so is sound.
                     int restored, droppedClearance, droppedOrphan, droppedPlane, aboveNear, aboveFar;
-                    RestoreSteppedSpans(hf, steppedSpans, walkableHeight, walkableClimb,
+                    var restoredCells = new List<int>();
+                    RestoreSteppedSpans(hf, steppedSpans, walkableHeight, walkableClimb, restoredCells,
                         out restored, out droppedClearance, out droppedOrphan, out droppedPlane,
                         out aboveNear, out aboveFar);
                     r.SteppedRestoredSpans = restored;
@@ -1988,6 +2113,20 @@ namespace BetterBannerlordNavmeshing
                     r.SteppedDroppedPlane = droppedPlane;
                     r.SteppedAboveNear = aboveNear;
                     r.SteppedAboveFar = aboveFar;
+                    if (restoredCells.Count > 0)
+                    {
+                        // World XZ of the restored cells: the prune pass uses them as per-face provenance
+                        // for "this face only exists because of the exemption".
+                        var cellXz = new List<float>(restoredCells.Count * 2);
+                        for (int i = 0; i < restoredCells.Count; i++)
+                        {
+                            int cx = restoredCells[i] % width;
+                            int cz = restoredCells[i] / width;
+                            cellXz.Add(hf.bmin.X + (cx + 0.5f) * s.VoxelCellSizeMeters);
+                            cellXz.Add(hf.bmin.Z + (cz + 0.5f) * s.VoxelCellSizeMeters);
+                        }
+                        r.SteppedRestoredCellXz = cellXz;
+                    }
                 }
                 // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
