@@ -670,7 +670,7 @@ Harness `Test 23` with the setting on - all four now connect, and all four contr
 |---|---|---|
 | `v2: stepped tris:` | - | `forced-walkable=0 ledge-exempt=14474/665317` |
 | ramps | - | 0 synthesized (18 props: 12 flat, 2 steep, 4 long - no bridgeable holes on Birtu) |
-| `v2: stepped: markedCells=...` | - | `markedCells=38312 restored=21105` |
+| `v2: stepped: markedCells=...` | - | `markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5` |
 | mesh | V=32 836 F=50 957 E=84 531 | V=33 408 **F=51 643** E=85 817 |
 | islands | 5 | **6** (one extra island) |
 
@@ -684,10 +684,29 @@ Per-instance `--coverage` (the exemption is the only active mechanism on Birtu):
 
 So the setting is a clear win for `stairs_bo` (the V3.11 regressions 45.7->38.3 / 39.1->35.0 are gone, now +9 to
 +20 points each) and for `european_castle_ladder`, and improves four of the six wooden flights - but two
-`wooden_platform_stairs_a` instances lose coverage (the exempt treads fragment their surface and the
-low-height filter drops spans under the coarse plane the rasterizer had built) and one extra island appears.
-**The default therefore stays off** until those two residuals are fixed; the exemption and the hole-only ramps
-are otherwise measured and safe (invariants PASS, level bands within +/-10 faces, neutrality `MATCH`).
+`wooden_platform_stairs_a` instances lose coverage (55.9->40.4, 59.1->58.0) and one extra island appears.
+
+**V3.13: the exemption is gated per span, not per cell.** After `FilterLedgeSpans` a remembered span is
+restored only when
+1. its own clearance above survives `walkableHeight` (the same rule `FilterWalkableLowHeightSpans` applies one
+   step later), and
+2. the restored span ends up connected - through walkable neighbours within `walkableClimb` in adjacent
+   columns, restored or not - to a column that was walkable before this pass or to the tile border, so a patch
+   can never become an orphan island.
+`v2: stepped: markedCells=38312 restored=18191 droppedClearance=2909 droppedOrphan=5` (was `restored=21105`
+ungated) and Test 23 stays 4/4 with the controls unchanged. The gates do **not** fix the two wooden flights,
+and the measurement says why: (1) the clearance gate is a no-op for the mesh - those 2909 spans are the same
+ones `FilterWalkableLowHeightSpans` nulls one step later, so the built mesh is byte-identical
+(`F=51643 islands=6`); (2) only 5 spans are orphans, so the extra island is not one; (3) the coverage loss is a
+~0.2 m sag where a restored tread coexists with the coarse plane above it and the region builder joins the two
+levels into one contour (probe at (258,245.5) level 37.5: `h=38.83` off -> `h=38.63` on, and the coverage
+window's lower bound is `surface-0.2 = 38.77`). An experimental extra gate that restores only into columns the
+trim emptied did give islands 5 and **no** regressions, but it also removed ~97% of the gains (16 of 18
+instances unchanged) and broke Test 23 (a/b/d) by starving the rung restorations the ladder cases need, so it
+was dropped. **The default therefore stays off**; the remaining lever is to have a restored tread *replace* the
+coarse plane span above it (drop the plane where the tread is authored), which is safe only where that plane is
+the flight's own merge artefact and not a legitimate storey above it - that rule needs a per-span authorship
+signal the heightfield does not carry today.
 
 ### Terrain holes (false lids)
 
@@ -754,7 +773,7 @@ NavMesh: v2: tiles=100 built=100 failed=0 workers=12 polys=...
 NavMesh: v2: gap fill: filled=<n> emptyColumns=<n> (cap=2 cells, before erosion)   <- only when NavMeshVoxelGapFillCells>0
 NavMesh: v2: stitch: added=<n> faces across tiles (cap=<n> cells)                     <- only when NavMeshVoxelStitchMaxGapCells>0
 NavMesh: v2: stepped tris: forced-walkable=<n> ledge-exempt=<n>/<m> (ramps walkable regardless of slope; stepped-prop treads kept off the ledge trim)   <- only when NavMeshVoxelSteppedProps=true
-NavMesh: v2: stepped: markedCells=<n> restored=<n> (ledge-trim exemption)   <- only when NavMeshVoxelSteppedProps=true and stepped props are present
+NavMesh: v2: stepped: markedCells=<n> restored=<n> droppedClearance=<n> droppedOrphan=<n> (ledge-trim exemption, gated per span)   <- only when NavMeshVoxelSteppedProps=true and stepped props are present
 NavMesh: v2: winding: flipped=<n>/<total> asset triangles (downward-wound)          <- per-triangle asset winding normalisation
 NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)             <- cross-tile stitch over the merged mesh, before the prune
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands

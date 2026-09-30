@@ -154,6 +154,8 @@ namespace BetterBannerlordNavmeshing
             public int Stitched;       // connector faces added by the per-tile stitch pass
             public int SteppedMarkedCells;    // heightfield cells covered by forced (ramp) triangles
             public int SteppedRestoredSpans;  // ramp spans the ledge filter nulled and the exemption restored
+            public int SteppedDroppedClearance; // remembered spans left nulled: no headroom above them
+            public int SteppedDroppedOrphan;    // remembered spans left nulled: they would be orphans
         }
 
         public sealed class VoxelMeshResult
@@ -177,6 +179,8 @@ namespace BetterBannerlordNavmeshing
             public int RasterizedTriangles;
             public int SteppedMarkedCells;     // cells covered by forced (ramp) triangles, all tiles
             public int SteppedRestoredSpans;   // ramp spans restored after the ledge trim, all tiles
+            public int SteppedDroppedClearance; // remembered spans not restored: no headroom
+            public int SteppedDroppedOrphan;    // remembered spans not restored: would be orphans
 
             public long TilesMs;
             public long MergeMs;
@@ -700,15 +704,18 @@ namespace BetterBannerlordNavmeshing
 
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
-                int markedCells = 0, restoredSpans = 0;
+                int markedCells = 0, restoredSpans = 0, droppedClearance = 0, droppedOrphan = 0;
                 for (int i = 0; i < results.Length; i++)
                     if (results[i] != null && !results[i].Failed)
                     {
                         markedCells += results[i].SteppedMarkedCells;
                         restoredSpans += results[i].SteppedRestoredSpans;
+                        droppedClearance += results[i].SteppedDroppedClearance;
+                        droppedOrphan += results[i].SteppedDroppedOrphan;
                     }
                 Log(log, "v2: stepped: markedCells=" + markedCells + " restored=" + restoredSpans
-                    + " (ledge-trim exemption)");
+                    + " droppedClearance=" + droppedClearance + " droppedOrphan=" + droppedOrphan
+                    + " (ledge-trim exemption, gated per span)");
             }
 
             // --- merge in sorted order (deterministic) ---
@@ -1642,6 +1649,130 @@ namespace BetterBannerlordNavmeshing
             return marked;
         }
 
+        // Restores only the remembered stepped-prop spans that the ledge trim nulled, and only where doing
+        // so is sound - the exemption is gated PER SPAN, not per cell:
+        //  - the span's own clearance above must survive walkableHeight (the same rule
+        //    FilterWalkableLowHeightSpans applies one step later), so a tread is never restored into a slot
+        //    that is already a ceiling;
+        //  - the span must end up connected - through walkable neighbours within walkableClimb in adjacent
+        //    columns (restored or not) - to a column that was walkable before this pass, or to the tile's
+        //    border ring, whose neighbours belong to another tile. A patch that would only connect to
+        //    itself is left nulled rather than becoming an orphan island.
+        // Cost is one pass over the remembered spans plus a 4-neighbour flood over the tile's columns.
+        private static void RestoreSteppedSpans(RcHeightfield hf, List<RcSpan>[] remembered,
+            int walkableHeight, int walkableClimb, out int restored, out int droppedClearance,
+            out int droppedOrphan)
+        {
+            restored = 0;
+            droppedClearance = 0;
+            droppedOrphan = 0;
+            int w = hf.width, h = hf.height;
+
+            // pass 1: clearance gate, and tentatively restore the survivors
+            var restoredSpans = new HashSet<RcSpan>();
+            for (int ci = 0; ci < remembered.Length; ci++)
+            {
+                List<RcSpan> list = remembered[ci];
+                if (list == null) continue;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    RcSpan sp = list[i];
+                    if (sp.area != RcRecast.RC_NULL_AREA) continue;   // never nulled: nothing to do
+                    if (sp.next != null && sp.next.smin - sp.smax < walkableHeight)
+                    {
+                        droppedClearance++;                          // no headroom: leave it nulled
+                        continue;
+                    }
+                    sp.area = RcRecast.RC_WALKABLE_AREA;
+                    restoredSpans.Add(sp);
+                    restored++;
+                }
+            }
+            if (restored == 0) return;
+
+            // pass 2: flood the columns that were already walkable (plus the tile border, which is
+            // another tile's business), stepping between columns whose walkable spans are within climb
+            var connected = new bool[w * h];
+            var queue = new Queue<int>();
+            for (int ci = 0; ci < w * h; ci++)
+            {
+                for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+                {
+                    if (sp.area == RcRecast.RC_NULL_AREA) continue;
+                    if (restoredSpans.Contains(sp)) continue;        // not a seed: restored this pass
+                    connected[ci] = true;
+                    queue.Enqueue(ci);
+                    break;
+                }
+            }
+            for (int x = 0; x < w; x++)
+            {
+                EnqueueColumn(connected, queue, x, 0, w, h);
+                EnqueueColumn(connected, queue, x, h - 1, w, h);
+            }
+            for (int z = 0; z < h; z++)
+            {
+                EnqueueColumn(connected, queue, 0, z, w, h);
+                EnqueueColumn(connected, queue, w - 1, z, w, h);
+            }
+            while (queue.Count > 0)
+            {
+                int ci = queue.Dequeue();
+                int x = ci % w, z = ci / w;
+                for (int d = 0; d < 4; d++)
+                {
+                    int nx = x + (d == 0 ? 1 : d == 1 ? -1 : 0);
+                    int nz = z + (d == 2 ? 1 : d == 3 ? -1 : 0);
+                    if (nx < 0 || nz < 0 || nx >= w || nz >= h) continue;
+                    int nci = nz * w + nx;
+                    if (connected[nci]) continue;
+                    if (!ColumnsLink(hf, ci, nci, walkableClimb)) continue;
+                    connected[nci] = true;
+                    queue.Enqueue(nci);
+                }
+            }
+
+            // pass 3: drop restored spans that ended up without a way back to the existing network
+            for (int ci = 0; ci < remembered.Length; ci++)
+            {
+                List<RcSpan> list = remembered[ci];
+                if (list == null || connected[ci]) continue;
+                for (int i = 0; i < list.Count; i++)
+                {
+                    RcSpan sp = list[i];
+                    if (!restoredSpans.Contains(sp)) continue;
+                    sp.area = RcRecast.RC_NULL_AREA;
+                    restored--;
+                    droppedOrphan++;
+                }
+            }
+        }
+
+        private static void EnqueueColumn(bool[] connected, Queue<int> queue, int x, int z, int w, int h)
+        {
+            if (x < 0 || z < 0 || x >= w || z >= h) return;
+            int ci = z * w + x;
+            if (connected[ci]) return;
+            connected[ci] = true;
+            queue.Enqueue(ci);
+        }
+
+        // Two columns are linked when they hold walkable spans whose walkable floors are within climb -
+        // the same test BuildCompactHeightfield uses to join neighbours.
+        private static bool ColumnsLink(RcHeightfield hf, int a, int b, int walkableClimb)
+        {
+            for (RcSpan sa = hf.spans[a]; sa != null; sa = sa.next)
+            {
+                if (sa.area == RcRecast.RC_NULL_AREA) continue;
+                for (RcSpan sb = hf.spans[b]; sb != null; sb = sb.next)
+                {
+                    if (sb.area == RcRecast.RC_NULL_AREA) continue;
+                    if (Math.Abs(sa.smax - sb.smax) <= walkableClimb) return true;
+                }
+            }
+            return false;
+        }
+
         private static int CellIndex(float p, float min, float cellSize, int count)
         {
             int i = cellSize > 0f ? (int)Math.Floor((p - min) / cellSize) : 0;
@@ -1791,22 +1922,14 @@ namespace BetterBannerlordNavmeshing
                     RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
                 if (steppedSpans != null)
                 {
-                    // Restore only spans that were walkable before the ledge filter and that it nulled:
-                    // ordinary geometry in the same tile keeps the exact current cap.
-                    int restored = 0;
-                    for (int ci = 0; ci < steppedSpans.Length; ci++)
-                    {
-                        List<RcSpan> list = steppedSpans[ci];
-                        if (list == null) continue;
-                        for (int i = 0; i < list.Count; i++)
-                        {
-                            RcSpan sp = list[i];
-                            if (sp.area != RcRecast.RC_NULL_AREA) continue;
-                            sp.area = RcRecast.RC_WALKABLE_AREA;
-                            restored++;
-                        }
-                    }
+                    // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
+                    // current cap, and a remembered span comes back only when doing so is sound.
+                    int restored, droppedClearance, droppedOrphan;
+                    RestoreSteppedSpans(hf, steppedSpans, walkableHeight, walkableClimb,
+                        out restored, out droppedClearance, out droppedOrphan);
                     r.SteppedRestoredSpans = restored;
+                    r.SteppedDroppedClearance = droppedClearance;
+                    r.SteppedDroppedOrphan = droppedOrphan;
                 }
                 // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
