@@ -458,6 +458,7 @@ namespace BetterBannerlordNavmeshing
                     + "m stride=" + NavMeshSampleStride + " fallback=" + grid.UsedPointFallback
                     + " heights=" + grid.Heights.Length);
                 sb.AppendLine("assets: entities=" + records.Count + " included=" + assets.EntitiesIncluded
+                    + (assets.LadderIncluded > 0 ? " laddersIncluded=" + assets.LadderIncluded : "")
                     + " tris=" + assets.TriangleCount + " cappedShapes=" + assets.ShapesCapped
                     + " scanMs=" + assets.ScanMs);
                 sb.AppendLine("excluded: [flora=" + assets.ExFlora + " barrier=" + assets.ExBarrier
@@ -465,7 +466,8 @@ namespace BetterBannerlordNavmeshing
                     + " dynamic=" + assets.ExDynamic + " noShape=" + assets.ExNoShape
                     + " empty=" + assets.ExEmpty + " exceptions=" + assets.ExExceptions
                     + " unsolid=" + assets.ExUnsolid + "]"
-                    + " entitiesSeen=" + assets.Count + " physics=" + assets.Physics);
+                    + " entitiesSeen=" + assets.Count + " physics=" + assets.Physics
+                    + (assets.LadderIncluded > 0 ? " laddersIncluded=" + assets.LadderIncluded : ""));
                 sb.AppendLine("largest:");
                 var order = new System.Collections.Generic.List<int>();
                 for (int i = 0; i < assets.LargestTris.Count; i++) order.Add(i);

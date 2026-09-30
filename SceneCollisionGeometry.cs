@@ -82,6 +82,9 @@ namespace BetterBannerlordNavmeshing
             public int Count, Physics;
             public int ExFlora, ExBarrier, ExTerrain, ExLadder, ExDynamic, ExNoShape, ExEmpty,
                 ExExceptions, ExUnsolid;
+            // Ladder-flagged bodies admitted by the classifier because the stepped-props feature is on
+            // (they are excluded, and counted in ExLadder, when it is off).
+            public int LadderIncluded;
             // Synthesized stair/ladder ramp triangles (SteppedPropRamps); null when none/disabled.
             public bool[] ForceWalkableTris;
             public bool[] LedgeExemptTris;
@@ -163,7 +166,7 @@ namespace BetterBannerlordNavmeshing
             var preloadSeen = new HashSet<string>(StringComparer.Ordinal);
 
             int count = 0, physics = 0;
-            int exFlora = 0, exBarrier = 0, exTerrain = 0, exLadder = 0;
+            int exFlora = 0, exBarrier = 0, exTerrain = 0, exLadder = 0, ladderIncluded = 0;
             int exDynamic = 0, exNoShape = 0, exceptions = 0;
             int preloadNamesEmpty = 0;
             int exUnsolid = 0;
@@ -206,7 +209,14 @@ namespace BetterBannerlordNavmeshing
                     if (isTerrain) { exTerrain++; continue; }
                     if (isFlora && !includeFlora) { exFlora++; continue; }
                     if (isBarrier) { exBarrier++; continue; }
-                    if (isLadder) { exLadder++; continue; }
+                    // Ladders: excluded by default - a rung set is not a walkable surface and the engine
+                    // handles ladders separately. With the stepped-props feature on they are collected
+                    // like any other stepped prop: the rungs are steep-walkable surfaces, SteppedPropRamps
+                    // bridges the unsupported stretches between them, and the synthesized ramp is widened
+                    // to at least MinWidthMeters, so a narrow (0.6 m) ladder still leaves a navigable
+                    // strip after erosion. The prop's own triangles are ledge-exempt like any stair's.
+                    if (isLadder && !propRamps) { exLadder++; continue; }
+                    if (isLadder) ladderIncluded++;
                     if (isUnsolid) { exUnsolid++; continue; }
                     if (isDynamic && !includeDynamic) { exDynamic++; continue; }
 
@@ -515,6 +525,7 @@ namespace BetterBannerlordNavmeshing
             result.ExEmpty = exEmpty;
             result.ExExceptions = exceptions;
             result.ExUnsolid = exUnsolid;
+            result.LadderIncluded = ladderIncluded;
             result.RampQuads = rampQuads;
             result.RampStairs = rampStairs;
             result.RampHoles = rampHoles;
@@ -528,6 +539,7 @@ namespace BetterBannerlordNavmeshing
             if (log != null)
             {
                 log("assets: entities=" + count + " physics=" + physics + " included=" + included
+                    + (ladderIncluded > 0 ? " laddersIncluded=" + ladderIncluded : "")
                     + " excluded=[flora=" + exFlora + " barrier=" + exBarrier + " terrain=" + exTerrain
                     + " ladder=" + exLadder + " dynamic=" + exDynamic + " noShape=" + exNoShape
                     + " empty=" + exEmpty + " exceptions=" + exceptions + " unsolid=" + exUnsolid + "]"

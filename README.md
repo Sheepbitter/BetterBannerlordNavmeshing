@@ -291,7 +291,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
-| `NavMeshVoxelSteppedProps` | `true` | **Off by default; read *Stairs & ladders* before enabling.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The default still stays off for one reason: the level-band criterion (faces per 1 m band must stay within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
+| `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -410,7 +410,7 @@ name):
 | Dynamic / movable props (`Dynamic`/`Moveable`, dynamic mobility, dynamic rigid body) | included (`NavMeshVoxelIncludeDynamic`) | Captured at their placed pose - e.g. Birtu's merlons are static-in-practice props. Set false for static-only. |
 | Flora (`BodyOwnerFlora`) | **excluded** (`NavMeshVoxelIncludeFlora = false`) | Usually visual; many small shapes add faces without being reliably navigable. |
 | Barriers (`Barrier` / `Barrier3D`) | excluded | Invisible blocker volumes; walkable faces must not sit on them. |
-| Ladders (`Ladder`) | excluded | Not a walkable surface; the engine handles ladders separately. |
+| Ladders (`Ladder`) | excluded, **included when `NavMeshVoxelSteppedProps` is on** | Not a walkable surface by themselves and the engine handles ladders separately, so they are dropped by default. With the stepped-props feature on they are collected and the flight is synthesized like a stair's (their rungs are steep-walkable, the gaps between rungs are ramps), because a real ladder's collision is the only thing that carries a navmesh up it. Counted as `laddersIncluded=<n>`. See *Stairs & ladders*. |
 | Non-solid-for-agents markers (`Disabled` / `OnlyCollideWithRaycast` / `DontTransferToPhysicsEngine` / `MissileOnly`) | excluded | Flagged as not solid for agents: such a body must not become walkable navmesh. Counted as `unsolid=` in the exclusion log. (None on Birtu today; future-proofing.) |
 | Terrain-owner bodies (`BodyOwnerTerrain`) | excluded | The terrain is already meshed from the heightfield; reading it again would double up. |
 | Non-physics / empty / no-shape entities | excluded | Nothing to voxelize. |
@@ -635,7 +635,8 @@ platform island is pruned with the default and kept when the cap is 0.
 
 Two mechanisms for props whose body flags include `HasSteps` (`0x800`) or `Ladder` (`0x40`) - Birtu has 84 of
 the former and 2 of the latter. **Everything else keeps the ordinary 50 deg cap** (the builder's
-`effectiveMaxSlope`).
+`effectiveMaxSlope`). Both mechanisms only run while this setting is on; in particular `Ladder` bodies are
+collected (not excluded) only then, see *V3.16* below.
 
 **1. Stairs: the prop's own treads are exempt from the ledge trim.** Thin stepped collision loses its spans to
 the rasterizer (erosion eats a 0.26 m tread), and what survives is then deleted by `FilterLedgeSpans`, whose
@@ -787,6 +788,51 @@ and each added face covers ~5 previously-uncovered samples (the 864 fewer gaps i
 is in direct tension with the coverage criterion. **`NavMeshVoxelSteppedProps` therefore stays `false`**: the
 code is complete and the default-off path is unchanged, but the flip waits on the level-band criterion.
 
+**V3.16: Ladder-flagged props are collected, and the apron is bounded by the prop's own footprint.** The glue
+between the two mechanisms was missing: `SceneCollisionGeometry` dropped every `Ladder` body at classification
+(`if (isLadder) { exLadder++; continue; }`, before the ramp synthesis) so a ladder prop could never reach
+`SteppedPropRamps` at all - Test 23 only passed because its rig feeds the synthesis directly. The recorded Birtu
+snapshot's own log said `excluded: [... ladder=2 ...]`, i.e. the two real ladders on the map
+(`civilian_ladder_6m` at `(300.05, 280.84, 15.60)` and `civilian_ladder_5m` at `(302.53, 313.77, 16.63)`, leaning
+~29 deg off vertical) were always thrown away.
+
+Now, **with `NavMeshVoxelSteppedProps` on**, a `Ladder` body is collected like any stepped prop: the rungs are
+steep-walkable surfaces (the prop's own triangles are ledge-exempt), `SteppedPropRamps` bridges the unsupported
+stretches between the rungs, and the synthesized ramp is clamped to at least `MinWidthMeters` (1.2 m) so a narrow
+(0.6-0.7 m) ladder still leaves a navigable strip after erosion. With the setting off nothing changes: ladders are
+still excluded and counted in `ladder=<n>` (the off build is byte-identical, neutrality `MATCH`). The new counter
+appears in the assets log and in the snapshot `.txt`:
+
+```
+assets: entities=4336 physics=4366 included=4338 laddersIncluded=2 excluded=[flora=0 barrier=28 terrain=0 ladder=0 ...]
+```
+
+Harness `Test 24` mirrors the real setup - a ladder leaning 35 deg off vertical against a tall wall, with a small
+doorway (1.0 m wide, 2.2 m high) at its top leading to the upper floor - and asserts end-to-end connectivity
+through the doorway plus a walled-shut control:
+
+| case | connection |
+|---|---|
+| a) door open, ramps off | **not connected** (rungs 0.7 m apart > the 0.4 m climb) |
+| b) door open, ramps on | connected: lower->threshold, threshold->upper, lower->upper |
+| c) door walled shut, ramps on, 2.0 m wall | **not connected** |
+| d) door walled shut, ramps on, 0.5 m wall, stitch off | **not connected** (the ramp does not tunnel) |
+| f) door open, ramps on, stitch off | connected (both threshold legs) |
+
+The connection in (b)/(f) is made by the doorway **sill** (the top of the wall under the opening, i.e. the floor
+running through it) once the ladder's top reaches it; the top apron itself now stops inside the wall instead of
+poking `ApronMeters` (0.55 m) past the prop's footprint. That bound is the V3.16 synthesis change: the bottom and
+top aprons are forced-walkable pads whose job is to flatten the flight's *own* ends to the floor / landing level so
+their spans merge with what the prop stands on, and a pad authored inside whatever the prop leans on would
+fabricate a walkable surface there (over a thin partition it would sit in the next room's air). They now reach at
+most half a cell past the prop's own bottom / top-band footprint.
+
+One pre-existing behaviour showed up while pinning this down and is **reported, not fixed**: the merge-stitch pass
+(cap 4-6 cells) bridges a ~0.3 m air gap between two surfaces at the same level *over* a thin (0.5 m) wall block,
+because the block's solid volume carries no walkable span at that level (case (e); case (d) with the stitch off
+proves the ramp is not the cause). Case (c) is therefore asserted at a realistic 2.0 m castle-wall thickness, which
+is beyond the stitch cap.
+
 ### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
@@ -831,7 +877,8 @@ NavMesh: assets: preloading <M> unique physics bodies by name
 NavMesh: assets: preloaded <M> bodies by name (preloadMs=<n>)
 NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- every 250 entities (read pass)
 NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=.. dyn=.. meshCount=.. tris=..   <- only when NavMeshVoxelAssetTrace=true
-NavMesh: assets: entities=... physics=... included=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=.. unsolid=..] tris=... cappedShapes=... scanMs=...
+NavMesh: assets: entities=... physics=... included=... laddersIncluded=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=.. unsolid=..] tris=..
+         (laddersIncluded=<n> only when NavMeshVoxelSteppedProps=true and Ladder-flagged bodies were collected). cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: stepped: ramps=<n> stairs=<n> ladders=<n> holes=<n> noHoles=<n> skipped=<n> (ramps bridge unsupported stretches only; treads are ledge-exempt)   <- only when NavMeshVoxelSteppedProps=true
 NavMesh: assets: stepped: skipped detail flat=<n> steep=<n> long=<n> capped=<n>; band=0.5m ...   <- only when something was skipped
@@ -868,9 +915,9 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
 - `v2: tris input=... culledByAabb=...` - input triangles, ones outside every tile, and the number actually
   rasterized (higher than `input` near tile borders because each tile sees its neighbours' geometry).
 - `assets: ...` (main thread, before the build) - the collision-geometry scan: entity/physics/included counts,
-  the per-reason exclusion counts, total triangles, any capped shapes and the scan time (`scanMs`); plus a
-  name-heuristic kind histogram and the twenty largest shapes. `assetsMs` on the perf/`done:` lines is the same
-  scan's wall time.
+  `laddersIncluded=<n>` when the stepped-props feature collected `Ladder` bodies, the per-reason exclusion
+  counts, total triangles, any capped shapes and the scan time (`scanMs`); plus a name-heuristic kind histogram
+  and the twenty largest shapes. `assetsMs` on the perf/`done:` lines is the same scan's wall time.
 - `v2: soup terrain=... + assets=...` - the merged Recast-space soup size; the uniform lift applied to the
   whole mesh (`NavMeshHeightOffsetMeters`) is stated in the line.
 - `terrain hole audit: ...` / `v2: terrain hole mask applied: ...` - only when `NavMeshVoxelTerrainHoleAudit`

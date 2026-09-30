@@ -120,7 +120,8 @@ namespace BetterBannerlordNavmeshing
             return "band=" + LayerHeightMeters + "m envTol=" + EnvelopeTolerance + "m station="
                 + StationStepMeters + "m minRise=" + MinRiseMeters + "m maxSlope=" + MaxSlopeDegrees
                 + "deg width=" + MinWidthMeters + ".." + MaxWidthMeters + "m x" + WidthFactor + " apron="
-                + ApronMeters + "m maxBridge=" + MaxBridgeRunMeters + "m maxRamps=" + MaxRampsPerProp
+                + ApronMeters + "m (capped to the prop's own footprint) maxBridge=" + MaxBridgeRunMeters
+                + "m maxRamps=" + MaxRampsPerProp
                 + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m (navigable cap applied per build)";
         }
 
@@ -135,7 +136,7 @@ namespace BetterBannerlordNavmeshing
             float slopeCap = Math.Min(MaxSlopeDegrees,
                 NavigableSlopeDegrees(cellSizeMeters, climbMeters, ledgeFilter));
             r.SlopeCapDegrees = slopeCap;
-            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r, slopeCap, climbMeters);
+            for (int i = 0; i < props.Count; i++) AppendProp(props[i], r, slopeCap, climbMeters, cellSizeMeters);
             return r;
         }
 
@@ -151,7 +152,8 @@ namespace BetterBannerlordNavmeshing
             return (float)(Math.Atan(t) * 180.0 / Math.PI);
         }
 
-        private static void AppendProp(Prop p, Result r, float slopeCapDegrees, float climbMeters)
+        private static void AppendProp(Prop p, Result r, float slopeCapDegrees, float climbMeters,
+            float cellSizeMeters)
         {
             if (p == null || p.VertsXyz == null || p.Tris == null) return;
             if (!IsSteppedOrLadder(p.Flags)) return;
@@ -377,8 +379,33 @@ namespace BetterBannerlordNavmeshing
                 return;
             }
 
+            // -------- apron reach: the pads flatten the flight to its floor / landing level so their
+            // spans merge with the geometry the prop stands on, but they are forced walkable, so they
+            // must not reach past the prop's OWN footprint. A pad poking further would sit inside
+            // whatever the prop leans on and, because forced spans survive the ledge trim, it would
+            // tunnel through a wall (or a thin door) at the flight's landing level. The prop's own
+            // footprint at the bottom / top bands is what bounds it; half a cell of overshoot is kept
+            // so a cell straddling the footprint edge still receives a span (the merge is by cell
+            // adjacency within walkableClimb, so no bigger overlap is needed).
+            float botFootprint = float.MaxValue, topFootprint = float.MinValue;
+            for (int k = 0; k < used; k++)
+            {
+                if (topZ[k] <= zMin + EnvelopeTolerance && winLo[k] < botFootprint) botFootprint = winLo[k];
+                if (topZ[k] >= zMax - EnvelopeTolerance && winHi[k] > topFootprint) topFootprint = winHi[k];
+            }
+            if (botFootprint == float.MaxValue) botFootprint = runMin;
+            if (topFootprint == float.MinValue) topFootprint = runMax;
+            float halfCell = 0.5f * cellSizeMeters;
+
             float botReach = starts[0] * step + ApronMeters;
-            float topReach = (stationCount - 1 - ends[ends.Count - 1]) * step + ApronMeters;
+            float botAllowed = Math.Max(0f, runMin - botFootprint) + halfCell;
+            if (botReach > starts[0] * step + botAllowed) botReach = starts[0] * step + botAllowed;
+
+            float runEnd = runMin + (stationCount - 1) * step;
+            float topGap = (stationCount - 1 - ends[ends.Count - 1]) * step;
+            float topReach = topGap + ApronMeters;
+            float topAllowed = Math.Max(0f, topFootprint - runEnd) + halfCell;
+            if (topReach > topGap + topAllowed) topReach = topGap + topAllowed;
 
             var keys = new List<string>();
             int emitted = 0;
