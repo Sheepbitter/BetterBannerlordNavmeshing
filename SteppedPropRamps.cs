@@ -101,6 +101,127 @@ namespace BetterBannerlordNavmeshing
             public int Capped;         // the flight needed more than MaxRampsPerProp chunks
             public float SlopeCapDegrees;   // the steepest ramp the Recast build can keep walkable
             public readonly List<RampInfo> Infos = new List<RampInfo>();
+            // One entry per prop that produced no ramp, with the reason and the key numbers. Diagnostic
+            // only (never used by the geometry); the caller logs them, capped.
+            public readonly List<Skip> Skips = new List<Skip>();
+        }
+
+        // Why a prop produced no ramp. Reason is one of: z-range, no-direction, vertical, too-short,
+        // no-support, no-rise, no-holes, within-climb, hole-steep, hole-long, hole-rise, hole-short,
+        // capped, chunk-refused.
+        public sealed class Skip
+        {
+            public string Prop;
+            public string Reason;
+            public int Tris;            // prop triangles used
+            public float ZMin, ZMax;    // the prop's vertical extent
+            public float RunSpan;       // horizontal extent along the flight's own direction
+            public int Stations;        // run stations the flight was sampled at
+            public int Supported;       // stations where the prop supplies collision
+            public int Holes;           // unsupported stretches considered
+            public float HoleRun;       // the offending hole's run (m), when relevant
+            public float HoleRise;      // ... its rise (m)
+            public float HoleSlopeDeg;  // ... its implied slope
+            public int HoleCount;       // how many holes hit that reason
+            public int Counter;         // which Result counter this skip bumped (1 flat, 2 steep, 3 long,
+                                        // 4 capped, 5 no-holes) so it can be undone if a fallback runs
+            public int Instances = 1;   // how many props folded into this line
+        }
+
+        // Folds identical (prop, reason) rows into one line with a count, keeping first-seen order
+        // (deterministic). Birtu has dozens of entities of the same asset, so a raw per-prop list is
+        // dominated by one name and hides the interesting rows.
+        public static List<Skip> FoldSkips(List<Skip> src)
+        {
+            var folded = new List<Skip>();
+            var index = new Dictionary<string, int>();
+            for (int i = 0; i < src.Count; i++)
+            {
+                Skip s = src[i];
+                string key = s.Prop + "\n" + s.Reason;
+                int at;
+                if (index.TryGetValue(key, out at)) { folded[at].Instances++; continue; }
+                index[key] = folded.Count;
+                folded.Add(s);
+            }
+            return folded;
+        }
+
+        // Undoes the bookkeeping of a skip (used when a ladder falls back to a synthesized chain).
+        private static void UndoSkip(Result r, Skip s)
+        {
+            r.Skips.Remove(s);
+            if (s.Counter == 1) r.SkippedFlat--;
+            else if (s.Counter == 2) r.SkippedSteep--;
+            else if (s.Counter == 3) r.SkippedLong--;
+            else if (s.Counter == 4) r.Capped--;
+            else if (s.Counter == 5) r.NoHoles--;
+        }
+
+        // A Ladder prop's collision is a *climbable plane* (a plank), not a tread pattern: its triangles
+        // span the whole run, so the per-station envelope cannot see the flight rise, there are no gaps
+        // between treads to bridge - and its own surface is too steep (and, at a ladder's width, too
+        // narrow to survive erosion) to be the path itself. When the hole-based synthesis found nothing
+        // to use, lay ONE straight ramp from the prop's own bottom to its top instead: that is exactly
+        // the chain the hole logic would produce if every station were a hole. It goes through EmitChunk,
+        // so the width clamp (>= MinWidthMeters, which is what beats erosion), the slope cap, the dedupe
+        // and the two end aprons are identical to a hole bridge's.
+        private static bool TryLadderChain(Result r, Prop p, float[] perp, float[] winLo, float[] winHi,
+            float[] cx, float[] cy, float[] cz, float[] topZ, int used, int stations,
+            float runMin, float runSpan, float zMin, float zMax, float slopeCapDegrees,
+            float cellSizeMeters, Skip skip)
+        {
+            if ((p.Flags & FlagLadder) == 0) return false;
+            if (stations < 2 || used <= 0) return false;
+            if (zMax - zMin < MinRiseMeters) return false;
+
+            // The flight's own bottom and top (the band envelope centres), NOT the per-station envelope
+            // centres: a plank's every triangle spans the whole run, so each station's centre is the
+            // prop's global centroid and the chain would have no run at all.
+            float bx, by, tx, ty;
+            if (!BandCentres(cx, cy, cz, topZ, used, zMin, zMax, out bx, out by, out tx, out ty))
+                return false;
+
+            var px = new float[2];
+            var py = new float[2];
+            var pz = new float[2];
+            px[0] = bx;
+            py[0] = by;
+            pz[0] = zMin;
+            px[1] = tx;
+            py[1] = ty;
+            pz[1] = zMax;
+
+            float halfCell = 0.5f * cellSizeMeters;
+            var keys = new List<string>();
+            if (!EmitChunk(r, p.Name, perp, winLo, winHi, px, py, pz, 0, 1, runMin, runSpan,
+                zMin, zMax, halfCell, halfCell, true, true, keys, slopeCapDegrees))
+                return false;
+
+            r.Ladders++;
+            if (skip != null) UndoSkip(r, skip);
+            return true;
+        }
+
+        public static string DescribeSkip(Skip s)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("ramps: skip '").Append(s.Prop).Append("' ").Append(s.Reason);
+            if (s.HoleCount > 0)
+                sb.Append(" run=").Append(Num(s.HoleRun)).Append("m rise=").Append(Num(s.HoleRise))
+                  .Append("m -> ").Append(Num(s.HoleSlopeDeg)).Append("deg (holes=").Append(s.HoleCount)
+                  .Append("/").Append(s.Holes).Append(")");
+            sb.Append(" tris=").Append(s.Tris)
+              .Append(" z=[").Append(Num(s.ZMin)).Append("..").Append(Num(s.ZMax)).Append("]")
+              .Append(" runSpan=").Append(Num(s.RunSpan)).Append("m stations=").Append(s.Supported)
+              .Append("/").Append(s.Stations);
+            if (s.Instances > 1) sb.Append(" (x").Append(s.Instances).Append(" props)");
+            return sb.ToString();
+        }
+
+        private static string Num(float v)
+        {
+            return v.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         }
 
         // One emitted ramp, for logging / diagnostics (never used by the geometry itself).
@@ -161,6 +282,11 @@ namespace BetterBannerlordNavmeshing
             if (triCount <= 0) return;
             int vertCount = p.VertsXyz.Length / 3;
 
+            // Every early exit below fills this and appends it to r.Skips, so a prop that produced no
+            // ramp is always named with the reason and the numbers that made it so.
+            var skip = new Skip();
+            skip.Prop = p.Name;
+
             // -------- pass 1: compact per-triangle data (centroid XZ, centroid Z, top surface height)
             var cx = new float[triCount];
             var cy = new float[triCount];
@@ -191,9 +317,14 @@ namespace BetterBannerlordNavmeshing
                 used++;
             }
             if (used == 0) return;
+            skip.Tris = used;
+            skip.ZMin = zMin;
+            skip.ZMax = zMax;
             if (zMax - zMin < MinRiseMeters)
             {
                 r.SkippedFlat++;
+                skip.Reason = "z-range"; skip.Counter = 1;
+                r.Skips.Add(skip);
                 return;
             }
 
@@ -202,6 +333,8 @@ namespace BetterBannerlordNavmeshing
             if (!FlightDirection(cx, cy, cz, topZ, used, zMin, zMax, out dirX, out dirY))
             {
                 r.SkippedFlat++;
+                skip.Reason = "no-direction"; skip.Counter = 1;
+                r.Skips.Add(skip);
                 return;
             }
             float perpDirX = -dirY, perpDirY = dirX;
@@ -227,9 +360,12 @@ namespace BetterBannerlordNavmeshing
                 if (winHi[k] > runMax) runMax = winHi[k];
             }
             float runSpan = runMax - runMin;
+            skip.RunSpan = runSpan;
             if (runSpan < 1e-3f)
             {
                 r.SkippedSteep++;   // perfectly vertical (a true wall): nothing to walk on
+                skip.Reason = "vertical"; skip.Counter = 2;
+                r.Skips.Add(skip);
                 return;
             }
 
@@ -238,9 +374,12 @@ namespace BetterBannerlordNavmeshing
             // fixed 0.25 m step would miss the holes between them entirely.
             float step = Math.Min(StationStepMeters, Math.Max(0.1f, runSpan / 32f));
             int stationCount = (int)Math.Floor(runSpan / step) + 1;
+            skip.Stations = stationCount;
             if (stationCount < 2)
             {
                 r.SkippedFlat++;
+                skip.Reason = "too-short"; skip.Counter = 1;
+                r.Skips.Add(skip);
                 return;
             }
             if (stationCount > MaxStations)
@@ -311,11 +450,23 @@ namespace BetterBannerlordNavmeshing
             if (sup.Count < 2)
             {
                 r.SkippedFlat++;
+                skip.Supported = sup.Count;
+                skip.Reason = "no-support"; skip.Counter = 1;
+                r.Skips.Add(skip);
                 return;
             }
             if (stZ[sup[sup.Count - 1]] - stZ[sup[0]] < MinRiseMeters)
             {
                 r.SkippedFlat++;
+                skip.Supported = sup.Count;
+                skip.Reason = "no-rise"; skip.Counter = 1;
+                r.Skips.Add(skip);
+                // A ladder's plank spans the whole run, so every station carries the plank's global top
+                // and the envelope cannot rise. It is still a straight climbable plane: fall back to one
+                // chain over its own footprint (UndoSkip removes this skip when that succeeds).
+                if (TryLadderChain(r, p, perp, winLo, winHi, cx, cy, cz, topZ, used, stationCount,
+                        runMin, runSpan, zMin, zMax, slopeCapDegrees, cellSizeMeters, skip))
+                    return;
                 return;
             }
 
@@ -328,6 +479,12 @@ namespace BetterBannerlordNavmeshing
             var ends = new List<int>();
             int lastSup = -1;
             int holes = 0;
+            // Hole refusals, per reason, with the worst (steepest / longest / tallest) example, so a prop
+            // that ends up with no bridge can say exactly why.
+            int holeSteep = 0, holeLong = 0, holeRise = 0, holeShort = 0, holeWithinClimb = 0;
+            float stRun = 0f, stRise = 0f, stDeg = 0f;
+            float loRun = 0f, loRise = 0f;
+            float riRun = 0f, riRise = 0f;
             for (int i = 0; i < stationCount; i++)
             {
                 if (stOk[i]) { lastSup = i; continue; }
@@ -344,38 +501,84 @@ namespace BetterBannerlordNavmeshing
                 if (gapRise <= climbMeters + 1e-3f)
                 {
                     // Within a step: ordinary rasterisation already walks over it, no ramp needed.
+                    holeWithinClimb++;
                     continue;
                 }
                 if (gapRun > MaxBridgeRunMeters + 1e-3f)
                 {
                     r.SkippedLong++;
+                    holeLong++;
+                    if (gapRun > loRun) { loRun = gapRun; loRise = gapRise; }
                     continue;
                 }
                 if (gapRise < MinChunkRiseMeters || gapRun < 1e-3f
                     || gapRise > MaxRisePerRampMeters + 1e-3f)
                 {
                     r.SkippedSteep++;
+                    if (gapRise > MaxRisePerRampMeters + 1e-3f)
+                    {
+                        holeRise++;
+                        if (gapRise > riRise) { riRise = gapRise; riRun = gapRun; }
+                    }
+                    else
+                    {
+                        holeShort++;
+                    }
                     continue;
                 }
-                if (Math.Atan2(gapRise, gapRun) * 180.0 / Math.PI > slopeCapDegrees)
+                float gapDeg = (float)(Math.Atan2(gapRise, gapRun) * 180.0 / Math.PI);
+                if (gapDeg > slopeCapDegrees)
                 {
                     r.SkippedSteep++;
+                    holeSteep++;
+                    if (gapDeg > stDeg) { stDeg = gapDeg; stRun = gapRun; stRise = gapRise; }
                     continue;
                 }
                 starts.Add(bStart);
                 ends.Add(bEnd);
             }
             r.Holes += holes;
+            skip.Holes = holes;
             if (starts.Count == 0)
             {
                 // No hole to bridge (or every hole was refused): the prop's own, now ledge-exempt treads
                 // are the path. This is NOT a skip - reporting it as one hid whole flights in V3.11.
                 r.NoHoles++;
+                skip.Counter = 5;
+                if (holeSteep > 0)
+                {
+                    skip.Reason = "hole-steep"; skip.HoleRun = stRun; skip.HoleRise = stRise;
+                    skip.HoleSlopeDeg = stDeg; skip.HoleCount = holeSteep;
+                }
+                else if (holeRise > 0)
+                {
+                    skip.Reason = "hole-rise"; skip.HoleRun = riRun; skip.HoleRise = riRise;
+                    skip.HoleSlopeDeg = (float)(Math.Atan2(riRise, riRun) * 180.0 / Math.PI);
+                    skip.HoleCount = holeRise;
+                }
+                else if (holeLong > 0)
+                {
+                    skip.Reason = "hole-long"; skip.HoleRun = loRun; skip.HoleRise = loRise;
+                    skip.HoleSlopeDeg = (float)(Math.Atan2(loRise, loRun) * 180.0 / Math.PI);
+                    skip.HoleCount = holeLong;
+                }
+                else if (holeShort > 0) { skip.Reason = "hole-short"; skip.HoleCount = holeShort; }
+                else if (holes == 0) skip.Reason = "no-holes";
+                else skip.Reason = "within-climb";   // every hole is steppable: treads are the path
+                r.Skips.Add(skip);
+                // Same ladder fallback: a ladder whose rungs/holes are all steppable still has no
+                // widened, erosion-proof path of its own.
+                if (TryLadderChain(r, p, perp, winLo, winHi, cx, cy, cz, topZ, used, stationCount,
+                        runMin, runSpan, zMin, zMax, slopeCapDegrees, cellSizeMeters, skip))
+                    return;
                 return;
             }
             if (starts.Count > MaxRampsPerProp)
             {
                 r.Capped++;
+                skip.Reason = "capped";
+                skip.Counter = 4;
+                r.Skips.Add(skip);
                 return;
             }
 
@@ -427,10 +630,17 @@ namespace BetterBannerlordNavmeshing
             {
                 r.SkippedFlat++;   // no chunk even reached the slope / run guards
             }
+            if (emitted == 0)
+            {
+                skip.Reason = "chunk-refused";
+                skip.HoleCount = starts.Count;
+                r.Skips.Add(skip);
+            }
         }
 
         // The flight's horizontal direction, from the band envelope centres of its lowest and highest
-        // occupied 0.5 m bands. False when the prop has no usable rise.
+        // occupied 0.5 m bands. False when the prop has no usable rise. Also returns those two centres
+        // (the flight's own bottom and top), which a ladder chain needs as its endpoints.
         private static bool FlightDirection(float[] cx, float[] cy, float[] cz, float[] topZ, int used,
             float zMin, float zMax, out float dirX, out float dirY)
         {
@@ -474,6 +684,43 @@ namespace BetterBannerlordNavmeshing
             return true;
         }
 
+        // The envelope centres of the prop's lowest and highest occupied 0.5 m bands: the flight's own
+        // bottom and top points. Same bands FlightDirection uses for the run direction.
+        private static bool BandCentres(float[] cx, float[] cy, float[] cz, float[] topZ, int used,
+            float zMin, float zMax, out float bx, out float by, out float tx, out float ty)
+        {
+            bx = 0f; by = 0f; tx = 0f; ty = 0f;
+            int bandCount = (int)Math.Floor((zMax - zMin) / LayerHeightMeters) + 1;
+            if (bandCount < 2) bandCount = 2;
+            if (bandCount > 8192) bandCount = 8192;
+            var bandZ = new float[bandCount];
+            for (int b = 0; b < bandCount; b++) bandZ[b] = float.MinValue;
+            for (int k = 0; k < used; k++)
+            {
+                int b = BandOf(cz[k], zMin, bandCount);
+                if (topZ[k] > bandZ[b]) bandZ[b] = topZ[k];
+            }
+            int bandLo = -1, bandHi = -1;
+            for (int b = 0; b < bandCount; b++)
+            {
+                if (bandZ[b] == float.MinValue) continue;
+                if (bandLo < 0) bandLo = b;
+                bandHi = b;
+            }
+            if (bandLo < 0 || bandHi <= bandLo) return false;
+            float lx = 0, ly = 0, hx = 0, hy = 0;
+            int ln = 0, hn = 0;
+            for (int k = 0; k < used; k++)
+            {
+                int b = BandOf(cz[k], zMin, bandCount);
+                if (b == bandLo && topZ[k] >= bandZ[bandLo] - EnvelopeTolerance) { lx += cx[k]; ly += cy[k]; ln++; }
+                if (b == bandHi && topZ[k] >= bandZ[bandHi] - EnvelopeTolerance) { hx += cx[k]; hy += cy[k]; hn++; }
+            }
+            if (ln == 0 || hn == 0) return false;
+            bx = lx / ln; by = ly / ln;
+            tx = hx / hn; ty = hy / hn;
+            return true;
+        }
         private static int BandOf(float z, float zMin, int bandCount)
         {
             int b = (int)((z - zMin) / LayerHeightMeters);

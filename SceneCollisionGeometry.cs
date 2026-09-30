@@ -309,6 +309,7 @@ namespace BetterBannerlordNavmeshing
             var rampTris = new List<int>();
             int rampQuads = 0, rampStairs = 0, rampLadders = 0, rampHoles = 0, rampNoHoles = 0;
             int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
+            var rampSkips = new List<SteppedPropRamps.Skip>();
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -436,6 +437,7 @@ namespace BetterBannerlordNavmeshing
                         rampSkippedSteep += ramps.SkippedSteep;
                         rampSkippedLong += ramps.SkippedLong;
                         rampCapped += ramps.Capped;
+                        for (int k = 0; k < ramps.Skips.Count; k++) rampSkips.Add(ramps.Skips[k]);
 
                         rampHoles += ramps.Holes;
                         rampNoHoles += ramps.NoHoles;
@@ -557,6 +559,12 @@ namespace BetterBannerlordNavmeshing
                         log("assets: stepped: skipped detail flat=" + rampSkippedFlat + " steep="
                             + rampSkippedSteep + " long=" + rampSkippedLong + " capped=" + rampCapped
                             + "; " + SteppedPropRamps.Describe());
+                    // One line per skipped prop asset, folded by (name, reason), capped.
+                    List<SteppedPropRamps.Skip> foldedSkips = SteppedPropRamps.FoldSkips(rampSkips);
+                    for (int k = 0; k < foldedSkips.Count && k < 20; k++)
+                        log("assets: " + SteppedPropRamps.DescribeSkip(foldedSkips[k]));
+                    if (foldedSkips.Count > 20)
+                        log("assets: ramps: skip ... (+" + (foldedSkips.Count - 20) + " more)");
                 }
                 else
                 {

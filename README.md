@@ -291,7 +291,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
-| `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
+| `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -870,6 +870,48 @@ Case (e) was the V3.16 residual and is fixed in V3.17 (see *Stitching*): the mer
 ~0.3 m air gap over the wall block because its clearance probe sampled the stitch line too sparsely and could not
 see the block's solid volume at all.
 
+**V3.18: the two real ladders get ramps, and every skipped prop says why.** `civilian_ladder_6m` (at
+`(300.05, 280.84, 15.60)`) and `civilian_ladder_5m` (`(302.53, 313.77, 16.63)`) are tilted ~61 deg from
+horizontal, and neither used to synthesize anything. The reason was not steepness: each ladder's collision is a
+**slanted plank** - 12 triangles forming a closed prism whose faces span the whole flight - so at every run
+station the envelope carried the plank's *global* top (21.08 m), the envelope could not rise, and the synthesis
+stopped at `no-rise` (0.000 m of rise over 31 stations) long before the slope rules. The ladder's own surface is
+also the wrong shape to be the path: at ~0.7 m wide it is narrower than 3 cells, so `rcErodeWalkableArea` removes
+all of it.
+
+Two changes:
+
+1. **Per-prop skip reasons.** Every prop that produces no ramp is now named in the log with the reason and the
+   numbers that made it so, folded by (prop, reason) and capped:
+   ```
+   assets: ramps: skip 'sturgia_castle_stairs_c_l2' no-holes tris=79 z=[18.838..21.314] runSpan=4.307m stations=0/33 (x58 props)
+   assets: ramps: skip 'wooden_platform_stairs_a'  no-rise  tris=132 z=[35.442..37.764] runSpan=3.226m stations=33/33 (x12 props)
+   ```
+   Reasons: `z-range`, `no-direction`, `vertical`, `too-short`, `no-support`, `no-rise`, `no-holes`,
+   `within-climb`, `hole-steep`, `hole-long`, `hole-rise`, `hole-short`, `capped`, `chunk-refused`; hole reasons
+   carry the offending hole's `run`/`rise`/`-> deg`.
+2. **A Ladder fallback chain.** A `Ladder` prop's collision is a climbable plane, not a tread pattern: it has no
+   holes to bridge and its own surface is too steep (and too narrow) to be the path. So when the hole-based
+   synthesis found nothing to use, the builder now lays **one straight ramp from the prop's own bottom to its top**
+   - exactly the chain the hole logic would produce if every station were a hole. It goes through the same
+   `EmitChunk`, so the width clamp (>= `MinWidthMeters` = 1.2 m, which is what beats erosion), the slope cap, the
+   dedupe and the two end aprons are identical to a hole bridge's. Measured on the re-dumped snapshot:
+   `ramps: synthesized=2 props=2 ladders=2` (was 0), and
+
+   | ramp | rise | run | slope | width |
+   |---|---|---|---|---|
+   | `civilian_ladder_6m` | 5.517 m | 2.920 m | 62.1 deg | 1.2 m |
+   | `civilian_ladder_5m` | 4.453 m | 2.251 m | 63.2 deg | 1.2 m |
+
+   with the emitted geometry at the props' own `z` ranges (`[15.563..21.080]` and `[16.597..21.050]`).
+
+The fallback is deliberately restricted to `Ladder`-flagged props that produced no ramp at all, so nothing that
+already worked changes: Test 23 (4/4), Test 24, the merge-stitch tests and the 18-instance `--coverage` tables are
+untouched (all 36 rows bit-identical, worst |coverage delta| = 0.0). **Residual, same root cause, not covered:**
+12 `wooden_platform_stairs_a` entities (and some `sturgia_*` stairs) also report `no-rise`/`no-holes` with
+`stations=<all>/<all>`, i.e. their collision faces span the whole run and flatten the envelope too. They are
+`HasSteps` props with measured 100 % level coverage, so the ladder rule was not extended to them.
+
 ### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
@@ -919,6 +961,7 @@ NavMesh: assets: entities=... physics=... included=... laddersIncluded=... exclu
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: stepped: ramps=<n> stairs=<n> ladders=<n> holes=<n> noHoles=<n> skipped=<n> (ramps bridge unsupported stretches only; treads are ledge-exempt)   <- only when NavMeshVoxelSteppedProps=true
 NavMesh: assets: stepped: skipped detail flat=<n> steep=<n> long=<n> capped=<n>; band=0.5m ...   <- only when something was skipped
+NavMesh: assets: ramps: skip '<prop>' <reason> [run=..m rise=..m -> ..deg (holes=../..)] tris=.. z=[.. ..] runSpan=..m stations=<supported>/<total> [(x N props)]   <- one folded line per skipped prop asset, capped at 20 (V3.18)
 NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 20 by triangle count)
 NavMesh: v2: terrain hole mask applied: cells touching a hole are dropped from the soup   <- only when holes were found
 NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted uniformly by +0.5m)
