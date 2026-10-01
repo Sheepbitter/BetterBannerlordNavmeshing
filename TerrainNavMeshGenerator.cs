@@ -959,6 +959,12 @@ namespace BetterBannerlordNavmeshing
             public long ClearMs;
             public long ImportMs;
             public long FacesAfterMs;
+
+            // Non-null when the write succeeded but ImportNavigationMeshPrefab was
+            // deliberately not called, because the engine provably cannot resolve
+            // the name in this session (see NavMeshPrefabIndex). Callers should
+            // log this instead of the generic "import skipped" note.
+            public string ImportSkipReason;
         }
 
         public static ExportResult ExportAndImport(
@@ -1032,9 +1038,26 @@ namespace BetterBannerlordNavmeshing
 
             string prefabName = ResolvePrefabName(scene, prefabNameOverride, log);
             string folder = ResolveFolder(scene, folderOverride, log);
+
+            // Snapshot the two facts that decide whether the engine can resolve
+            // this name at all, BEFORE anything is created on disk:
+            //   - did the NavMeshPrefabs folder already exist? The native index
+            //     only ever looks at modules that HAVE one;
+            //   - did <name>.bin already exist? If it did, the name was in the
+            //     index when it was built and rewriting the file keeps it there.
+            bool folderExisted = Directory.Exists(folder);
+            string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
+            bool binExistedBefore = File.Exists(binPath);
+
+            if (log != null)
+                log("prefab index: folder=" + folder
+                    + " folderExistedBefore=" + folderExisted
+                    + " binExistedBefore=" + binExistedBefore);
+
+            NavMeshPrefabIndex.DescribeLookup(log, prefabName, folder);
+
             Directory.CreateDirectory(folder);
 
-            string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
             if (log != null)
                 log("writing bin: " + binPath);
             var writeWatch = System.Diagnostics.Stopwatch.StartNew();
@@ -1065,6 +1088,36 @@ namespace BetterBannerlordNavmeshing
 
             if (importIntoScene)
             {
+                // The engine resolves a prefab name through an index it built while
+                // the modules were loading (rva 0x4EBCE0: it walks the loaded
+                // modules, and for each module with a NavMeshPrefabs folder
+                // registers every *.bin stem it finds). There is no managed API to
+                // refresh it and no filesystem fallback: load_nav_mesh_prefab
+                // (rva 0x9795F0) does a case-sensitive lookup and, on a miss, logs
+                // "file not found: <path>" followed by
+                // 'No navigation mesh prefab was found with name "<name>"!'.
+                //
+                // So when we can prove the name was not in the index, calling the
+                // importer would only produce that engine error and import zero
+                // faces. Skip it and say exactly why instead. A bin that already
+                // existed keeps its name registered, so rewriting and re-importing
+                // in the same session still works.
+                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(
+                    log, prefabName, folder, folderExisted, binExistedBefore);
+
+                if (unresolvable != null)
+                {
+                    result.ImportSkipReason = unresolvable;
+                    if (log != null)
+                    {
+                        log("import SKIPPED (the engine cannot resolve this prefab name in this"
+                            + " session): " + unresolvable);
+                        log("import SKIPPED: the .bin at " + binPath + " is correct; it becomes usable"
+                            + " once the engine's prefab index has been rebuilt.");
+                    }
+                }
+                else
+                {
                 // Find out whether there is anything to clear first: clearing a
                 // scene that has zero navmesh faces can crash the native
                 // navmesh code, so an unknown or zero face count means "don't
@@ -1152,6 +1205,7 @@ namespace BetterBannerlordNavmeshing
                 // enable/disable on it, and static faces are always enabled, so
                 // no SetAbilityOfFacesWithId call is needed.
                 result.ImportAttempted = true;
+                }
             }
 
             if (log != null)
@@ -1174,12 +1228,26 @@ namespace BetterBannerlordNavmeshing
         }
 
         // prefabNameOverride wins; otherwise the scene name plus "_navmesh".
+        //
+        // The derived default is bounded to NavMeshPrefabIndex.LoaderNameLimit:
+        // load_nav_mesh_prefab copies the name into a fixed 0x80-byte buffer
+        // (native rva 0x97988A) and trips "str_length < size" when it does not
+        // fit, so a 128-character-or-longer name is truncated before the lookup
+        // and can never match the file name. A procedural generator can easily
+        // produce a scene name that long, so the bounded form is derived
+        // deterministically (an 8-hex-digit FNV-1a tail) instead of failing. Names
+        // that already fit are untouched, so every existing export stays valid.
         public static string ResolvePrefabName(Scene scene, string prefabNameOverride, System.Action<string> log)
         {
             if (!string.IsNullOrEmpty(prefabNameOverride))
             {
                 if (log != null)
                     log("prefab name: " + prefabNameOverride);
+
+                string overrideProblem = NavMeshPrefabIndex.ValidateName(prefabNameOverride);
+                if (overrideProblem != null && log != null)
+                    log("prefab name WARNING: " + overrideProblem + " (NavMeshPrefabName is used as given)");
+
                 return prefabNameOverride;
             }
 
@@ -1188,9 +1256,15 @@ namespace BetterBannerlordNavmeshing
                 throw new InvalidOperationException(
                     "Could not derive a navmesh prefab name from the scene; set NavMeshPrefabName.");
 
-            string defaultName = sceneName + "_navmesh";
+            string defaultName = NavMeshPrefabIndex.DeriveBoundedName(sceneName, "_navmesh");
             if (log != null)
+            {
                 log("prefab name: " + defaultName + " (scene-derived default)");
+                if (defaultName.Length < sceneName.Length + "_navmesh".Length)
+                    log("prefab name: shortened from '" + sceneName + "_navmesh + hash' ("
+                        + (sceneName + "_navmesh").Length.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        + " characters) because the engine truncates prefab names at 128");
+            }
             return defaultName;
         }
 
@@ -1302,8 +1376,9 @@ namespace BetterBannerlordNavmeshing
         }
 
         // Distinct likely game-root folders, from two independent sources so a
-        // missing one is simply skipped.
-        private static List<string> GetGameRootCandidates()
+        // missing one is simply skipped. Internal: NavMeshPrefabIndex walks the
+        // same roots to mirror the engine's Modules\<M>\NavMeshPrefabs index.
+        internal static List<string> GetGameRootCandidates()
         {
             var roots = new List<string>();
 

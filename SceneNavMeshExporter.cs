@@ -283,6 +283,28 @@ namespace BetterBannerlordNavmeshing
                 string folder = TerrainNavMeshGenerator.ResolveFolder(scene, NavMeshExportFolder, log);
                 log("import only: prefab='" + prefabName + "' folder=" + folder);
 
+                // Same resolvability guard as the export half. Import Only exists
+                // for the "export once, restart the editor, import" loop, so the
+                // bin is normally there; when it is not, calling the importer would
+                // only make the engine log 'No navigation mesh prefab was found with
+                // name "..."!' and add nothing.
+                string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
+                bool folderExisted = System.IO.Directory.Exists(folder);
+                bool binExisted = System.IO.File.Exists(binPath);
+                log("prefab index: folderExistedBefore=" + folderExisted
+                    + " binExistedBefore=" + binExisted);
+                NavMeshPrefabIndex.DescribeLookup(log, prefabName, folder);
+
+                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(
+                    log, prefabName, folder, folderExisted, binExisted);
+                if (unresolvable != null)
+                {
+                    log("import SKIPPED (the engine cannot resolve this prefab name in this"
+                        + " session): " + unresolvable);
+                    log("done: importOnly=true prefab='" + prefabName + "' imported=false");
+                    return;
+                }
+
                 int facesBeforeRun = SafeFaceCount(scene);
                 log("faces before run: " + (facesBeforeRun < 0 ? "unavailable" : facesBeforeRun.ToString()));
 
@@ -317,9 +339,11 @@ namespace BetterBannerlordNavmeshing
             }
         }
 
-        // Shared post-import diagnosis for both the full run and Import Only. The
-        // engine builds its prefab list at startup, so a prefab written this
-        // session is not found on the first attempt.
+        // Shared post-import diagnosis for both the full run and Import Only.
+        // The engine resolves a name through an index it built while the modules
+        // were loading (native rva 0x4EBCE0: every *.bin stem under an existing
+        // Modules/<M>/NavMeshPrefabs), so the face count is the only reliable
+        // evidence that an import actually landed.
         private static void LogImportCheck(System.Action<string> log, int facesBeforeRun, int facesAfterRun, bool clearExistingFaces)
         {
             bool increased;
@@ -337,7 +361,10 @@ namespace BetterBannerlordNavmeshing
 
             if (!increased)
             {
-                log("import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).");
+                log("import warning: no faces appeared. Either this prefab name was not in the engine's"
+                    + " index (it is built from the *.bin files that existed when the modules were loaded,"
+                    + " and nothing re-runs it), or the imported bin was empty for this scene. See the"
+                    + " 'prefab index:' lines above for where the engine looked.");
             }
         }
 
@@ -762,8 +789,10 @@ namespace BetterBannerlordNavmeshing
                 }
                 else
                 {
-                    log("import skipped; import '" + result.PrefabName
-                        + "' manually from the editor's navmesh prefab panel.");
+                    log("import skipped" + (string.IsNullOrEmpty(result.ImportSkipReason)
+                        ? " by request; import '" + result.PrefabName
+                          + "' manually from the editor's navmesh prefab panel."
+                        : "; import '" + result.PrefabName + "': " + result.ImportSkipReason));
                 }
 
                 log("done: totalMs=" + runWatch.ElapsedMilliseconds
@@ -1034,8 +1063,10 @@ namespace BetterBannerlordNavmeshing
                 }
                 else
                 {
-                    log("import skipped; import '" + result.PrefabName
-                        + "' manually from the editor's navmesh prefab panel.");
+                    log("import skipped" + (string.IsNullOrEmpty(result.ImportSkipReason)
+                        ? "; import '" + result.PrefabName
+                          + "' manually from the editor's navmesh prefab panel."
+                        : "; import '" + result.PrefabName + "': " + result.ImportSkipReason));
                 }
 
                 log("done: totalMs=" + req.RunWatch.ElapsedMilliseconds

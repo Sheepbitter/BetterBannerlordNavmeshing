@@ -45,6 +45,45 @@ Copy-Item -LiteralPath $subModuleSrc -Destination $subModuleDst -Force
 Write-Host "SubModule.xml -> $subModuleDst"
 Write-Host ""
 
+# Provision Modules\BetterBannerlordNavmeshing\NavMeshPrefabs.
+#
+# The engine only ever looks for navmesh prefabs in a Modules\<Module>\NavMeshPrefabs
+# folder, and it builds its name -> module index once, while the modules load
+# (TaleWorlds.Native.dll rva 0x4EBCE0: it walks the loaded modules and registers
+# every *.bin stem found in an existing NavMeshPrefabs folder). A folder created
+# after that point is invisible for the rest of the session, which is what makes
+# a procedural generator log
+#   No navigation mesh prefab was found with name "<name>"!
+# (native rva 0x9795F0, reached via Scene.ImportNavigationMeshPrefab).
+#
+# The folder is therefore created here, at deploy time, so it exists before the
+# engine ever starts. A .txt inside it is not a *.bin, so it registers nothing; it
+# only documents the folder for whoever looks at the module folder later.
+$navMeshPrefabsDir = Join-Path $moduleDir 'NavMeshPrefabs'
+New-Item -ItemType Directory -Path $navMeshPrefabsDir -Force | Out-Null
+$navMeshPrefabsReadme = Join-Path $navMeshPrefabsDir 'README.txt'
+if (-not (Test-Path -LiteralPath $navMeshPrefabsReadme)) {
+    $navMeshPrefabsText = @'
+Navmesh prefabs are read from this folder.
+
+The engine resolves a navmesh prefab name to a module by scanning
+Modules\<Module>\NavMeshPrefabs\*.bin once, while the modules are loading, and it
+keeps that list for the whole session. Two consequences:
+
+  * This folder must exist before the game/editor starts. If it is created later
+    (for example by the first export that resolves to this module), every bin
+    written into it stays invisible until the index is rebuilt - restart the
+    editor or reload modules.
+  * A prefab name that did not exist when the index was built can never be
+    resolved in that session, however many times its .bin is rewritten.
+    build.ps1 creates this folder; TerrainNavMeshGenerator writes <prefab>.bin
+    into it and logs a "prefab index:" block saying whether the name resolves.
+'@
+    Set-Content -LiteralPath $navMeshPrefabsReadme -Value $navMeshPrefabsText -Encoding UTF8
+}
+Write-Host "NavMeshPrefabs -> $navMeshPrefabsDir (pre-existing folder, so the engine indexes it)"
+Write-Host ""
+
 Write-Host "Summary"
 foreach ($variant in $variants) {
     $dll = Join-Path $moduleDir "bin\$variant\BetterBannerlordNavmeshing.dll"
