@@ -136,22 +136,247 @@ namespace BetterBannerlordNavmeshing
         public static byte[] WriteInterleaved(float[] xyz, int vertexCount,
             int[] tri, int faceCount, out int edgeCount)
         {
-            List<int> edgeA, edgeB;
-            Dictionary<long, int> edgeMap;
-            BuildEdges(tri, faceCount, out edgeA, out edgeB, out edgeMap);
-            edgeCount = edgeA.Count;
+            return WriteInterleaved(xyz, vertexCount, tri, faceCount, null, out edgeCount);
+        }
 
-            var vx = new float[vertexCount];
-            var vy = new float[vertexCount];
-            var vz = new float[vertexCount];
-            for (int i = 0; i < vertexCount; i++)
+        // Quad-aware overload. `quadPairs` holds two triangle indices per merged quad (null/empty =
+        // triangles only, in which case the output is byte-identical to the plain writer). Each pair
+        // is emitted as ONE 4-vertex face: the shared interior edge is deleted, the four remaining
+        // boundary edges are written, and field 0 (is_concave, >= v2) carries the honest reflex flag.
+        // Unpaired faces keep their 3-vertex record unchanged. Native navmeshes are polygon-based with
+        // exactly this per-face vertex count + is_concave layout, so the importer already accepts n-gons.
+        public static byte[] WriteInterleaved(float[] xyz, int vertexCount,
+            int[] tri, int faceCount, int[] quadPairs, out int edgeCount)
+        {
+            if (quadPairs == null || quadPairs.Length < 2)
             {
-                vx[i] = xyz[i * 3 + 0];
-                vy[i] = xyz[i * 3 + 1];
-                vz[i] = xyz[i * 3 + 2];
+                List<int> plainA, plainB;
+                Dictionary<long, int> plainMap;
+                BuildEdges(tri, faceCount, out plainA, out plainB, out plainMap);
+                edgeCount = plainA.Count;
+
+                var pvx = new float[vertexCount];
+                var pvy = new float[vertexCount];
+                var pvz = new float[vertexCount];
+                for (int i = 0; i < vertexCount; i++)
+                {
+                    pvx[i] = xyz[i * 3 + 0];
+                    pvy[i] = xyz[i * 3 + 1];
+                    pvz[i] = xyz[i * 3 + 2];
+                }
+                return WriteFlat(pvx, pvy, pvz, vertexCount, tri, faceCount, plainA, plainB, plainMap);
             }
 
-            return WriteFlat(vx, vy, vz, vertexCount, tri, faceCount, edgeA, edgeB, edgeMap);
+            // Which faces are quad anchors (emitted as a 4-gon) and which are the skipped partner.
+            var anchor = new int[faceCount];
+            var partner = new int[faceCount];
+            for (int i = 0; i < faceCount; i++) { anchor[i] = -1; partner[i] = -1; }
+            for (int q = 0; q + 1 < quadPairs.Length; q += 2)
+            {
+                int f0 = quadPairs[q], f1 = quadPairs[q + 1];
+                if (f0 < 0 || f1 < 0 || f0 >= faceCount || f1 >= faceCount || f0 == f1) continue;
+                if (anchor[f0] >= 0 || partner[f0] >= 0 || anchor[f1] >= 0 || partner[f1] >= 0) continue;
+                anchor[f0] = f1;
+                partner[f1] = f0;
+            }
+
+            // Emit the face walks in the source face order, skipping partners.
+            var faceVerts = new List<int>(tri.Length);
+            var faceStart = new List<int>(faceCount);
+            var faceLen = new List<byte>(faceCount);
+            var faceConcave = new List<byte>(faceCount);
+            var walk = new int[4];
+            for (int f = 0; f < faceCount; f++)
+            {
+                if (partner[f] >= 0) continue;
+                faceStart.Add(faceVerts.Count);
+                if (anchor[f] >= 0)
+                {
+                    bool concave;
+                    BuildQuad(tri, xyz, f, anchor[f], walk, out concave);
+                    faceVerts.Add(walk[0]); faceVerts.Add(walk[1]);
+                    faceVerts.Add(walk[2]); faceVerts.Add(walk[3]);
+                    faceLen.Add(4);
+                    faceConcave.Add((byte)(concave ? 1 : 0));
+                }
+                else
+                {
+                    faceVerts.Add(tri[f * 3]); faceVerts.Add(tri[f * 3 + 1]); faceVerts.Add(tri[f * 3 + 2]);
+                    faceLen.Add(3);
+                    faceConcave.Add(0);
+                }
+            }
+            int outFaceCount = faceStart.Count;
+
+            // Edge table over the emitted perimeters (the shared edges are gone).
+            var edgeMap = new Dictionary<long, int>(LongKeyComparer.Instance);
+            var edgeA = new List<int>();
+            var edgeB = new List<int>();
+            var faceEdges = new List<int>(outFaceCount * 4);
+            for (int i = 0; i < outFaceCount; i++)
+            {
+                int s = faceStart[i], n = faceLen[i];
+                for (int j = 0; j < n; j++)
+                {
+                    int a = faceVerts[s + j];
+                    int b = faceVerts[s + (j + 1) % n];
+                    int lo = a < b ? a : b, hi = a < b ? b : a;
+                    long key = ((long)lo << 32) | (uint)hi;
+                    int ei;
+                    if (!edgeMap.TryGetValue(key, out ei))
+                    {
+                        ei = edgeA.Count;
+                        edgeMap[key] = ei;
+                        edgeA.Add(lo);
+                        edgeB.Add(hi);
+                    }
+                    faceEdges.Add(ei);
+                }
+            }
+            edgeCount = edgeA.Count;
+
+            int bodyLength = 4 + 4 + vertexCount * 12 + 4 + edgeA.Count * 20 + 4;
+            for (int i = 0; i < outFaceCount; i++) bodyLength += 25 + 8 * faceLen[i];
+            bodyLength += 4 + LevelGroupCount * 8;
+
+            using (var stream = new MemoryStream(bodyLength + 4))
+            {
+                using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, true))
+                {
+                    writer.Write((uint)bodyLength);
+                    writer.Write(Nmg8Version);
+
+                    writer.Write(vertexCount);
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        writer.Write(xyz[i * 3]);
+                        writer.Write(xyz[i * 3 + 1]);
+                        writer.Write(xyz[i * 3 + 2]);
+                    }
+
+                    writer.Write(edgeA.Count);
+                    for (int i = 0; i < edgeA.Count; i++)
+                    {
+                        writer.Write(PadInt);
+                        writer.Write(edgeA[i]);
+                        writer.Write(edgeB[i]);
+                        writer.Write(PadInt);
+                        writer.Write(PadInt);
+                    }
+
+                    writer.Write(outFaceCount);
+                    int feBase = 0;
+                    for (int i = 0; i < outFaceCount; i++)
+                    {
+                        int n = faceLen[i];
+                        int s = faceStart[i];
+                        writer.Write(n);
+                        for (int j = 0; j < n; j++) writer.Write(faceVerts[s + j]);
+                        for (int j = 0; j < n; j++) writer.Write(faceEdges[feBase + j]);
+                        feBase += n;
+
+                        // Per-face versioned fields (version_fields_count = 2):
+                        // field 0 (>= v2): is_concave, field 1 (>= v1): level_cost_index.
+                        writer.Write(2);
+                        writer.Write((int)faceConcave[i]);
+                        writer.Write(0);
+
+                        writer.Write(0f);            // cost
+                        writer.Write(LevelMaskAll);  // level_mask (all agents)
+                        writer.Write((byte)0);       // inverted flag
+                    }
+
+                    writer.Write(LevelGroupCount);
+                    for (int g = 0; g < LevelGroupCount; g++)
+                    {
+                        writer.Write(0);
+                        writer.Write(0);
+                    }
+
+                    writer.Flush();
+                }
+
+                return stream.ToArray();
+            }
+        }
+
+        // Reconstructs the 4-vertex boundary walk of the quad formed by triangles f0 and f1 (which
+        // share exactly one edge). The walk keeps f0's winding: with the shared edge directed along
+        // f0's winding as (p -> q), the walk is q -> x -> p -> y, where x/y are the two apexes.
+        // concave is true when the quad has exactly one reflex vertex (typical when a sliver merges
+        // with its neighbour). Pure geometry; it never trusts an inconsistent winding.
+        private static void BuildQuad(int[] tri, float[] xyz, int f0, int f1, int[] walk, out bool concave)
+        {
+            int a0 = tri[f0 * 3], b0 = tri[f0 * 3 + 1], c0 = tri[f0 * 3 + 2];
+            int a1 = tri[f1 * 3], b1 = tri[f1 * 3 + 1], c1 = tri[f1 * 3 + 2];
+            int p, q, x;
+            if (Shares(a0, b0, a1, b1, c1)) { p = a0; q = b0; x = c0; }
+            else if (Shares(b0, c0, a1, b1, c1)) { p = b0; q = c0; x = a0; }
+            else { p = c0; q = a0; x = b0; }
+            int y = OtherOf(a1, b1, c1, p, q);
+            walk[0] = q; walk[1] = x; walk[2] = p; walk[3] = y;
+            concave = QuadReflex(xyz, walk);
+        }
+
+        private static bool Shares(int u, int w, int a, int b, int c)
+        {
+            return (u == a || u == b || u == c) && (w == a || w == b || w == c);
+        }
+
+        private static int OtherOf(int a, int b, int c, int u, int w)
+        {
+            if (a != u && a != w) return a;
+            if (b != u && b != w) return b;
+            if (c != u && c != w) return c;
+            return -1;
+        }
+
+        // True when the quad walk has a reflex corner (folding the polygon onto its own plane).
+        private static bool QuadReflex(float[] xyz, int[] walk)
+        {
+            double nx = 0, ny = 0, nz = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                int a = walk[i], b = walk[(i + 1) % 4];
+                double ax = xyz[a * 3], ay = xyz[a * 3 + 1], az = xyz[a * 3 + 2];
+                double bx = xyz[b * 3], by = xyz[b * 3 + 1], bz = xyz[b * 3 + 2];
+                nx += (ay - by) * (az + bz);
+                ny += (az - bz) * (ax + bx);
+                nz += (ax - bx) * (ay + by);
+            }
+            double nl = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-12) return false;
+            nx /= nl; ny /= nl; nz /= nl;
+            double ux, uy, uz;
+            if (Math.Abs(nx) <= Math.Abs(ny) && Math.Abs(nx) <= Math.Abs(nz)) { ux = 0; uy = -nz; uz = ny; }
+            else if (Math.Abs(ny) <= Math.Abs(nz)) { ux = -nz; uy = 0; uz = nx; }
+            else { ux = -ny; uy = nx; uz = 0; }
+            double ul = Math.Sqrt(ux * ux + uy * uy + uz * uz);
+            if (ul < 1e-12) return false;
+            ux /= ul; uy /= ul; uz /= ul;
+            double wx = ny * uz - nz * uy, wy = nz * ux - nx * uz, wz = nx * uy - ny * ux;
+
+            double cx = 0, cy = 0, cz = 0;
+            for (int i = 0; i < 4; i++) { cx += xyz[walk[i] * 3]; cy += xyz[walk[i] * 3 + 1]; cz += xyz[walk[i] * 3 + 2]; }
+            cx /= 4; cy /= 4; cz /= 4;
+            var px = new double[4];
+            var py = new double[4];
+            for (int i = 0; i < 4; i++)
+            {
+                double dx = xyz[walk[i] * 3] - cx, dy = xyz[walk[i] * 3 + 1] - cy, dz = xyz[walk[i] * 3 + 2] - cz;
+                px[i] = dx * ux + dy * uy + dz * uz;
+                py[i] = dx * wx + dy * wy + dz * wz;
+            }
+            double area2 = 0;
+            for (int i = 0; i < 4; i++) { int j = (i + 1) % 4; area2 += px[i] * py[j] - px[j] * py[i]; }
+            if (Math.Abs(area2) < 1e-12) return false;
+            for (int i = 0; i < 4; i++)
+            {
+                int pa = (i + 3) % 4, pb = i, pc = (i + 1) % 4;
+                double cr = (px[pb] - px[pa]) * (py[pc] - py[pa]) - (py[pb] - py[pa]) * (px[pc] - px[pa]);
+                if (cr * area2 < 0) return true;   // this corner is reflex
+            }
+            return false;
         }
 
         // Serialises vertices/faces into a full NMG8 .bin (length prefix

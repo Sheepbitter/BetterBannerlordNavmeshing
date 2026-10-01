@@ -80,6 +80,12 @@ namespace BetterBannerlordNavmeshing
         // Final-mesh sliver cleanup (thin/tiny triangles). Default ON, documented in the README.
         public bool NavMeshVoxelCleanup = true;
 
+        // Final quad merge, part of the cleanup (default ON). Thin faces are combined with a
+        // near-coplanar neighbour into one emitted 4-vertex face; geometry is unchanged (only the
+        // shared interior edge disappears). Switch OFF instantly if the engine's importer ever
+        // dislikes n-gon faces.
+        public bool NavMeshVoxelQuadMerge = true;
+
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
         public string NavMeshSnapshotAssertPoints = "";
@@ -460,6 +466,7 @@ namespace BetterBannerlordNavmeshing
                     + " prune=" + (NavMeshVoxelPruneIsolatedIslands
                         ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
+                    + " quadMerge=" + NavMeshVoxelQuadMerge
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
                     + " includeFlora=" + NavMeshVoxelIncludeFlora);
@@ -544,7 +551,7 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
-                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps);
+                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -565,7 +572,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false);
+                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, true);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
@@ -597,7 +604,8 @@ namespace BetterBannerlordNavmeshing
             int voxelStitchMaxGapCells,
             bool voxelPruneIsolatedIslands,
             int voxelPruneMaxIslandFaces,
-            bool voxelSteppedProps)
+            bool voxelSteppedProps,
+            bool voxelQuadMerge)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -636,6 +644,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelStitchMaxGapCells=" + voxelStitchMaxGapCells
                     + " voxelPrune=" + (voxelPruneIsolatedIslands ? voxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + voxelSteppedProps
+                    + " quadMerge=" + voxelQuadMerge
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(voxelContourMaxError) + "vox"
@@ -680,6 +689,7 @@ namespace BetterBannerlordNavmeshing
                     voxel.StitchMaxGapCells = voxelStitchMaxGapCells;
                     voxel.PruneIsolatedIslands = voxelPruneIsolatedIslands;
                     voxel.PruneMaxIslandFaces = voxelPruneMaxIslandFaces;
+                    voxel.QuadMerge = voxelQuadMerge;
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
@@ -893,6 +903,7 @@ namespace BetterBannerlordNavmeshing
                 voxel.PruneIsolatedIslands = NavMeshVoxelPruneIsolatedIslands;
                 voxel.PruneMaxIslandFaces = NavMeshVoxelPruneMaxIslandFaces;
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
+                voxel.QuadMerge = NavMeshVoxelQuadMerge;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;

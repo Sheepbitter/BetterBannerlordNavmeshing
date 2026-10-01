@@ -95,6 +95,13 @@ namespace BetterBannerlordNavmeshing
             public bool CleanupSlivers = true;
             public int CleanupMaxMs = 6000;
 
+            // Final quad merge (part of the cleanup, after the flip polish). Thin faces are combined
+            // with a near-coplanar neighbour into one emitted 4-vertex face (the writer writes the
+            // engine's n-gon face record with an honest is_concave). Geometry and the triangle list are
+            // unchanged - only the shared interior edge disappears - so this is purely a face-count /
+            // routing-cost reduction. Default ON; switch OFF instantly if the importer dislikes n-gons.
+            public bool QuadMerge = true;
+
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
 
@@ -178,6 +185,10 @@ namespace BetterBannerlordNavmeshing
             // Recast-space (Y-up), welded, height-offset applied.
             public float[] VertsXyz;
             public int[] Tris;
+            // Quad merge: two triangle indices per emitted 4-vertex face. Null when the cleanup is off
+            // or no thin face could be merged. The triangles stay in Tris; the writer folds each pair
+            // into one 4-vertex face (identical geometry).
+            public int[] QuadPairs;
             public int VertexCount;
             public int FaceCount;
             public int EdgeCount;
@@ -833,6 +844,7 @@ namespace BetterBannerlordNavmeshing
             // Final-mesh sliver cleanup (thin/tiny triangles). Runs on the merged, welded, stitched,
             // pruned mesh; only retriangulates it (decimate needle/thin vertices + flip polish). The
             // island count is asserted unchanged and the outline moves by <= a small tolerance.
+            int[] quadPairs = null;
             if (s.CleanupSlivers && merged.Tris.Count >= 3)
             {
                 var cv = new List<float>(merged.X.Count * 3);
@@ -841,9 +853,9 @@ namespace BetterBannerlordNavmeshing
                     cv.Add(merged.X[i]); cv.Add(merged.Y[i]); cv.Add(merged.Z[i]);
                 }
                 var ct = new List<int>(merged.Tris);
-                NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, s.CleanupMaxMs);
+                NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, s.CleanupMaxMs, s.QuadMerge);
                 if (cln.Welded > 0 || cln.Removed > 0 || cln.Decimated > 0 || cln.Relaxed > 0
-                    || cln.Refined > 0 || cln.Flipped > 0)
+                    || cln.Refined > 0 || cln.Flipped > 0 || cln.Quads > 0)
                 {
                     int nv = cv.Count / 3;
                     merged.X.Clear(); merged.Y.Clear(); merged.Z.Clear();
@@ -853,9 +865,11 @@ namespace BetterBannerlordNavmeshing
                     }
                     merged.Tris.Clear(); merged.Tris.AddRange(ct);
                 }
+                if (cln.Quads > 0 && cln.QuadPairs != null)
+                    quadPairs = cln.QuadPairs.ToArray();
                 Log(log, "cleanup: welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
                     + cln.Decimated + " relaxed=" + cln.Relaxed + " refined=" + cln.Refined
-                    + " flipped=" + cln.Flipped + " needles before=" + cln.NeedlesBefore
+                    + " flipped=" + cln.Flipped + " quads=" + cln.Quads + " needles before=" + cln.NeedlesBefore
                     + " after=" + cln.NeedlesAfter + " thin before=" + cln.ThinBefore + " after="
                     + cln.ThinAfter + " boundaryMoved=" + cln.BoundaryMovedCount + " boundaryMaxMove="
                     + F(cln.BoundaryMaxMove) + "m components " + cln.ComponentsBefore + "->"
@@ -907,6 +921,7 @@ namespace BetterBannerlordNavmeshing
                 result.VertsXyz[i * 3 + 2] = merged.Z[i];
             }
             result.Tris = merged.Tris.ToArray();
+            result.QuadPairs = quadPairs;
 
             // --- topology + invariants (gate) ---
             ComputeInvariants(result, result.Tris, result.FaceCount);

@@ -165,7 +165,7 @@ namespace BetterBannerlordNavmeshing
 
             int edgeCount;
             result.Bin = Nmg8Writer.WriteInterleaved(vres.VertsXyz, vres.VertexCount, vres.Tris,
-                vres.FaceCount, out edgeCount);
+                vres.FaceCount, vres.QuadPairs, out edgeCount);
             result.EdgeCount = edgeCount;
 
             if (writeObj)

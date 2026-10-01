@@ -65,6 +65,15 @@ namespace BetterBannerlordNavmeshing
         public const float FlipNormalAngleDegrees = 18f;
         public const float FlipSurfaceMoveMeters = 0.15f;
         public const float FlipMinAngleGainDegrees = 0.5f;
+        // Quad-merge (the final stage). A face is a candidate while it is still thin by either
+        // predicate (min angle < 6 deg OR aspect longest^2/(2*area) > 8); it may then be combined
+        // with a neighbour across one shared edge into a single 4-vertex face. The two faces must be
+        // near-coplanar (fold <= this many degrees) so the quad is a sensible polygon and step rims /
+        // stacked levels stay out, the four vertices must be distinct, the quad walk must be simple
+        // with the surface's winding, and neither face may already be merged.
+        public const float QuadMergeThinMinAngleDegrees = 6f;
+        public const float QuadMergeThinAspect = 8f;
+        public const float QuadMergeFoldMaxDegrees = 25f;
 
         public sealed class Stats
         {
@@ -82,6 +91,12 @@ namespace BetterBannerlordNavmeshing
             public float SlideMax;
             public int Collapsed;          // short-edge merges (redundant points)
             public int Refined;            // long thin triangles refined by an edge split
+            // Quad merge (final stage): thin faces combined with a neighbour into one emitted
+            // 4-vertex face. Geometry and the triangle list are unchanged - only the shared interior
+            // edge is deleted from the EMITTED face perimeters. QuadPairs holds two face indices per
+            // quad in the FINAL mesh's face numbering (no compaction happens after this stage).
+            public int Quads;
+            public List<int> QuadPairs;
             public string EdgeHist;
             // Why each surviving needle's vertices were not removable (capped; goes to the run log).
             public List<string> Diag;
@@ -90,7 +105,8 @@ namespace BetterBannerlordNavmeshing
         }
 
         // vertsXyz: flat x,y,z. tris: flat indices. maxMilliseconds bounds the decimation + flips.
-        public static Stats Run(List<float> vertsXyz, List<int> tris, int maxMilliseconds)
+        public static Stats Run(List<float> vertsXyz, List<int> tris, int maxMilliseconds,
+            bool quadMerge = true)
         {
             var st = new Stats();
             var watch = System.Diagnostics.Stopwatch.StartNew();
@@ -133,6 +149,14 @@ namespace BetterBannerlordNavmeshing
             // The flip polish gets its own window: decimation is allowed to use the whole budget (it is
             // the primary lever), and squeezing the flips into the remainder left them doing nothing.
             FlipEdges(v, tris, st, (int)(maxMilliseconds + 2500 + refineUsed), watch);
+
+            // The quad merge is the LAST stage and is purely additive: it does not move a vertex, does
+            // not add/remove/reorder a face, and does not touch `tris` at all - it only records which
+            // triangle pairs the writer should emit as a single 4-vertex face (identical geometry, the
+            // shared interior edge simply disappears from the emitted perimeter). It runs after the flip
+            // polish, the last pass that rewrites face contents; from here to the end of Run nothing
+            // compacts `tris`, so the recorded face indices are exactly the final mesh's numbering.
+            if (quadMerge) MergeQuads(vertsXyz, tris, st);
 
             st.NeedlesAfter = CountNeedles(vertsXyz.ToArray(), tris);
             st.ThinAfter = CountThin(vertsXyz.ToArray(), tris);
@@ -1910,6 +1934,182 @@ namespace BetterBannerlordNavmeshing
             double cosA = dot / (l0 * l1);
             if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
             return Math.Acos(cosA) * 180.0 / Math.PI;
+        }
+
+        // ---- 5. QUAD MERGE (final stage) ----------------------------------------------------------
+        // The last quality lever the user asked for: "can any of the remaining needles be combined
+        // with a nearby triangle to make a quad". This stage does NOT change geometry and does NOT
+        // change the triangle list - it only records triangle pairs for the writer to emit as a single
+        // 4-vertex face. The NMG8 format stores a per-face vertex count followed by that many vertex
+        // indices and that many edge indices, plus an is_concave field, so an n-gon is a first-class
+        // face (that is how the engine's own navmeshes are stored). "Merging" is therefore exactly
+        // "delete the shared interior edge from the emitted perimeters": same vertices, same surface,
+        // same coverage, zero geometric risk.
+        //
+        // Deterministic sweep: thin faces in ascending index order; each takes the neighbour across a
+        // shared edge that yields the best quad (maximise the quad's worst interior angle, tie-break
+        // smallest perimeter) subject to: (a) neither face already merged; (b) four distinct vertices;
+        // (c) the quad walk is simple with the surface winding; (d) the two faces fold by <= 25 deg;
+        // (e) geometry unchanged (above); (f) the writer derives the honest is_concave value from the
+        // same walk. Face indices are stable here (no compaction after FlipEdges), so QuadPairs indexes
+        // the final mesh directly.
+        private static void MergeQuads(List<float> verts, List<int> tris, Stats st)
+        {
+            int nf = tris.Count / 3;
+            if (nf < 2) return;
+            var v = verts.ToArray();
+            var merged = new bool[nf];
+            // Exact edge -> faces index (the same leanness as the refine pass): the mesh is manifold
+            // (maxEdgeMult <= 2), so one long per edge holds both face indices (-1 for a boundary edge).
+            var edgeIndex = BuildEdgeFaceIndex(tris);
+            var pairs = new List<int>();
+
+            for (int f0 = 0; f0 < nf; f0++)
+            {
+                if (merged[f0]) continue;
+                int a0 = tris[f0 * 3], b0 = tris[f0 * 3 + 1], c0 = tris[f0 * 3 + 2];
+                if (a0 < 0) continue;
+                if (!IsThinForQuad(v, a0, b0, c0)) continue;
+
+                int bestF1 = -1;
+                double bestWorst = 0.0, bestPerim = 0.0;
+                for (int ei = 0; ei < 3; ei++)
+                {
+                    // The edge directed along f0's winding, so the quad walk below keeps f0's winding.
+                    int u = ei == 0 ? a0 : (ei == 1 ? b0 : c0);
+                    int w = ei == 0 ? b0 : (ei == 1 ? c0 : a0);
+                    long packed;
+                    if (!edgeIndex.TryGetValue(EdgeKey(u, w), out packed)) continue;
+                    int lo = (int)(packed & 0xffffffffL), hi = (int)(packed >> 32);
+                    int f1 = lo == f0 ? hi : (hi == f0 ? lo : -1);
+                    if (f1 < 0 || f1 >= nf || merged[f1]) continue;
+                    int a1 = tris[f1 * 3], b1 = tris[f1 * 3 + 1], c1 = tris[f1 * 3 + 2];
+                    if (a1 < 0) continue;
+                    int x = ThirdVertex(a0, b0, c0, u, w);          // f0's apex
+                    int y = ThirdVertex(a1, b1, c1, u, w);          // neighbour's apex
+                    if (x < 0 || y < 0 || x == y) continue;
+                    if (x == u || x == w || y == u || y == w) continue;   // (b) four distinct vertices
+                    double fold = NormalAngleDeg(v, a0, b0, c0, a1, b1, c1);
+                    if (fold > QuadMergeFoldMaxDegrees) continue;   // (d) step rims / stacked levels out
+                    double worst, perim;
+                    if (!QuadWorstAndPerimeter(v, u, w, x, y, out worst, out perim)) continue; // (c)
+                    bool better = bestF1 < 0
+                        || worst > bestWorst + 1e-9
+                        || (Math.Abs(worst - bestWorst) <= 1e-9 && perim < bestPerim - 1e-9);
+                    if (better) { bestWorst = worst; bestPerim = perim; bestF1 = f1; }
+                }
+
+                if (bestF1 >= 0)
+                {
+                    merged[f0] = true; merged[bestF1] = true;
+                    pairs.Add(f0); pairs.Add(bestF1);
+                }
+            }
+
+            st.Quads = pairs.Count / 2;
+            st.QuadPairs = pairs;
+        }
+
+        // A face is a quad-merge candidate while still thin by either predicate.
+        private static bool IsThinForQuad(float[] v, int a, int b, int c)
+        {
+            if (MinAngle(v, a, b, c) < QuadMergeThinMinAngleDegrees) return true;
+            double area = Area(v, a, b, c);
+            if (area < 1e-12) return false;
+            double longest = Math.Max(Len(v, a, b), Math.Max(Len(v, b, c), Len(v, c, a)));
+            return longest * longest / (2.0 * area) > QuadMergeThinAspect;
+        }
+
+        // The one of (a,b,c) that is neither u nor w (0/1 for a malformed face).
+        private static int ThirdVertex(int a, int b, int c, int u, int w)
+        {
+            if (a != u && a != w) return a;
+            if (b != u && b != w) return b;
+            if (c != u && c != w) return c;
+            return -1;
+        }
+
+        // Builds the quad's boundary walk for the two triangles sharing (u,w), where (u,w) is directed
+        // along f0's winding and x/y are the two apexes. The walk q->x->u->y (q=w, p=u) reproduces f0
+        // and the neighbour triangle with their original winding. Returns the quad's worst interior
+        // angle (degrees) and perimeter (m); false when the projection is degenerate or the walk is
+        // self-intersecting (a bowtie - the two faces are inconsistently wound or overlap), i.e.
+        // constraint (c).
+        private static bool QuadWorstAndPerimeter(float[] v, int u, int w, int x, int y,
+            out double worst, out double perim)
+        {
+            worst = 0.0; perim = 0.0;
+            // walk = w -> x -> u -> y
+            int[] walk = { w, x, u, y };
+
+            // Newell normal of the quad (stable on a near-degenerate sliver).
+            double nx = 0, ny = 0, nz = 0;
+            for (int i = 0; i < 4; i++)
+            {
+                int a = walk[i], b = walk[(i + 1) % 4];
+                double ax = v[a * 3], ay = v[a * 3 + 1], az = v[a * 3 + 2];
+                double bx = v[b * 3], by = v[b * 3 + 1], bz = v[b * 3 + 2];
+                nx += (ay - by) * (az + bz);
+                ny += (az - bz) * (ax + bx);
+                nz += (ax - bx) * (ay + by);
+            }
+            double nl = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-12) return false;
+            nx /= nl; ny /= nl; nz /= nl;
+
+            // Orthonormal basis spanning the quad plane; project the four corners.
+            double ux, uy, uz;
+            if (Math.Abs(nx) <= Math.Abs(ny) && Math.Abs(nx) <= Math.Abs(nz)) { ux = 0; uy = -nz; uz = ny; }
+            else if (Math.Abs(ny) <= Math.Abs(nz)) { ux = -nz; uy = 0; uz = nx; }
+            else { ux = -ny; uy = nx; uz = 0; }
+            double ul = Math.Sqrt(ux * ux + uy * uy + uz * uz);
+            if (ul < 1e-12) return false;
+            ux /= ul; uy /= ul; uz /= ul;
+            double wx = ny * uz - nz * uy, wy = nz * ux - nx * uz, wz = nx * uy - ny * ux;
+
+            double cx = 0, cy = 0, cz = 0;
+            for (int i = 0; i < 4; i++) { cx += v[walk[i] * 3]; cy += v[walk[i] * 3 + 1]; cz += v[walk[i] * 3 + 2]; }
+            cx /= 4; cy /= 4; cz /= 4;
+            var px = new double[4];
+            var py = new double[4];
+            for (int i = 0; i < 4; i++)
+            {
+                double dx = v[walk[i] * 3] - cx, dy = v[walk[i] * 3 + 1] - cy, dz = v[walk[i] * 3 + 2] - cz;
+                px[i] = dx * ux + dy * uy + dz * uz;
+                py[i] = dx * wx + dy * wy + dz * wz;
+            }
+            double area2 = 0;
+            for (int i = 0; i < 4; i++) { int j = (i + 1) % 4; area2 += px[i] * py[j] - px[j] * py[i]; }
+            if (Math.Abs(area2) < 1e-12) return false;
+
+            worst = 180.0;
+            int opposite = 0;   // vertices whose turn sign is opposite the polygon's: reflex / bowtie
+            for (int i = 0; i < 4; i++)
+            {
+                int pa = (i + 3) % 4, pb = i, pc = (i + 1) % 4;
+                double cr = (px[pb] - px[pa]) * (py[pc] - py[pa]) - (py[pb] - py[pa]) * (px[pc] - px[pa]);
+                bool reflex = cr * area2 < -1e-12;
+                if (reflex) opposite++;
+                // Interior angle at this corner, [0,360): reflex corners see the far side.
+                double e1x = px[pa] - px[pb], e1y = py[pa] - py[pb];
+                double e2x = px[pc] - px[pb], e2y = py[pc] - py[pb];
+                double l1 = Math.Sqrt(e1x * e1x + e1y * e1y), l2 = Math.Sqrt(e2x * e2x + e2y * e2y);
+                if (l1 < 1e-12 || l2 < 1e-12) return false;
+                double cosA = (e1x * e2x + e1y * e2y) / (l1 * l2);
+                if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
+                double ang = Math.Acos(cosA) * 180.0 / Math.PI;
+                if (reflex) ang = 360.0 - ang;
+                if (ang < worst) worst = ang;
+            }
+            // A simple quad has at most one reflex corner; two or more is a self-intersecting bowtie.
+            if (opposite >= 2) return false;
+
+            for (int i = 0; i < 4; i++)
+            {
+                int a = walk[i], b = walk[(i + 1) % 4];
+                perim += Len(v, a, b);
+            }
+            return true;
         }
     }
 }

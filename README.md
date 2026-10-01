@@ -292,6 +292,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **inserts** a midpoint into long thin faces (first, so the later passes clean its children), **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, slides ratio needles, and finishes with a Delaunay-style flip polish. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
+| `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices, simple quad walk). **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. The writer emits the engine's n-gon face record (per-face vertex count + boundary edge indices + an honest `is_concave` field). Log: `quads=N` on the `cleanup:` line. `false` = triangles only (A/B for the importer). See *Sliver cleanup*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -706,6 +707,19 @@ it creates.
    of in-plane offsets (toward the ring's centroid, plus rings of directions out to 2 m) and keeps the one
    that maximises its worst incident angle, subject to the same bounds.
 5. **Flip polish.** Delaunay-style edge flips on the remaining near-coplanar quads (strict min-angle gain).
+6. **Quad merge (final, `NavMeshVoxelQuadMerge`).** A face that is still thin (min angle < 6 deg OR aspect
+   `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across one shared edge into ONE
+   emitted **4-vertex face**. This is the user's "combine a needle with a nearby triangle to make a quad":
+   the pipeline stays triangles-only, and the writer folds each recorded pair into a single n-gon face. The
+   NMG8 format stores a per-face vertex count, that many vertex indices, that many boundary edge indices and
+   an `is_concave` field, so an n-gon is a first-class face (native navmeshes are stored the same way). The
+   scan is deterministic (thin faces in index order; each takes the neighbour that maximises the quad's worst
+   interior angle, tie-break smallest perimeter) and **geometry is completely unchanged**: no vertex moves,
+   no triangle is added, removed or reordered - merging only deletes the shared interior edge from the emitted
+   face perimeters. Same surface, same coverage, zero geometric risk; it is purely a face-count (and routing
+   cost) reduction. The writer writes `is_concave = 1` honestly when the quad has a reflex corner (common when
+   a sliver merges with its neighbour) and `0` otherwise; unpaired faces keep their byte-identical 3-vertex
+   record.
 
 Adjacent component structure is protected twice: component counts must be unchanged, and components of 16
 faces or fewer are skipped entirely (a fold could otherwise delete a small island outright).
@@ -715,6 +729,19 @@ inside the mesher's own promise, the fan must be planar enough, no new face may 
 component count must not change, components of 16 faces or fewer are skipped, and the topology gate - the same
 thing the export's invariant gate checks - refuses any removal that would create a duplicate face or an edge
 with more than two faces.
+
+The quad merge has its own small guard set, all checked per candidate pair before the pair is recorded:
+neither face may already be merged; the union's four vertices must be distinct; the quad's boundary walk must
+be simple and wound with the surface (a self-intersecting bowtie - which is what an inconsistently wound or
+overlapping pair produces - is refused); and the two faces may fold by at most 25 deg, so a step rim or two
+stacked levels sharing an edge never become one polygon. Because the shared edge had exactly two incident
+faces in the manifold input, deleting it keeps the emitted mesh manifold. Face indices are stable at this
+point (`MergeQuads` runs after the flip polish and nothing compacts `tris` afterwards), so the recorded pair
+list indexes the final mesh directly. The toggle `NavMeshVoxelQuadMerge` (default on) turns the whole stage
+off instantly - the emitted bin then goes back to triangles only - in case the engine's importer ever
+disagrees with 4-vertex faces. Measured quads emitted: Birtu 808 (170 concave), CC_20 2379 (523 concave),
+Basamu ~4126 (1066 concave) - every other metric is unchanged, since the triangle mesh is untouched (see
+*Sliver cleanup*).
 
 Refinement's own guarantee is **topological, not just geometric**. Each sweep builds an exact edge -> faces
 index (key = the `(a,b)` edge; value = the two face indices packed into one long, face0 in the low 32 bits,
