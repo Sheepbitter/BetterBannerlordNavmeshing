@@ -100,6 +100,13 @@ namespace BetterBannerlordNavmeshing
         public const float ConnectorPadWidthMeters = 1.0f;
         // Test hook: false uses the legacy short pad (the V3.28 behaviour).
         public static bool ConnectorTopPadExtension = true;
+        // SURFACE-SEEKING endpoints. A ladder's physics is often lined up VISUALLY with the metamesh but
+        // its physics object does not reach the doorway sill / upper floor - there is a physics gap. So the
+        // ladder's own top/bottom become LOCATORS: the connector probes up (to the landing) and down (to
+        // the floor) within these reaches and anchors at the surfaces it finds.
+        public const float ConnectorLandingReachMeters = 1.5f;  // vertical search up from the ladder top
+        public const float ConnectorFloorReachMeters = 1.5f;    // vertical search down from the ladder base
+        public const float ConnectorSeekRadiusMeters = 2.0f;    // horizontal footprint around the anchor
 
         public sealed class Prop
         {
@@ -111,6 +118,12 @@ namespace BetterBannerlordNavmeshing
             // when the point is FREE (no solid collision). The collector supplies it from the collision
             // soup, the harness from the synthetic scene. Null => no probe (V3.28 behaviour).
             public Func<float, float, float, bool> IsFreeAt;
+            // Optional surface seeker: SeekSurface(engineX, engineY, fromHeight, up, reach) returns the
+            // engine height of the nearest solid TOP surface within the reach (the highest solid top when
+            // up, the highest below when down), or float.NaN when none is found. Used to make the connector
+            // endpoints land on the doorway sill / upper floor / lower floor even when the ladder's own
+            // physics does not reach them (the common metamesh/physics gap).
+            public Func<float, float, float, bool, float, float> SeekSurface;
         }
 
         public sealed class Result
@@ -237,8 +250,10 @@ namespace BetterBannerlordNavmeshing
         // Offset symbolic connector for a ladder the ordinary synthesis could not connect. Pure: the
         // geometry is derived from the prop alone; the builder's clearance exemption keeps it alive where
         // the ladder's own plank/hatch is within head height. See the header constants for the rationale.
-        private static bool TryLadderOffsetConnector(Result r, Prop p, float slopeCapDegrees, Skip skip)
+        private static bool TryLadderOffsetConnector(Result r, Prop p, float slopeCapDegrees, Skip skip,
+            out string refuse)
         {
+            refuse = null;
             if (p == null || p.VertsXyz == null || p.Tris == null) return false;
             if ((p.Flags & FlagLadder) == 0) return false;
             int triCount = p.Tris.Length / 3;
@@ -309,10 +324,38 @@ namespace BetterBannerlordNavmeshing
                 dirX /= len; dirY /= len;
             }
 
+            // SURFACE-SEEKING ENDPOINTS. The ladder's own physics top/bottom are LOCATORS: probe up for
+            // the landing (doorway sill / upper floor) and down for the floor, so a metamesh/physics gap
+            // (the ladder's physics not reaching the sill - the common real-map case) is bridged. Without
+            // a seeker the ladder's own heights are used (V3.31 behaviour).
+            float anchorBottomZ = zMin;
+            float anchorTopZ = zMax;
+            if (p.SeekSurface != null)
+            {
+                float topSurf = SeekAnchor(p, bx, by, tx, ty, zMax, true);
+                if (float.IsNaN(topSurf)) { refuse = "no-landing-in-reach"; return false; }
+                float botSurf = SeekAnchor(p, bx, by, tx, ty, zMin, false);
+                if (float.IsNaN(botSurf)) { refuse = "no-floor-in-reach"; return false; }
+                // Only move an anchor when the surface is genuinely beyond the ladder's own plane: a
+                // landing above the physics top, a floor below the physics base. Never pull the anchors
+                // inside the ladder (that would shorten a good connector).
+                if (topSurf > zMax) anchorTopZ = topSurf;
+                if (botSurf < zMin) anchorBottomZ = botSurf;
+            }
+            // LANDING ALIGNMENT: a raised landing (the floor beyond 10-20 cm above the ladder top) meshes
+            // in a different voxel row than a thin quad placed exactly at the surface, so the pad's span
+            // and the floor's span miss each other (the measured Test 26 (c) break). Snap the landing
+            // anchor a hair BELOW the found surface so the pad's flat quad rasterises into the same row as
+            // the floor slab's top and the two spans merge. 0.1 m is inside walkableClimb and smaller than
+            // the 0.2 m cell height.
+            if (p.SeekSurface != null) anchorTopZ -= 0.1f;
+            float connRise = anchorTopZ - anchorBottomZ;
+            if (connRise < MinRiseMeters) connRise = rise;
+
             float target = ConnectorSlopeDegrees;
             if (slopeCapDegrees > 0f && slopeCapDegrees < target) target = slopeCapDegrees;
             if (target < 20f) target = 20f;
-            float run = rise / (float)Math.Tan(target * Math.PI / 180.0);
+            float run = connRise / (float)Math.Tan(target * Math.PI / 180.0);
             if (run < ConnectorMinRunMeters) run = ConnectorMinRunMeters;
             if (run > MaxRunPerRampMeters) run = MaxRunPerRampMeters;
 
@@ -332,17 +375,17 @@ namespace BetterBannerlordNavmeshing
                     float f = (float)i / rampSamples;
                     float sx = footX + (tx - footX) * f;
                     float sy = footY + (ty - footY) * f;
-                    float sz = zMin + (zMax - zMin) * f;
+                    float sz = anchorBottomZ + (anchorTopZ - anchorBottomZ) * f;
                     // A hair above the ramp surface so the ramp's own plane does not read as solid.
                     if (!p.IsFreeAt(sx, sy, sz + 0.05f)) return false;
                 }
             }
 
-            // Foot pad (flat on the floor) and ramp. The RAMP's top anchor is (tx,ty,zMax) - see the
-            // top-pad block below for how the landing is reached.
+            // Foot pad (flat on the floor) and ramp; the ramp runs from the floor anchor to the landing
+            // anchor (surface-found heights).
             AppendConnectorQuad(r, footX - dirX * ConnectorFootPadMeters,
-                footY - dirY * ConnectorFootPadMeters, zMin, footX, footY, zMin, px, py);
-            AppendConnectorQuad(r, footX, footY, zMin, tx, ty, zMax, px, py);
+                footY - dirY * ConnectorFootPadMeters, anchorBottomZ, footX, footY, anchorBottomZ, px, py);
+            AppendConnectorQuad(r, footX, footY, anchorBottomZ, tx, ty, anchorTopZ, px, py);
 
             // TOP PAD. A ladder often leads into a narrow doorway ("barely fits a person"): the pad must
             // run THROUGH the throat and OVERLAP the floor's first surviving navmesh cell, or the link
@@ -353,7 +396,7 @@ namespace BetterBannerlordNavmeshing
             float padCap = ConnectorTopPadExtension ? ConnectorTopPadMeters : ConnectorTopPadLegacyMeters;
             if (padCap > ConnectorTopPadMaxMeters) padCap = ConnectorTopPadMaxMeters;
             float padHw = 0.5f * ConnectorPadWidthMeters;
-            float padTop = PadTopZ(p, tx, ty, zMax);
+            float padTop = anchorTopZ;
             float bestReach = 0f;
             float bestDirX = dirX, bestDirY = dirY;
             float[] padDirs = { dirX, dirY, 1f, 0f, -1f, 0f, 0f, 1f, 0f, -1f };
@@ -369,24 +412,28 @@ namespace BetterBannerlordNavmeshing
             }
             if (bestReach <= 1e-3f)
             {
-                // No probe / nothing to cross: keep the short legacy pad on the run direction at zMax.
-                AppendConnectorQuad(r, tx, ty, zMax,
-                    tx + dirX * ConnectorTopPadLegacyMeters, ty + dirY * ConnectorTopPadLegacyMeters, zMax,
-                    px, py);
-                padTop = zMax;
+                // No probe / nothing to cross: keep the short legacy pad on the run direction at the anchor.
+                AppendConnectorQuad(r, tx, ty, anchorTopZ,
+                    tx + dirX * ConnectorTopPadLegacyMeters, ty + dirY * ConnectorTopPadLegacyMeters,
+                    anchorTopZ, px, py);
+                padTop = anchorTopZ;
             }
 
             var info = new RampInfo();
             info.Prop = p.Name;
-            info.BottomY = zMin;
-            info.TopY = zMax;
+            info.BottomY = anchorBottomZ;
+            info.TopY = anchorTopZ;
             info.Run = run;
             info.Width = ConnectorWidthMeters;
-            info.SlopeDeg = (float)(Math.Atan2(rise, run) * 180.0 / Math.PI);
+            info.SlopeDeg = (float)(Math.Atan2(connRise, run) * 180.0 / Math.PI);
             info.FootX = footX; info.FootHz = footY;
             info.HeadX = tx; info.HeadHz = ty;
             info.TopPadMeters = bestReach;
             info.DirX = bestDirX; info.DirHs = bestDirY;
+            info.LadderTopY = zMax;
+            info.LandingY = anchorTopZ;
+            info.LadderBaseY = zMin;
+            info.FloorY = anchorBottomZ;
             r.Infos.Add(info);
             r.Ramps++;
             r.Ladders++;
@@ -394,20 +441,51 @@ namespace BetterBannerlordNavmeshing
             return true;
         }
 
-        // Where the pad's flat top should sit at the ladder's own top: with a scene probe, the landing's
-        // own top surface just below the ladder top (so the pad's spans merge with the floor beyond);
-        // without one, the prop's own top (zMax, V3.28). Probing at the anchor's own XZ (not out along
-        // the run) keeps this independent of direction.
-        private static float PadTopZ(Prop p, float tx, float ty, float zMax)
+        // Surface seek around the anchor's footprint: probe the scene's solid TOP surface within the reach.
+        // Tries the anchor XZ first, then a small ring (ConnectorSeekRadius), so a sill the ladder's own
+        // physics misses by a hair is still found. up=true looks for the highest top ABOVE fromHeight;
+        // up=false for the highest top at or below fromHeight. Returns float.NaN when none in reach.
+        private static float SeekAnchor(Prop p, float bx, float by, float tx, float ty, float fromHeight,
+            bool up)
         {
-            if (p.IsFreeAt == null) return zMax;
-            for (float dz = 0f; dz <= 1.0f; dz += 0.05f)
+            if (p.SeekSurface == null) return fromHeight;
+            float reach = up ? ConnectorLandingReachMeters : ConnectorFloorReachMeters;
+            // Candidate XZ points: the top anchor, the bottom anchor, and a small ring around the top.
+            float ax = up ? tx : bx, ay = up ? ty : by;
+            float best = float.NaN;
+            // centre
+            TrySeek(p, ax, ay, fromHeight, up, reach, ref best);
+            // ring (8 points) at half and full radius
+            for (int r = 1; r <= 2; r++)
             {
-                float z = zMax - dz;
-                if (p.IsFreeAt(tx, ty, z + 0.05f) && !p.IsFreeAt(tx, ty, z - 0.2f))
-                    return z;
+                float rad = ConnectorSeekRadiusMeters * 0.5f * r;
+                for (int a = 0; a < 8; a++)
+                {
+                    double ang = a * Math.PI / 4.0;
+                    float sx = ax + (float)Math.Cos(ang) * rad;
+                    float sy = ay + (float)Math.Sin(ang) * rad;
+                    TrySeek(p, sx, sy, fromHeight, up, reach, ref best);
+                }
             }
-            return zMax;
+            return best;
+        }
+
+        private static void TrySeek(Prop p, float sx, float sy, float fromHeight, bool up, float reach,
+            ref float best)
+        {
+            float h = p.SeekSurface(sx, sy, fromHeight, up, reach);
+            if (float.IsNaN(h)) return;
+            if (up)
+            {
+                // Prefer the LOWEST landing above (the first surface the ladder meets), so a ladder does
+                // not jump to a much higher storey.
+                if (float.IsNaN(best) || h < best) best = h;
+            }
+            else
+            {
+                // Prefer the HIGHEST floor at/below (the nearest surface under the base).
+                if (float.IsNaN(best) || h > best) best = h;
+            }
         }
 
         // How far the pad may run from (tx,ty) along (dirX,dirY) at height padTop before SOLID geometry
@@ -424,9 +502,11 @@ namespace BetterBannerlordNavmeshing
                 if (p.IsFreeAt != null)
                 {
                     // The pad's own level AND just below it must be open: a filled throat (a walled-shut
-                    // doorway) is solid at head height and blocks the pad - no tunneling over a wall.
+                    // doorway) is solid at head height and blocks the pad - no tunneling over a wall. The
+                    // below-sample is small (0.15 m) so a lintel only 0.2 m above the crossing does not
+                    // false-reject a legitimate pad.
                     if (!p.IsFreeAt(sx, sy, padTop + 0.05f)) return s - step;
-                    if (!p.IsFreeAt(sx, sy, padTop - 0.55f)) return s - step;
+                    if (!p.IsFreeAt(sx, sy, padTop - 0.15f)) return s - step;
                 }
                 else
                 {
@@ -499,9 +579,11 @@ namespace BetterBannerlordNavmeshing
             // Engine-space horizontal endpoints of the centre line (X and the second horizontal axis).
             // Only set by the offset symbolic connector; zero for the ordinary ramp path.
             public float FootX, FootHz, HeadX, HeadHz;
-            // Offset connector only: the top pad's reach (m) and the direction it ran.
+            // Offset connector only: the top pad's reach (m) and the direction it ran, plus the
+            // surface-seeking anchor heights (ladder's own physics vs the found landing/floor).
             public float TopPadMeters;
             public float DirX, DirHs;
+            public float LadderTopY, LandingY, LadderBaseY, FloorY;
         }
 
         public static bool IsSteppedOrLadder(int flags)
@@ -561,7 +643,9 @@ namespace BetterBannerlordNavmeshing
             if (r.Ramps > rampsBefore) return;                 // the ordinary path emitted
             if (p == null || (p.Flags & FlagLadder) == 0) return;   // connectors are ladder-flag only
             Skip skip = r.Skips.Count > skipsBefore ? r.Skips[r.Skips.Count - 1] : null;
-            TryLadderOffsetConnector(r, p, slopeCapDegrees, skip);
+            string refuse = null;
+            TryLadderOffsetConnector(r, p, slopeCapDegrees, skip, out refuse);
+            if (refuse != null && skip != null) skip.Reason = refuse;
         }
 
         private static void AppendPropCore(Prop p, Result r, float slopeCapDegrees, float climbMeters,

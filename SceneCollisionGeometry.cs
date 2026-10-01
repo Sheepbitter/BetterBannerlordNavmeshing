@@ -436,6 +436,13 @@ namespace BetterBannerlordNavmeshing
                         {
                             return ScenePointFree(verts, tris, px, py, pz);
                         };
+                        // Surface seeker: the engine height of the highest soup top within a small XZ
+                        // footprint around the point, bounded by the reach. Used to anchor the connector
+                        // on the landing/floor even when the ladder's physics does not reach it.
+                        prop.SeekSurface = delegate (float px, float py, float fromHeight, bool up, float reach)
+                        {
+                            return SceneSeekSurface(verts, tris, px, py, fromHeight, up, reach);
+                        };
 
                         SteppedPropRamps.Result ramps = SteppedPropRamps.Synthesize(
                             new SteppedPropRamps.Prop[] { prop },
@@ -633,6 +640,34 @@ namespace BetterBannerlordNavmeshing
                 if (planeZ >= pz - 0.3f) return false;
             }
             return true;
+        }
+
+        // Surface seeker for the connector's endpoints: the engine height of the highest soup TOP surface
+        // whose XZ projection contains the point, within the reach band from fromHeight. up=true band is
+        // [fromHeight, fromHeight+reach] (the landing above); up=false band is [fromHeight-reach,
+        // fromHeight] (the floor below). NaN when nothing is found in the band. Deterministic.
+        private static float SceneSeekSurface(List<float> verts, List<int> tris, float px, float py,
+            float fromHeight, bool up, float reach)
+        {
+            float lo = up ? fromHeight - 0.5f : fromHeight - reach;
+            float hi = up ? fromHeight + reach : fromHeight;
+            int triCount = tris.Count / 3;
+            float best = float.NaN;
+            for (int t = 0; t < triCount; t++)
+            {
+                int i0 = tris[t * 3 + 0], i1 = tris[t * 3 + 1], i2 = tris[t * 3 + 2];
+                float ax = verts[i0 * 3], ay = verts[i0 * 3 + 1], az = verts[i0 * 3 + 2];
+                float bx = verts[i1 * 3], by = verts[i1 * 3 + 1], bz = verts[i1 * 3 + 2];
+                float cx = verts[i2 * 3], cy = verts[i2 * 3 + 1], cz = verts[i2 * 3 + 2];
+                if (px < Math.Min(ax, Math.Min(bx, cx)) || px > Math.Max(ax, Math.Max(bx, cx))) continue;
+                if (py < Math.Min(ay, Math.Min(by, cy)) || py > Math.Max(ay, Math.Max(by, cy))) continue;
+                if (!PointInTriXZ(px, py, ax, ay, bx, by, cx, cy)) continue;
+                float z = TriHeightAtXZ(px, py, ax, az, ay, bx, bz, by, cx, cz, cy);
+                if (float.IsNaN(z)) continue;
+                if (z < lo - 1e-4f || z > hi + 1e-4f) continue;
+                if (float.IsNaN(best) || z > best) best = z;   // highest top within the band
+            }
+            return best;
         }
 
         // Inside-or-on-edge XZ triangle test (py is the horizontal second axis here).

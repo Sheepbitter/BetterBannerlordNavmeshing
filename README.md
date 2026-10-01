@@ -956,6 +956,39 @@ still reports `connected=False` - it reaches the landing through the ordinary st
 offset connector), and its chain geometry tops out short of the landing. The same mechanism (a steep or short
 chain not merging with the landing) is the remaining lever.
 
+**V3.32: surface-seeking endpoints, the physics gap, and the geometry-difference sweep.** A ladder's metamesh
+is often lined up visually while its **physics object is not**: the ladder's physics top can end a few cm
+short of the doorway sill. The connector's endpoints are therefore **surface-seeking**: the ladder's own
+top/bottom are *locators*, and `Prop.SeekSurface(engineX, engineY, fromHeight, up, reach)` (wired from the
+collected soup, mirroring `IsFreeAt`) finds the nearest **solid top** within the reach - the landing above
+(`ConnectorLandingReachMeters = 1.5 m`) or the floor below (`ConnectorFloorReachMeters = 1.5 m`), searched
+over a small footprint (`ConnectorSeekRadiusMeters = 2.0 m`). The anchors snap to those surfaces; if none is
+in reach the prop is skipped with `no-landing-in-reach` / `no-floor-in-reach`. The pad's flat top is aligned
+to the landing, and the landing anchor is dropped 0.1 m (inside `walkableClimb`) so the pad's quad
+rasterises into the same row as the floor slab.
+
+Harness `Test 26` now also runs a **6 cm physics gap** (ladder top 2.94 vs sill 3.0): `lower->upper=True`
+with the feature on. A **geometry-difference sweep** (`SweepDoorway26`, same scene, cheap parametric
+variants) maps which real-geometry differences break the crossing and where the mesh dies:
+
+| variant | lower->upper | dies at x |
+|---|---|---|
+| baseline (1.0 m opening, lintel 3.4, sill 3.0) | **TRUE** | - |
+| (a) opening 0.7 m wide | **TRUE** | - |
+| (b) **low lintel at 2.6 m** (2.4 m clear) | false | 5.10 |
+| (c) **landing raised +0.2 m** | false | 5.10 |
+| (c) landing lowered -0.2 m | TRUE | - |
+| (d) ladder offset -0.35 m | TRUE | - |
+| (e) wall 0.4 m | TRUE | - |
+| (e) **wall 1.0 m** | false | 6.10 |
+
+So the crossing is robust to a narrow opening, a ladder offset, a lower landing and thin walls, but breaks
+when **the headroom above the crossing is small** (a low lintel, or a landing raised by ~0.2 m so the pad
+sits just under the lintel) and at a **~1.0 m wall**. Both breakers die at the wall's near/mid face, where
+the pad's landing-level span does not merge with the floor's voxel row. These are the candidates for the
+real-map failure; the direction is a landing whose top sits within ~0.2 m of the opening's lintel/headroom.
+
+
 
 ### Terrain holes (false lids)
 
