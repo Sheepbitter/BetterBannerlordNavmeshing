@@ -842,7 +842,8 @@ namespace BetterBannerlordNavmeshing
                 }
                 var ct = new List<int>(merged.Tris);
                 NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, s.CleanupMaxMs);
-                if (cln.Welded > 0 || cln.Removed > 0 || cln.Decimated > 0 || cln.Flipped > 0)
+                if (cln.Welded > 0 || cln.Removed > 0 || cln.Decimated > 0 || cln.Relaxed > 0
+                    || cln.Refined > 0 || cln.Flipped > 0)
                 {
                     int nv = cv.Count / 3;
                     merged.X.Clear(); merged.Y.Clear(); merged.Z.Clear();

@@ -104,28 +104,35 @@ namespace BetterBannerlordNavmeshing
             Weld(vertsXyz, tris, st);
             RemoveDegenerateAndDuplicate(vertsXyz, tris, st);
 
-            Decimate(vertsXyz, tris, st, maxMilliseconds, watch);
+            // Long thin triangles get an extra vertex FIRST (see RefineLongThin): the user's taxonomy -
+            // short needles are removed, medium ones are slid, long ones need an inserted vertex - and the
+            // user's ordering instruction - the insert pass runs before removal/slide, so anything it
+            // creates is remeasured and cleaned up by them. The split itself is surface-exact.
+            //
+            // Refine draws on the same wall clock, so the later passes' existing deadlines are shifted by
+            // however long it actually took: running the insert pass first must not starve the primary
+            // decimation/slide levers (V3.38's windows are preserved on top of refine).
+            long runStart = watch.ElapsedMilliseconds;
+            if (EnableRefine)
+                RefineLongThin(vertsXyz, tris, st,
+                    (int)(watch.ElapsedMilliseconds + maxMilliseconds), watch);
+            long refineUsed = watch.ElapsedMilliseconds - runStart;
             // Defensive: drop any sentinel slot an early-exiting sweep left behind, then drop the vertices
-            // no face references (the ones decimation removed) and renumber. Indices are renumbered only
-            // HERE, after decimation - decimation itself relies on stable vertex indices.
+            // no face references and renumber. Indices are renumbered only at this boundary; each pass that
+            // relies on stable indices (refinement, decimation) finishes before its own compaction.
+            CompactVertices(vertsXyz, tris);
+            v = vertsXyz.ToArray();
+
+            Decimate(vertsXyz, tris, st, (int)(maxMilliseconds + refineUsed), watch);
             CompactVertices(vertsXyz, tris);
             v = vertsXyz.ToArray();
             // Slide thin vertices to a better in-plane position (ratio needles cannot be folded away - see
             // RelaxThin), then polish with Delaunay-style flips.
-            RelaxThin(vertsXyz, tris, st, maxMilliseconds + 1500, watch);
-            v = vertsXyz.ToArray();
-            // Long thin triangles get an extra vertex (see RefineLongThin): the user's taxonomy - short
-            // needles are removed, medium ones are slid, long ones need an inserted vertex.
-            // NOT YET ENABLED: the split works geometrically (surface-exact) but the per-sweep CSR cannot
-            // guarantee that an interior edge's neighbour is found, so some splits leave a T-junction (edge
-            // islands 5 -> 153 on Birtu). Needs an edge-keyed neighbour index (MeshTopo already tracks the
-            // multiplicities) before it can ship. The pass below stays for that follow-up.
-            if (EnableRefine)
-                RefineLongThin(vertsXyz, tris, st, maxMilliseconds + 1500, watch);
+            RelaxThin(vertsXyz, tris, st, (int)(maxMilliseconds + 1500 + refineUsed), watch);
             v = vertsXyz.ToArray();
             // The flip polish gets its own window: decimation is allowed to use the whole budget (it is
             // the primary lever), and squeezing the flips into the remainder left them doing nothing.
-            FlipEdges(v, tris, st, maxMilliseconds + 2500, watch);
+            FlipEdges(v, tris, st, (int)(maxMilliseconds + 2500 + refineUsed), watch);
 
             st.NeedlesAfter = CountNeedles(vertsXyz.ToArray(), tris);
             st.ThinAfter = CountThin(vertsXyz.ToArray(), tris);
@@ -1403,17 +1410,22 @@ namespace BetterBannerlordNavmeshing
         // and no tolerance is involved. Splitting the longest edge (a 2-4 split together with the face
         // across it, or a 1-2 split on an outline edge) halves the span, so repeated sweeps converge on the
         // target aspect ratio. The MeshTopo guard validates every split.
-        public const float RefineMinAngleDegrees = 6f;
-        public const float RefineMinEdgeMeters = 1.5f;
+        // Aspect ratio = longest^2 / (2*area) = longest / altitude. The user's ratio taxonomy: a 10 m span
+        // under 1 m wide is a needle, so a face is a long-thin candidate once it is 8x longer than wide.
+        // The min-angle metric does NOT improve under a base split (the split halves the base, the apex
+        // angle is unchanged); the aspect ratio is what converges - it roughly halves per split.
+        public const float RefineAspectRatio = 8f;
+        // The user measured the surviving long needles at 6-9 m (some 6-7 m); 4 m catches them with margin.
+        public const float RefineMinEdgeMeters = 4f;
         // Only triangles with a real width get refined: an ultra-thin needle (a few centimetres wide) must
         // not be split - halving its base narrows the apex angle instead of widening the sliver - it belongs
         // to removal/slide. The long 10 m x 1 m class is what refinement is for.
         public const float RefineMinWidthMeters = 0.12f;
         public const int RefineMaxSplitsFactor = 20;   // at most faces/20 inserted vertices per mesh
-        // While false the refine pass is skipped (see the call site): it is correct geometrically but the
-        // neighbour lookup needs an edge-keyed index before it can stop leaving T-junctions. (Deliberately
-        // not a const: a const would make the body unreachable code and warn.)
-        public static readonly bool EnableRefine = false;
+        // Enabled by the exact edge-indexed neighbour lookup (BuildEdgeFaceIndex/SplitEdge): an interior
+        // edge is ALWAYS split 2-4 with its true neighbour, so no T-junction is possible. (Deliberately not
+        // a const: a const would make the body unreachable code and warn.)
+        public static readonly bool EnableRefine = true;
 
         private static void RefineLongThin(List<float> verts, List<int> tris, Stats st, int maxMs,
             System.Diagnostics.Stopwatch watch)
@@ -1423,20 +1435,21 @@ namespace BetterBannerlordNavmeshing
             int splits = 0;
             for (int sweep = 0; sweep < 8 && splits < maxSplits; sweep++)
             {
-                int[] ringStart, ringFaces;
-                BuildFaceAdjacency(tris, out ringStart, out ringFaces);
+                // Exact edge -> faces index for this whole sweep, updated on every split (see SplitEdge).
+                // Unlike a CSR snapshot it can always answer "who is across this edge?" mid-sweep, so an
+                // interior split never leaves a T-junction. MeshTopo still validates each split's deltas.
+                var edgeFaces = BuildEdgeFaceIndex(tris);
                 MeshTopo topo = MeshTopo.Build(tris);
                 int nv = verts.Count / 3;
+                var boundary = BoundaryVertsFromIndex(edgeFaces, nv);
                 var dirty = new bool[nv];
                 bool any = false;
-                int nf = tris.Count / 3;
                 for (int t = 0; t + 2 < tris.Count && splits < maxSplits; t += 3)
                 {
                     if ((t & 1023) == 0 && watch.ElapsedMilliseconds > maxMs) goto done;
                     int a = tris[t], b = tris[t + 1], c = tris[t + 2];
                     if (a < 0) continue;
                     if (IsDirty(dirty, a) || IsDirty(dirty, b) || IsDirty(dirty, c)) continue;
-                    if (MinAngle(v, a, b, c) >= RefineMinAngleDegrees) continue;
                     double e0 = Len(v, a, b), e1 = Len(v, b, c), e2 = Len(v, c, a);
                     int p, q, r;
                     double longest;
@@ -1444,13 +1457,27 @@ namespace BetterBannerlordNavmeshing
                     else if (e1 >= e2) { p = b; q = c; r = a; longest = e1; }
                     else { p = c; q = a; r = b; longest = e2; }
                     if (longest < RefineMinEdgeMeters) continue;
-                    double altitude = longest > 1e-9 ? 2.0 * Area(v, a, b, c) / longest : 0.0;
-                    if (altitude < RefineMinWidthMeters) continue;
-                    if (!SplitEdge(verts, tris, ref v, ringStart, ringFaces, topo, t / 3, p, q, r, dirty, st))
+                    double area = Area(v, a, b, c);
+                    if (area < 1e-12) continue;
+                    // The user's ratio criterion: longest^2/(2*area) = longest/altitude. Halving the longest
+                    // edge roughly halves this ratio, so repeated sweeps converge on RefineAspectRatio.
+                    double aspect = longest * longest / (2.0 * area);
+                    if (aspect <= RefineAspectRatio) continue;
+                    double width = 2.0 * area / longest;
+                    if (width < RefineMinWidthMeters) continue;   // ultra-thin: removal/slide's job
+                    // Outline edges are split 1-2 (the spec's "outline edge, fine"). An INTERIOR edge is
+                    // only split 2-4 when its whole face is interior: a 2-4 split sitting on the outline
+                    // perturbs which boundary vertices the removal pass later folds away, which can shrink
+                    // the mesh's coverage (harness Test 7 detailCoversFan dropped to 98.8% without this).
+                    long pk = EdgeKey(p, q);
+                    long pv;
+                    if (!edgeFaces.TryGetValue(pk, out pv)) continue;
+                    bool outline = (int)(pv >> 32) < 0;
+                    if (!outline && (boundary[a] || boundary[b] || boundary[c])) continue;
+                    if (!SplitEdge(verts, tris, ref v, edgeFaces, topo, t / 3, p, q, r, dirty, st))
                         continue;
                     splits++;
                     any = true;
-                    nf = tris.Count / 3;
                 }
                 if (!any) break;
             }
@@ -1459,37 +1486,124 @@ namespace BetterBannerlordNavmeshing
             return;
         }
 
+        // ---- exact edge -> faces index (per refine sweep) ----------------------------------------------
+        // key = EdgeKey(a,b); value = two face indices packed into one long: face0 in the low 32 bits, face1
+        // in the high 32 bits, -1 when absent (a third face is impossible - the input passes the invariant
+        // gate with maxEdgeMult=2). Rebuilt at the start of every sweep and updated incrementally on every
+        // split (remove the old faces' three edges, add the new faces' edges), exactly like MeshTopo.Commit
+        // maintains the counts, so it is exact at all times - not just at sweep start.
+        private static Dictionary<long, long> BuildEdgeFaceIndex(List<int> tris)
+        {
+            var map = new Dictionary<long, long>(LongHash.Instance);
+            for (int t = 0; t + 2 < tris.Count; t += 3)
+            {
+                int a = tris[t], b = tris[t + 1], c = tris[t + 2];
+                if (a < 0) continue;
+                int f = t / 3;
+                IndexAddEdge(map, EdgeKey(a, b), f);
+                IndexAddEdge(map, EdgeKey(b, c), f);
+                IndexAddEdge(map, EdgeKey(c, a), f);
+            }
+            return map;
+        }
+
+        private static long PackFaces(int f0, int f1)
+        {
+            return ((long)f1 << 32) | (uint)f0;
+        }
+
+        // A boundary vertex is an endpoint of an edge used by a single face (the edge index's high slot
+        // still holds -1). Refinement uses this to keep its interior 2-4 splits off the outline (an outline
+        // edge may still be split 1-2, which adds only a vertex exactly on the boundary).
+        private static bool[] BoundaryVertsFromIndex(Dictionary<long, long> map, int nv)
+        {
+            var boundary = new bool[nv];
+            foreach (KeyValuePair<long, long> kv in map)
+            {
+                if ((int)(kv.Value >> 32) >= 0) continue;   // two faces: interior edge
+                int a = (int)(kv.Key >> 32), b = (int)(kv.Key & 0xffffffffL);
+                if (a >= 0 && a < nv) boundary[a] = true;
+                if (b >= 0 && b < nv) boundary[b] = true;
+            }
+            return boundary;
+        }
+
+        private static void IndexAddEdge(Dictionary<long, long> map, long key, int face)
+        {
+            long packed;
+            if (!map.TryGetValue(key, out packed)) { map[key] = PackFaces(face, -1); return; }
+            int lo = (int)(packed & 0xffffffffL), hi = (int)(packed >> 32);
+            if (lo < 0) lo = face; else if (hi < 0) hi = face;   // else a third face: cannot happen
+            map[key] = PackFaces(lo, hi);
+        }
+
+        private static void IndexAddFace(Dictionary<long, long> map, int a, int b, int c, int f)
+        {
+            IndexAddEdge(map, EdgeKey(a, b), f);
+            IndexAddEdge(map, EdgeKey(b, c), f);
+            IndexAddEdge(map, EdgeKey(c, a), f);
+        }
+
+        private static void IndexRemoveFace(Dictionary<long, long> map, List<int> tris, int f)
+        {
+            int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+            if (a < 0) return;
+            IndexRemoveEdge(map, EdgeKey(a, b), f);
+            IndexRemoveEdge(map, EdgeKey(b, c), f);
+            IndexRemoveEdge(map, EdgeKey(c, a), f);
+        }
+
+        private static void IndexRemoveEdge(Dictionary<long, long> map, long key, int face)
+        {
+            long packed;
+            if (!map.TryGetValue(key, out packed)) return;
+            int lo = (int)(packed & 0xffffffffL), hi = (int)(packed >> 32);
+            if (lo == face) { lo = hi; hi = -1; }
+            else if (hi == face) hi = -1;
+            else return;
+            if (lo < 0) map.Remove(key); else map[key] = PackFaces(lo, hi);
+        }
+
         // Split the edge (p,q) of face `f0` at its midpoint m: (p,q,r) -> (p,m,r),(m,q,r); when the edge is
-        // shared, the face `s` across it is split too (q,m,d),(m,p,d) so no T-junction is left. The new
-        // vertex lies on the old edge, so the surface is untouched.
-        private static bool SplitEdge(List<float> verts, List<int> tris, ref float[] v, int[] ringStart,
-            int[] ringFaces, MeshTopo topo, int f0, int p, int q, int r, bool[] dirty, Stats st)
+        // shared, the face `s` found in the exact edge index is split too (q,m,d),(m,p,d) so no T-junction
+        // is left. This is the one surgery here that is EXACTLY surface-neutral: the inserted vertex IS the
+        // midpoint of the split edge, so it lies on that edge, every new face stays in the plane of the face
+        // it replaces, and no tolerance is involved. Children keep their parent's winding.
+        private static bool SplitEdge(List<float> verts, List<int> tris, ref float[] v,
+            Dictionary<long, long> edgeFaces, MeshTopo topo, int f0, int p, int q, int r,
+            bool[] dirty, Stats st)
         {
             int nf = tris.Count / 3;
-            if (f0 < 0 || f0 >= nf) return false;
-            int s = -1, d = -1;
-            for (int i = ringStart[p]; i < ringStart[p + 1]; i++)
+            if (f0 < 0 || f0 >= nf || p == q || p == r || q == r) return false;
+            // Exact neighbour lookup: the edge exists (we are splitting it), so one slot must be f0.
+            long key = EdgeKey(p, q);
+            long packed;
+            if (!edgeFaces.TryGetValue(key, out packed)) { st.RejTopo++; return false; }
+            int lo = (int)(packed & 0xffffffffL), hi = (int)(packed >> 32);
+            int s = lo == f0 ? hi : (hi == f0 ? lo : -1);
+            if (s == -1) { st.RejTopo++; return false; }           // this face does not own the edge
+            if (s >= nf) { st.RejTopo++; return false; }
+            int d = -1;
+            if (s >= 0)
             {
-                int f = ringFaces[i];
-                if (f == f0 || f < 0 || f >= nf) continue;
-                int fa = tris[f * 3], fb = tris[f * 3 + 1], fc = tris[f * 3 + 2];
-                if (fa < 0) continue;
-                bool hp = fa == p || fb == p || fc == p;
-                bool hq = fa == q || fb == q || fc == q;
-                if (!hp || !hq) continue;
-                s = f;
-                d = (fa != p && fa != q) ? fa : (fb != p && fb != q) ? fb : fc;
-                break;
+                d = OtherVertex(tris, s, p, q);
+                if (d < 0 || d == r) { st.RejTopo++; return false; }
             }
-            // Never leave a T-junction: if the edge is interior (two faces) and the neighbour was not found
-            // (it was rewritten earlier this sweep, so the CSR is stale for it), defer to the next sweep.
-            int edgeMult = 0;
-            topo.EdgeCount.TryGetValue(EdgeKey(p, q), out edgeMult);
-            if (s < 0 && edgeMult >= 2) { st.RejTopo++; return false; }
+            // Cross-check against MeshTopo's (kept) edge multiplicities: index and counts must agree, and an
+            // interior edge whose neighbour cannot be found is refused (the V3.37 T-junction failure mode).
+            int edgeMult; topo.EdgeCount.TryGetValue(key, out edgeMult);
+            if (edgeMult != (s >= 0 ? 2 : 1)) { st.RejTopo++; return false; }
+
+            int a0 = tris[f0 * 3], b0 = tris[f0 * 3 + 1], c0 = tris[f0 * 3 + 2];
+            double ny0 = NormalY(v, a0, b0, c0);
+            double ny1 = 0.0;
+            if (s >= 0) ny1 = NormalY(v, tris[s * 3], tris[s * 3 + 1], tris[s * 3 + 2]);
+
             int m = verts.Count / 3;
             float mx = (v[p * 3] + v[q * 3]) * 0.5f;
             float my = (v[p * 3 + 1] + v[q * 3 + 1]) * 0.5f;
             float mz = (v[p * 3 + 2] + v[q * 3 + 2]) * 0.5f;
+
             var oldFaces = new List<int>(2);
             oldFaces.Add(f0);
             if (s >= 0) oldFaces.Add(s);
@@ -1501,28 +1615,75 @@ namespace BetterBannerlordNavmeshing
                 newTris.Add(q); newTris.Add(m); newTris.Add(d);
                 newTris.Add(m); newTris.Add(p); newTris.Add(d);
             }
-            if (!topo.CanReplace(tris, oldFaces, newTris)) { st.RejTopo++; return false; }
-            topo.Commit(tris, oldFaces, newTris);
 
+            // The new vertex is added first so the children can be measured, then rolled back on refusal.
             verts.Add(mx); verts.Add(my); verts.Add(mz);
             if (v.Length < verts.Count) Array.Resize(ref v, verts.Count + 3);
             v[m * 3] = mx; v[m * 3 + 1] = my; v[m * 3 + 2] = mz;
+            // Refuse a split that would itself manufacture a needle: an ultra-thin child belongs to the
+            // removal/slide passes, not to insertion. (This is why the pass only splits faces with a real
+            // width - and the footer of a long thin split can still narrow below the needle altitude.)
+            for (int i = 0; i + 2 < newTris.Count; i += 3)
+            {
+                if (IsNeedle(v, newTris[i], newTris[i + 1], newTris[i + 2]))
+                {
+                    verts.RemoveRange(verts.Count - 3, 3);
+                    st.RejTopo++;
+                    return false;
+                }
+            }
+            if (!topo.CanReplace(tris, oldFaces, newTris))
+            {
+                verts.RemoveRange(verts.Count - 3, 3);
+                st.RejTopo++;
+                return false;
+            }
+            topo.Commit(tris, oldFaces, newTris);
 
-            tris[f0 * 3] = p; tris[f0 * 3 + 1] = m; tris[f0 * 3 + 2] = r;
+            OrientTri(newTris, 0, v, ny0);
+            OrientTri(newTris, 3, v, ny0);
             if (s >= 0)
             {
-                tris[s * 3] = q; tris[s * 3 + 1] = m; tris[s * 3 + 2] = d;
-                tris.Add(m); tris.Add(p); tris.Add(d);
+                OrientTri(newTris, 6, v, ny1);
+                OrientTri(newTris, 9, v, ny1);
             }
-            else
+
+            // Update the index BEFORE `tris` is overwritten (removal reads the old faces).
+            for (int i = 0; i < oldFaces.Count; i++) IndexRemoveFace(edgeFaces, tris, oldFaces[i]);
+            int appendedBase = tris.Count / 3;
+            for (int i = 0; i + 2 < newTris.Count; i += 3)
             {
-                tris.Add(m); tris.Add(q); tris.Add(r);   // outline edge: split the single face
+                int k = i / 3;
+                int f = k < oldFaces.Count ? oldFaces[k] : appendedBase + (k - oldFaces.Count);
+                IndexAddFace(edgeFaces, newTris[i], newTris[i + 1], newTris[i + 2], f);
             }
-            // The neighbours of the surgery are deferred to the next sweep (their CSR rows/lists moved).
+
+            for (int i = 0; i < oldFaces.Count; i++)
+            {
+                int f = oldFaces[i];
+                tris[f * 3] = newTris[i * 3]; tris[f * 3 + 1] = newTris[i * 3 + 1]; tris[f * 3 + 2] = newTris[i * 3 + 2];
+            }
+            for (int i = oldFaces.Count; i * 3 + 2 < newTris.Count; i++)
+            {
+                tris.Add(newTris[i * 3]); tris.Add(newTris[i * 3 + 1]); tris.Add(newTris[i * 3 + 2]);
+            }
+            // The touched vertices are deferred to the next sweep (their incident lists are stale mid-sweep).
             markDirty(dirty, p); markDirty(dirty, q); markDirty(dirty, r);
             if (d >= 0) markDirty(dirty, d);
             markDirty(dirty, m);
             return true;
+        }
+
+        // Orients the three vertices at `at` in `outTris` to match the parent face's winding (refY = its
+        // NormalY; 0 leaves the order alone).
+        private static void OrientTri(List<int> outTris, int at, float[] v, double refY)
+        {
+            int x = outTris[at], y = outTris[at + 1], z = outTris[at + 2];
+            double ny = NormalY(v, x, y, z);
+            if ((refY > 0 && ny < 0) || (refY < 0 && ny > 0))
+            {
+                outTris[at + 1] = z; outTris[at + 2] = y;
+            }
         }
 
         private static void markDirty(bool[] dirty, int v)
