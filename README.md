@@ -291,6 +291,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelStitchMaxGapCells` | `6` | Stitching (cells, `0` = off). Per tile, reconnects two mesh components whose nearest boundary edges are within this many cells and within the agent climb, by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings. **Measured:** at cs 0.25 a real 1-cell seam is a 1.25 m (5-cell) mesh gap, so the default `6` covers it with margin (`5` is the minimum that works, `4` is one cell short). See *Stitching*. |
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
+| `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, with a Delaunay-style flip polish after. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -668,6 +669,52 @@ whatever its size (see *Stairs & ladders*). Real networks keep a core far above 
 
 Harness `Test 19`: a big terrain island (> cap) is bit-identical with pruning on/off; a small detached
 platform island is pruned with the default and kept when the cap is 0.
+
+### Sliver cleanup (`NavMeshVoxelCleanup`, on by default)
+
+The detail phase tessellates every polygon edge and adds an interior sample grid; in complex areas (a notched
+outline over an open yard is the classic) the result contains long thin **needle** triangles - visually ugly
+and, more importantly, expensive to route (every needle is another polygon a path query has to touch). This
+was the last quality gap versus the native generator.
+
+The pass runs on the final merged mesh, after the weld/stitch/prune and before the invariant gate:
+
+1. **Weld** vertices within 1 mm and drop degenerate/duplicate faces.
+2. **Decimate (primary).** Repeatedly remove a vertex that is incident to a needle (shortest altitude < 0.05 m
+   with a longest edge > 0.5 m) or a face thinner than 3 deg, and retriangulate the hole it leaves (best-quality
+   ear clip in one fixed best-fit plane). **Boundary vertices are candidates too** - a boundary needle's apex is
+   usually a sub-30 cm outline wobble; the outline *move* is bounded, not forbidden. A vertex that hangs off a
+   single face (a spike tip) is deleted with its face when the base edge is interior.
+3. **Flip polish.** Delaunay-style edge flips on the remaining near-coplanar quads (strict min-angle gain).
+
+Guards, all enforced before anything is applied: the surface may move at most **0.20 m** per removal
+(**0.30 m** on the outline), the fan must be planar enough, no new needle may be created, the component count
+must not change, and the **topology gate** - the same thing the export's invariant gate checks - refuses any
+removal that would create a duplicate face or an edge with more than two faces. The tolerances sit inside the
+mesh's own promise (detail max error 0.25 m, contour simplification 0.325 m). Deterministic; milliseconds to a
+couple of seconds (`CleanupMaxMs`, default 6 s, is a hard cap on decimation, with the flip polish getting a
+short extra window).
+
+Measured (needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg):
+
+| map | faces | needles | thin | outline moved | components | invariants |
+|---|---|---|---|---|---|---|
+| Birtu | 50700 -> 49657 | 105 -> **9** (-91%) | 1981 -> 1119 (-44%) | 627 verts, max 0.30 m | 5 -> 5 | PASS |
+| CC_20 (caves) | 266526 -> 263607 | 188 -> **45** (-76%) | 5984 -> 3596 (-40%) | 1324 verts, max 0.30 m | 15 -> 15 | PASS |
+| Basamu | 540232 -> 534449 | 596 -> **150** (-75%) | 11608 -> 6939 (-40%) | 2018 verts, max 0.30 m | 1 -> 1 | PASS |
+
+Known limits, by design: a needle whose removal would fold the surface by more than 0.20 m (a genuine step or
+fold) or swing the outline by more than 0.30 m (a real zigzag) **survives** - the pass will not reshape the
+walkable surface to win a triangle count. The `cleanup:` log lines name, per surviving needle, which guard
+refused each of its vertices. Separately, an opening with less than ~2 voxel cells (0.5 m) of headroom over a
+crossing cannot be represented by the voxel core at all; that tiny-ladder-doorway case is accepted as bad
+mapping practice.
+
+Performance note (V3.36, measured): the builder's long-keyed maps (weld grid, prune, invariants, cleanup) were
+hashing structured `(x<<32)|z` keys with .NET's default `hi ^ lo`, which collapses them into a handful of
+buckets and degenerates every map to quadratic chains. With the existing `LongKeyComparer` applied to all of
+them, the same builds get much faster - Birtu ~2x, CC_20 ~3.5x (66 s -> 19 s), Basamu ~5.7x (127 s -> 22 s) -
+with byte-identical output for the maps that already worked.
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 

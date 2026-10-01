@@ -77,6 +77,9 @@ namespace BetterBannerlordNavmeshing
         public bool NavMeshVoxelPruneIsolatedIslands = true;
         public int NavMeshVoxelPruneMaxIslandFaces = 400;
 
+        // Final-mesh sliver cleanup (thin/tiny triangles). Default ON, documented in the README.
+        public bool NavMeshVoxelCleanup = true;
+
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
         public string NavMeshSnapshotAssertPoints = "";
@@ -889,6 +892,7 @@ namespace BetterBannerlordNavmeshing
                 voxel.StitchMaxGapCells = NavMeshVoxelStitchMaxGapCells;
                 voxel.PruneIsolatedIslands = NavMeshVoxelPruneIsolatedIslands;
                 voxel.PruneMaxIslandFaces = NavMeshVoxelPruneMaxIslandFaces;
+                voxel.CleanupSlivers = NavMeshVoxelCleanup;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;

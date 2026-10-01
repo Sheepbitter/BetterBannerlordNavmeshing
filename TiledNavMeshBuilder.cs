@@ -89,6 +89,12 @@ namespace BetterBannerlordNavmeshing
             public bool PruneIsolatedIslands = true;
             public int PruneMaxIslandFaces = 400;
 
+            // Final-mesh sliver cleanup (after merge + stitch + prune, before the invariant gate).
+            // Removes needle/thin vertices and retriangulates their fans (decimation), then flips to
+            // polish. Conservative tolerances (0.05 m), island count and manifoldness preserved.
+            public bool CleanupSlivers = true;
+            public int CleanupMaxMs = 6000;
+
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
 
@@ -795,7 +801,7 @@ namespace BetterBannerlordNavmeshing
                 {
                     List<float> cellXz = results[i] != null ? results[i].SteppedRestoredCellXz : null;
                     if (cellXz == null) continue;
-                    if (steppedCells == null) steppedCells = new HashSet<long>();
+                    if (steppedCells == null) steppedCells = new HashSet<long>(LongKeyComparer.Instance);
                     for (int k = 0; k + 1 < cellXz.Count; k += 2)
                         steppedCells.Add(CellKey(cellXz[k], cellXz[k + 1], qcs));
                 }
@@ -816,12 +822,55 @@ namespace BetterBannerlordNavmeshing
                         + " faces (mixed provenance, no kept island is exempt-formed)");
             }
 
+            // Release the per-tile build structures before the cleanup. Keeping 15k+ tile results alive
+            // (each with meshes, heightfields and index lists) turns every cleanup allocation into a gen2
+            // collection over a multi-GB heap: on CC_20 the cleanup's topology maps took ~80 s each until
+            // these were released. The weld totals the export reports are captured first.
+            int tileVertexSum = SumTileVertices(results);
+            results = null;
+            tileTris = null;
+
+            // Final-mesh sliver cleanup (thin/tiny triangles). Runs on the merged, welded, stitched,
+            // pruned mesh; only retriangulates it (decimate needle/thin vertices + flip polish). The
+            // island count is asserted unchanged and the outline moves by <= a small tolerance.
+            if (s.CleanupSlivers && merged.Tris.Count >= 3)
+            {
+                var cv = new List<float>(merged.X.Count * 3);
+                for (int i = 0; i < merged.X.Count; i++)
+                {
+                    cv.Add(merged.X[i]); cv.Add(merged.Y[i]); cv.Add(merged.Z[i]);
+                }
+                var ct = new List<int>(merged.Tris);
+                NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, s.CleanupMaxMs);
+                if (cln.Welded > 0 || cln.Removed > 0 || cln.Decimated > 0 || cln.Flipped > 0)
+                {
+                    int nv = cv.Count / 3;
+                    merged.X.Clear(); merged.Y.Clear(); merged.Z.Clear();
+                    for (int i = 0; i < nv; i++)
+                    {
+                        merged.X.Add(cv[i * 3]); merged.Y.Add(cv[i * 3 + 1]); merged.Z.Add(cv[i * 3 + 2]);
+                    }
+                    merged.Tris.Clear(); merged.Tris.AddRange(ct);
+                }
+                Log(log, "cleanup: welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
+                    + cln.Decimated + " flipped=" + cln.Flipped + " needles before=" + cln.NeedlesBefore
+                    + " after=" + cln.NeedlesAfter + " thin before=" + cln.ThinBefore + " after="
+                    + cln.ThinAfter + " boundaryMoved=" + cln.BoundaryMovedCount + " boundaryMaxMove="
+                    + F(cln.BoundaryMaxMove) + "m components " + cln.ComponentsBefore + "->"
+                    + cln.ComponentsAfter + (cln.ComponentsBefore == cln.ComponentsAfter ? " (kept)"
+                        : " (CHANGED!)") + " [cand=" + cln.CandVerts + " rejMove=" + cln.RejMove
+                    + " rejFan=" + cln.RejFan + " rejRing=" + cln.RejRing + " rejTopo=" + cln.RejTopo + "]");
+                if (cln.Diag != null)
+                    for (int i = 0; i < cln.Diag.Count; i++) Log(log, "cleanup: " + cln.Diag[i]);
+                if (cln.DecimDiag != null) Log(log, "cleanup: " + cln.DecimDiag);
+            }
+
             int mergedVertices = merged.X.Count;
             var result = new VoxelMeshResult();
             result.VertexCount = mergedVertices;
             result.FaceCount = merged.Tris.Count / 3;
             result.DegenerateFaces = merged.Degenerate;
-            result.WeldMergedVertices = SumTileVertices(results) - mergedVertices;
+            result.WeldMergedVertices = tileVertexSum - mergedVertices;
             result.TileCount = tileCount;
             result.BuiltTiles = builtTiles;
             result.FailedTiles = failedTiles;
@@ -860,7 +909,7 @@ namespace BetterBannerlordNavmeshing
             // --- topology + invariants (gate) ---
             ComputeInvariants(result, result.Tris, result.FaceCount);
 
-            Log(log, "v2: weld verts=" + SumTileVertices(results) + " -> " + mergedVertices
+            Log(log, "v2: weld verts=" + tileVertexSum + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
                 + " degenerate=" + merged.Degenerate + " (weldMerged=" + result.WeldMergedVertices + ")");
             Log(log, "v2: invariants: faces=" + result.FaceCount + " edges=" + result.EdgeCount
@@ -895,7 +944,7 @@ namespace BetterBannerlordNavmeshing
             int nf = r.FaceCount;
             var fp = new int[nf];
             for (int i = 0; i < nf; i++) fp[i] = i;
-            var edgeFirst = new Dictionary<long, int>();
+            var edgeFirst = new Dictionary<long, int>(LongKeyComparer.Instance);
             for (int f = 0; f < nf; f++)
             {
                 int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
@@ -1075,8 +1124,8 @@ namespace BetterBannerlordNavmeshing
             var fp = new int[nf];
             var fpCore = new int[nf];
             for (int i = 0; i < nf; i++) { fp[i] = i; fpCore[i] = i; }
-            var edgeFirst = new Dictionary<long, int>();
-            var edgeFirstCore = new Dictionary<long, int>();
+            var edgeFirst = new Dictionary<long, int>(LongKeyComparer.Instance);
+            var edgeFirstCore = new Dictionary<long, int>(LongKeyComparer.Instance);
             var exemptFace = new bool[nf];
             for (int f = 0; f < nf; f++)
             {
@@ -1247,7 +1296,7 @@ namespace BetterBannerlordNavmeshing
 
             int[] fp = new int[nf];
             for (int i = 0; i < nf; i++) fp[i] = i;
-            var edgeMult = new Dictionary<long, int>();
+            var edgeMult = new Dictionary<long, int>(LongKeyComparer.Instance);
             for (int f = 0; f < nf; f++)
             {
                 int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
@@ -1296,7 +1345,7 @@ namespace BetterBannerlordNavmeshing
 
             var compParent = new int[nc];
             for (int i = 0; i < nc; i++) compParent[i] = i;
-            var edgeDistinct = new Dictionary<long, int>();
+            var edgeDistinct = new Dictionary<long, int>(LongKeyComparer.Instance);
 
             for (int i = 0; i < nc; i++)
             {
@@ -1459,7 +1508,7 @@ namespace BetterBannerlordNavmeshing
         private static void BuildSoupGrid(float[] soupVerts, int[] soupTris, int triCount, float cellSize,
             out Dictionary<long, List<int>> grid, out List<int> bigList)
         {
-            grid = new Dictionary<long, List<int>>();
+            grid = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
             bigList = new List<int>();
             for (int t = 0; t < triCount; t++)
             {
@@ -2651,7 +2700,7 @@ namespace BetterBannerlordNavmeshing
             // Face adjacency + edge multiplicity over welded ids.
             int[] fp = new int[nf];
             for (int i = 0; i < nf; i++) fp[i] = i;
-            var edgeMult = new Dictionary<long, int>();
+            var edgeMult = new Dictionary<long, int>(LongKeyComparer.Instance);
             for (int f = 0; f < nf; f++)
             {
                 int a = weld[r.Tris[f * 3]], b = weld[r.Tris[f * 3 + 1]], c = weld[r.Tris[f * 3 + 2]];
@@ -2921,7 +2970,7 @@ namespace BetterBannerlordNavmeshing
         private static int[] BuildPositionWeld(float[] verts, int nv, float tol)
         {
             var ids = new int[nv];
-            var grid = new Dictionary<long, List<int>>();
+            var grid = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
             var cx = new List<float>();
             var cy = new List<float>();
             var cz = new List<float>();
