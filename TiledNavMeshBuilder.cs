@@ -2138,11 +2138,18 @@ namespace BetterBannerlordNavmeshing
                 for (RcSpan up = conn.next; up != null; )
                 {
                     RcSpan next = up.next;
-                    if (up.area != RcRecast.RC_NULL_AREA && up.smin - conn.smax < walkableHeight)
+                    // Unlink a low ceiling EVEN IF ITS AREA IS ALREADY NULL (the ledge trim nulls it
+                    // first): FilterWalkableLowHeightSpans reads span.next.smin regardless of area, so a
+                    // linked-but-nulled span still kills the connector's span below it. This was the
+                    // measured Test 26 (e) 1.0 m wall break.
+                    if (up.smin - conn.smax < walkableHeight)
                     {
-                        up.area = RcRecast.RC_NULL_AREA;
+                        if (up.area != RcRecast.RC_NULL_AREA)
+                        {
+                            up.area = RcRecast.RC_NULL_AREA;
+                            cleared++;
+                        }
                         prev.next = next;         // unlink: it must not stay the ceiling
-                        cleared++;
                         up = next;
                         continue;
                     }

@@ -388,6 +388,12 @@ namespace BetterBannerlordNavmeshing
                 string prefabName = TerrainNavMeshGenerator.ResolvePrefabName(scene, NavMeshPrefabName, log);
                 string folder = TerrainNavMeshGenerator.ResolveFolder(scene, NavMeshExportFolder, log);
 
+                // The dump writes three files into this folder; a scene in another module may resolve a
+                // NavMeshPrefabs folder that does not exist yet (the export path creates it, the dump did
+                // not). Create it here so a dump of e.g. CC_20_siege never throws DirectoryNotFoundException.
+                if (!string.IsNullOrEmpty(folder))
+                    System.IO.Directory.CreateDirectory(folder);
+
                 // Terrain: the same sampler (and the same hole-audit setting) the export uses.
                 var terrainWatch = System.Diagnostics.Stopwatch.StartNew();
                 SceneTerrainSampler.TerrainGrid grid =

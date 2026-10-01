@@ -988,6 +988,45 @@ sits just under the lintel) and at a **~1.0 m wall**. Both breakers die at the w
 the pad's landing-level span does not merge with the floor's voxel row. These are the candidates for the
 real-map failure; the direction is a landing whose top sits within ~0.2 m of the opening's lintel/headroom.
 
+**V3.33: the merge rule fixed (null-area low ceilings), and the corrected sweep.** The 1.0 m-wall breaker
+was a real bug in `ClearConnectorCeilings`: the **ledge trim nulls a ceiling span's area first**, and the
+clearance pass then **skipped** any span whose area was already `RC_NULL_AREA` - but
+`FilterWalkableLowHeightSpans` reads `span.next.smin` **regardless of area**, so the linked-but-nulled
+ceiling still killed the connector's landing span below it. The pass now **unlinks a low ceiling even when
+its area is already null**. The corrected, re-run sweep (only the low-clearance case remains a limit):
+
+| variant | lower->upper | faces | dies at x |
+|---|---|---|---|
+| baseline (1.0 m opening, lintel 3.4, sill 3.0) | **TRUE** | 80 | - |
+| (a) opening 0.7 m wide | **TRUE** | 80 | - |
+| (b) lintel only 0.2 m above the sill | false | 75 | 5.10 |
+| (c) landing raised +0.2 m (lintel 3.6) | **TRUE** | 82 | - |
+| (c) landing lowered -0.2 m | **TRUE** | 80 | - |
+| (d) ladder offset -0.35 m | **TRUE** | 92 | - |
+| (e) wall 0.4 m | **TRUE** | 70 | - |
+| (e) wall 1.0 m | **TRUE** | 80 | - |
+
+So the crossing now survives a narrow opening, a raised or lowered landing, a ladder offset and walls from
+0.4 to 1.6 m. The one remaining limit, (b), is geometric: with only **0.2 m (one cell) of headroom** the
+rasterizer merges the pad, the opening and the lintel into a **single solid span**, so there is no separate
+landing span to keep. That is below the resolution the voxel core can represent, not a merge bug.
+
+**The dump folder.** `DumpSnapshotFromEditor` wrote the three snapshot files without creating the target
+folder; a scene in another module (e.g. `CC_20_siege` in `DedicatedCustomServerHelper`, which has `SceneObj`
+but no `NavMeshPrefabs`) failed with `DirectoryNotFoundException`. The dump now calls
+`Directory.CreateDirectory(folder)` (the export path already did). Behaviour is unchanged when the folder
+exists.
+
+**Basamu (first giant-map datapoint).** `mp_battle_Basamu_village` snapshot (grid 2049x2049, ~1 m spacing,
+11084 entities, **laddersIncluded=3**): `--ramps on` builds **16384 tiles in ~16 s** (`polys=125204`,
+`failed=0`), soup 6 496 534 v / 3 912 455 t, welded to **V=327018 F=540232 E=872756**, invariants **PASS**,
+**islands kept = 1** (5204 islands / 76848 faces pruned), `connector forcedInTile=0` (the 3
+`civilian_ladder_4m` entities do not trip the offset connector). The post-build island/probe reporting over
+540 k faces exceeds a 5-minute budget (the build itself is 16 s), so per-object foot->top probes on Basamu
+are left as a follow-up; the three ladders were located via the new `--ladders` listing mode
+(`(1411.28,698.64,27.87)`, `(1397.65,715.14,27.19)`, `(1396.33,682.12,29.42)`).
+
+
 
 
 ### Terrain holes (false lids)
