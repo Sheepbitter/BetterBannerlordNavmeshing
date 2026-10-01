@@ -853,7 +853,8 @@ namespace BetterBannerlordNavmeshing
                     merged.Tris.Clear(); merged.Tris.AddRange(ct);
                 }
                 Log(log, "cleanup: welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
-                    + cln.Decimated + " flipped=" + cln.Flipped + " needles before=" + cln.NeedlesBefore
+                    + cln.Decimated + " relaxed=" + cln.Relaxed + " refined=" + cln.Refined
+                    + " flipped=" + cln.Flipped + " needles before=" + cln.NeedlesBefore
                     + " after=" + cln.NeedlesAfter + " thin before=" + cln.ThinBefore + " after="
                     + cln.ThinAfter + " boundaryMoved=" + cln.BoundaryMovedCount + " boundaryMaxMove="
                     + F(cln.BoundaryMaxMove) + "m components " + cln.ComponentsBefore + "->"

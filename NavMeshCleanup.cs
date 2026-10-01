@@ -27,13 +27,13 @@ namespace BetterBannerlordNavmeshing
     public static class NavMeshCleanup
     {
         public const float WeldEpsilonMeters = 1e-3f;
-        // Surface-move tolerance for an interior vertex removal. 0.20 m is still inside the mesh's own
-        // promise (detail max error 0.25 m, contour simplification 0.325 m); folds that would merge a step
-        // are refused by the plane/outline bounds themselves.
-        public const float SurfaceToleranceMeters = 0.20f;
-        // Outline-move tolerance for a boundary vertex removal. Boundary needles are outline wobbles; a
-        // sub-30 cm straightening is invisible to navigation (agent radius 0.25 m) and to the bot.
-        public const float BoundaryToleranceMeters = 0.30f;
+        // Surface-move tolerance for an interior vertex removal. This is the knob that decides how much of
+        // the thin fan population can fold away: at 0.20 m the guard refused ~240k candidate folds on
+        // Birtu alone. 0.30 m equals the contour simplification's own budget (1.3 vox at cs 0.25 m), i.e.
+        // the surface may be re-shaped by no more than the mesher itself already promises.
+        public const float SurfaceToleranceMeters = 0.30f;
+        // Outline-move tolerance for a boundary vertex removal.
+        public const float BoundaryToleranceMeters = 0.35f;
         // A fan whose triangle normals spread more than this (degrees) is a step/corner/rim: skip it.
         // Kept generous on purpose - the real bound on a fold is the move tolerance below, and a tight
         // spread cap was refusing ordinary bumpy ground.
@@ -42,9 +42,18 @@ namespace BetterBannerlordNavmeshing
         public const float NeedleAltitudeMeters = 0.05f;
         public const float NeedleLongestEdgeMeters = 0.5f;
         public const float ThinMinAngleDegrees = 5f;
-        // Decimation candidates: only vertices of a needle or of a face thinner than this. Testing every
-        // vertex's whole fan was burning the time budget on ordinary bumpy ground.
-        public const float CandidateMinAngleDegrees = 3f;
+        // Decimation candidates: vertices of a face thinner than this, or of an edge shorter than
+        // ShortEdgeMeters (a redundant point). The user's screenshot: long thin fans over open ground -
+        // 1-2 m wide on 10 m bases - are NOT "needles" by the altitude metric, so the candidate set has to
+        // be the thin-edge/thin-face population, not just the extreme needles.
+        public const float CandidateMinAngleDegrees = 15f;
+        public const float ShortEdgeMeters = 0.25f;
+        // A replacement face must clear this min angle. (The old rule refused anything it called a needle,
+        // which blocked nearly every legitimate fold.)
+        public const float NewFaceMinAngleDegrees = 2.5f;
+        // Components at or below this face count are left completely alone (see the guard in Decimate): a
+        // fold would otherwise be able to delete a small island outright.
+        public const int SmallComponentFaces = 16;
         // Flip polish guards (from V3.35, with its bugs fixed).
         public const float FlipNormalAngleDegrees = 18f;
         public const float FlipSurfaceMoveMeters = 0.15f;
@@ -62,6 +71,10 @@ namespace BetterBannerlordNavmeshing
             public float BoundaryMaxMove;
             public int ComponentsBefore, ComponentsAfter;
             public int CandVerts, RejMove, RejFan, RejRing, RejTopo;
+            public int Relaxed;            // thin vertices slid to a better in-plane position
+            public float SlideMax;
+            public int Collapsed;          // short-edge merges (redundant points)
+            public int Refined;            // long thin triangles refined by an edge split
             public string EdgeHist;
             // Why each surviving needle's vertices were not removable (capped; goes to the run log).
             public List<string> Diag;
@@ -89,6 +102,19 @@ namespace BetterBannerlordNavmeshing
             // no face references (the ones decimation removed) and renumber. Indices are renumbered only
             // HERE, after decimation - decimation itself relies on stable vertex indices.
             CompactVertices(vertsXyz, tris);
+            v = vertsXyz.ToArray();
+            // Slide thin vertices to a better in-plane position (ratio needles cannot be folded away - see
+            // RelaxThin), then polish with Delaunay-style flips.
+            RelaxThin(vertsXyz, tris, st, maxMilliseconds + 1500, watch);
+            v = vertsXyz.ToArray();
+            // Long thin triangles get an extra vertex (see RefineLongThin): the user's taxonomy - short
+            // needles are removed, medium ones are slid, long ones need an inserted vertex.
+            // NOT YET ENABLED: the split works geometrically (surface-exact) but the per-sweep CSR cannot
+            // guarantee that an interior edge's neighbour is found, so some splits leave a T-junction (edge
+            // islands 5 -> 153 on Birtu). Needs an edge-keyed neighbour index (MeshTopo already tracks the
+            // multiplicities) before it can ship. The pass below stays for that follow-up.
+            if (EnableRefine)
+                RefineLongThin(vertsXyz, tris, st, maxMilliseconds + 1500, watch);
             v = vertsXyz.ToArray();
             // The flip polish gets its own window: decimation is allowed to use the whole budget (it is
             // the primary lever), and squeezing the flips into the remainder left them doing nothing.
@@ -275,6 +301,38 @@ namespace BetterBannerlordNavmeshing
                 bool any = false;
                 bool timeUp = false;
                 int csrVerts = ringStart.Length - 1;
+                // Never touch a tiny component: folding the only vertices of a 1-2 face island would delete
+                // it outright (the island structure must not change).
+                int nf0 = tris.Count / 3;
+                var faceComp = new int[nf0];
+                for (int i = 0; i < nf0; i++) faceComp[i] = -1;
+                var compSize = new List<int>();
+                var queue = new Queue<int>();
+                for (int f = 0; f < nf0; f++)
+                {
+                    if (faceComp[f] >= 0) continue;
+                    int id = compSize.Count;
+                    compSize.Add(0);
+                    faceComp[f] = id;
+                    queue.Enqueue(f);
+                    while (queue.Count > 0)
+                    {
+                        int g = queue.Dequeue();
+                        compSize[id]++;
+                        for (int k = 0; k < 3; k++)
+                        {
+                            int w = tris[g * 3 + k];
+                            if (w < 0 || w >= csrVerts) continue;
+                            for (int j = ringStart[w]; j < ringStart[w + 1]; j++)
+                            {
+                                int h = ringFaces[j];
+                                if (h < 0 || h >= nf0 || faceComp[h] >= 0) continue;
+                                faceComp[h] = id;
+                                queue.Enqueue(h);
+                            }
+                        }
+                    }
+                }
                 // Candidate mask for this sweep: only vertices of a needle / very thin face. One O(F)
                 // pass over the faces beats testing every vertex's fan with the full guard set (that was
                 // spending the whole budget on ordinary bumpy ground).
@@ -283,7 +341,9 @@ namespace BetterBannerlordNavmeshing
                 {
                     int a = tris[t], b = tris[t + 1], c = tris[t + 2];
                     if (a < 0) continue;
-                    if (!IsNeedle(v, a, b, c) && MinAngle(v, a, b, c) >= CandidateMinAngleDegrees) continue;
+                    if (MinAngle(v, a, b, c) >= CandidateMinAngleDegrees
+                        && Len(v, a, b) >= ShortEdgeMeters && Len(v, b, c) >= ShortEdgeMeters
+                        && Len(v, c, a) >= ShortEdgeMeters) continue;
                     if (a < cand.Length) cand[a] = true;
                     if (b < cand.Length) cand[b] = true;
                     if (c < cand.Length) cand[c] = true;
@@ -300,6 +360,16 @@ namespace BetterBannerlordNavmeshing
                     if ((vert & 255) == 0 && watch.ElapsedMilliseconds > maxMs) { timeUp = true; break; }
                     if (!cand[vert]) continue;
                     if (vert < alive.Length && (!alive[vert] || dirty[vert])) continue;
+                    {
+                        int f0 = -1;
+                        for (int j = ringStart[vert]; j < ringStart[vert + 1] && f0 < 0; j++)
+                        {
+                            int f = ringFaces[j];
+                            if (f >= 0 && f < nf0 && tris[f * 3] >= 0) f0 = f;
+                        }
+                        if (f0 < 0) continue;
+                        if (compSize[faceComp[f0]] <= SmallComponentFaces) continue;
+                    }
                     if (!IncidentSliver(v, tris, ringStart, ringFaces, vert)) continue;
                     st.CandVerts++;
                     if (!TryRemoveVertex(tris, v, ringStart, ringFaces, boundary, dirty, topo, vert, st))
@@ -342,7 +412,9 @@ namespace BetterBannerlordNavmeshing
                 int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
                 if (a < 0) continue;                               // blanked sentinel
                 if (a != vert && b != vert && c != vert) continue; // stale list entry (defensive)
-                if (IsNeedle(v, a, b, c) || MinAngle(v, a, b, c) < ThinMinAngleDegrees) return true;
+                if (MinAngle(v, a, b, c) < CandidateMinAngleDegrees) return true;
+                if (Len(v, a, b) < ShortEdgeMeters || Len(v, b, c) < ShortEdgeMeters
+                    || Len(v, c, a) < ShortEdgeMeters) return true;
             }
             return false;
         }
@@ -464,7 +536,7 @@ namespace BetterBannerlordNavmeshing
             if (!TriangulateRing(v, ring, newTris)) { st.RejTopo++; return false; }
             for (int i = 0; i + 2 < newTris.Count; i += 3)
             {
-                if (IsNeedle(v, newTris[i], newTris[i + 1], newTris[i + 2]))
+                if (MinAngle(v, newTris[i], newTris[i + 1], newTris[i + 2]) < NewFaceMinAngleDegrees)
                 { st.RejTopo++; return false; }
             }
 
@@ -1073,6 +1145,315 @@ namespace BetterBannerlordNavmeshing
                 if (d == 1) ends++;
             }
             return "ring(e=" + ends + ",d=" + maxd + ",n=" + adj.Count + ",i=" + incident.Count + ")";
+        }
+
+        // ---- 3b. RELAX: slide thin vertices -----------------------------------------------------------------
+        // Ratio needles - the user's canonical case is a 10 m fan edge with a 1 m wide apex - cannot be
+        // folded away: the apex sits a metre from the neighbouring geometry and removing it leaves a
+        // star-shaped hole that retriangulates just as badly. But they are almost always badly PLACED:
+        // sliding the apex within the local surface plane (so the height field is untouched) fattens the
+        // whole fan. For each thin vertex this pass tries a small set of in-plane offsets and keeps the one
+        // that maximises the worst incident angle, subject to the usual surface/outline bounds.
+        public const float SlideRadiusMeters = 2.0f;
+        public const float SlideMinGainDegrees = 1.0f;
+
+        private static void RelaxThin(List<float> verts, List<int> tris, Stats st, int maxMs,
+            System.Diagnostics.Stopwatch watch)
+        {
+            int nv = verts.Count / 3;
+            var v = verts.ToArray();
+            for (int sweep = 0; sweep < 3; sweep++)
+            {
+                int[] ringStart, ringFaces;
+                BuildFaceAdjacency(tris, out ringStart, out ringFaces);
+                var boundary = BoundaryFlags(tris, nv);
+                bool any = false;
+                int csrVerts = ringStart.Length - 1;
+                for (int vert = 0; vert < csrVerts; vert++)
+                {
+                    if ((vert & 255) == 0 && watch.ElapsedMilliseconds > maxMs) goto done;
+                    if (vert >= nv) continue;
+                    if (!IncidentSliver(v, tris, ringStart, ringFaces, vert)) continue;
+                    int nf = tris.Count / 3;
+                    var incident = new List<int>();
+                    for (int i = ringStart[vert]; i < ringStart[vert + 1]; i++)
+                    {
+                        int f = ringFaces[i];
+                        if (f < 0 || f >= nf) continue;
+                        if (tris[f * 3] < 0) continue;
+                        if (tris[f * 3] != vert && tris[f * 3 + 1] != vert && tris[f * 3 + 2] != vert) continue;
+                        incident.Add(f);
+                    }
+                    if (incident.Count < 3) continue;
+                    if (!FanPlanar(v, tris, incident)) continue;
+                    var ring = new List<int>();
+                    if (!BuildRing(tris, incident, vert, ring)) continue;
+                    if (ring.Count < 3) continue;
+                    if (TryRelax(v, ring, vert, boundary[vert])) { st.Relaxed++; any = true; }
+                }
+                if (!any) break;
+            }
+            done:
+            for (int i = 0; i < nv; i++)
+            {
+                verts[i * 3] = v[i * 3]; verts[i * 3 + 1] = v[i * 3 + 1]; verts[i * 3 + 2] = v[i * 3 + 2];
+            }
+        }
+
+        // Worst min-angle over the fan (vert joined to each consecutive ring pair).
+        private static double FanWorstAngle(float[] v, List<int> ring, int vert, bool boundary)
+        {
+            double worst = 180.0;
+            int n = ring.Count;
+            int last = boundary ? n - 1 : n;
+            for (int i = 0; i < last; i++)
+            {
+                double ang = MinAngle(v, vert, ring[i], ring[(i + 1) % n]);
+                if (ang < worst) worst = ang;
+            }
+            return worst;
+        }
+
+        // Try to slide `vert` inside its ring's plane so its worst incident angle improves. Returns false
+        // (leaving it untouched) when no candidate helps or a bound would be crossed.
+        private static bool TryRelax(float[] v, List<int> ring, int vert, bool boundary)
+        {
+            int k = ring.Count;
+            // Ring plane (Newell) and in-plane basis.
+            double cx = 0, cy = 0, cz = 0;
+            for (int i = 0; i < k; i++) { cx += v[ring[i] * 3]; cy += v[ring[i] * 3 + 1]; cz += v[ring[i] * 3 + 2]; }
+            cx /= k; cy /= k; cz /= k;
+            double nx = 0, ny = 0, nz = 0;
+            for (int i = 0; i < k; i++)
+            {
+                int a = ring[i], b = ring[(i + 1) % k];
+                double ax = v[a * 3] - cx, ay = v[a * 3 + 1] - cy, az = v[a * 3 + 2] - cz;
+                double bx = v[b * 3] - cx, by = v[b * 3 + 1] - cy, bz = v[b * 3 + 2] - cz;
+                nx += ay * bz - az * by; ny += az * bx - ax * bz; nz += ax * by - ay * bx;
+            }
+            double nl = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-12) return false;
+            nx /= nl; ny /= nl; nz /= nl;
+            double ux, uy, uz;
+            if (Math.Abs(nx) <= Math.Abs(ny) && Math.Abs(nx) <= Math.Abs(nz)) { ux = 0; uy = -nz; uz = ny; }
+            else if (Math.Abs(ny) <= Math.Abs(nz)) { ux = -nz; uy = 0; uz = nx; }
+            else { ux = -ny; uy = nx; uz = 0; }
+            double ul = Math.Sqrt(ux * ux + uy * uy + uz * uz);
+            if (ul < 1e-12) return false;
+            ux /= ul; uy /= ul; uz /= ul;
+            double wx = ny * uz - nz * uy, wy = nz * ux - nx * uz, wz = nx * uy - ny * ux;
+
+            double baseX = v[vert * 3], baseY = v[vert * 3 + 1], baseZ = v[vert * 3 + 2];
+            double current = FanWorstAngle(v, ring, vert, boundary);
+            double best = current + SlideMinGainDegrees;
+            double bpx = baseX, bpy = baseY, bpz = baseZ;
+            bool found = false;
+
+            // Candidate offsets: the ring centroid projected into the plane, plus rings of directions.
+            for (int c = 0; c < 25; c++)
+            {
+                double ox, oy, oz;
+                if (c == 0)
+                {
+                    // Toward the centroid, scaled so the move is a fraction of the ring's radius.
+                    double dx = cx - baseX, dy = cy - baseY, dz = cz - baseZ;
+                    double dl = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dl < 1e-9) continue;
+                    double take = Math.Min(dl, SlideRadiusMeters) / dl;
+                    ox = dx * take; oy = dy * take; oz = dz * take;
+                }
+                else
+                {
+                    int dir = (c - 1) % 8;
+                    int rad = (c - 1) / 8;                       // 0, 1, 2
+                    double ang = dir * Math.PI / 4.0;
+                    double r = SlideRadiusMeters * (rad == 0 ? 0.35 : rad == 1 ? 0.7 : 1.0);
+                    double du = Math.Cos(ang) * r, dw = Math.Sin(ang) * r;
+                    ox = ux * du + wx * dw; oy = uy * du + wy * dw; oz = uz * du + wz * dw;
+                }
+                v[vert * 3] = (float)(baseX + ox);
+                v[vert * 3 + 1] = (float)(baseY + oy);
+                v[vert * 3 + 2] = (float)(baseZ + oz);
+                if (!FanOrientationsHold(v, ring, vert, baseX, baseY, baseZ)) continue;
+                double ang2 = FanWorstAngle(v, ring, vert, boundary);
+                if (ang2 <= best) continue;
+                if (boundary)
+                {
+                    float om = OutlineMove(v, vert, ring);
+                    if (om > BoundaryToleranceMeters) continue;
+                }
+                best = ang2;
+                bpx = v[vert * 3]; bpy = v[vert * 3 + 1]; bpz = v[vert * 3 + 2];
+                found = true;
+            }
+            v[vert * 3] = (float)bpx; v[vert * 3 + 1] = (float)bpy; v[vert * 3 + 2] = (float)bpz;
+            return found;
+        }
+
+        // Every fan triangle must keep the orientation it had before the slide (an in-plane move that
+        // inverts or collapses a triangle is rejected). Evaluated against the ORIGINAL position.
+        private static bool FanOrientationsHold(float[] v, List<int> ring, int vert,
+            double baseX, double baseY, double baseZ)
+        {
+            int k = ring.Count;
+            for (int i = 0; i < k; i++)
+            {
+                int a = ring[i], b = ring[(i + 1) % k];
+                double before = Orient3Y(v, baseX, baseY, baseZ, a, b);
+                double after = Orient3Y(v, v[vert * 3], v[vert * 3 + 1], v[vert * 3 + 2], a, b);
+                if (before > 0 && after <= 0) return false;
+                if (before < 0 && after >= 0) return false;
+            }
+            return true;
+        }
+
+        private static double Orient3Y(float[] v, double px, double py, double pz, int a, int b)
+        {
+            double ux = v[a * 3] - px, uz = v[a * 3 + 2] - pz;
+            double wx = v[b * 3] - px, wz = v[b * 3 + 2] - pz;
+            return ux * wz - uz * wx;   // projected orientation about Y
+        }
+
+        // ---- 3c. REFINE: insert a vertex into long thin triangles -------------------------------------
+        // The last class in the user's taxonomy: needles that span LONG distances cannot be fixed by moving
+        // their ends and cannot be deleted (nothing else covers that span). Inserting one more point is the
+        // answer - and it is the only surgery here that is EXACTLY surface-neutral: the new vertex is the
+        // midpoint of an existing edge, so it lies on that edge, the split triangles stay in the same plane
+        // and no tolerance is involved. Splitting the longest edge (a 2-4 split together with the face
+        // across it, or a 1-2 split on an outline edge) halves the span, so repeated sweeps converge on the
+        // target aspect ratio. The MeshTopo guard validates every split.
+        public const float RefineMinAngleDegrees = 6f;
+        public const float RefineMinEdgeMeters = 1.5f;
+        // Only triangles with a real width get refined: an ultra-thin needle (a few centimetres wide) must
+        // not be split - halving its base narrows the apex angle instead of widening the sliver - it belongs
+        // to removal/slide. The long 10 m x 1 m class is what refinement is for.
+        public const float RefineMinWidthMeters = 0.12f;
+        public const int RefineMaxSplitsFactor = 20;   // at most faces/20 inserted vertices per mesh
+        // While false the refine pass is skipped (see the call site): it is correct geometrically but the
+        // neighbour lookup needs an edge-keyed index before it can stop leaving T-junctions. (Deliberately
+        // not a const: a const would make the body unreachable code and warn.)
+        public static readonly bool EnableRefine = false;
+
+        private static void RefineLongThin(List<float> verts, List<int> tris, Stats st, int maxMs,
+            System.Diagnostics.Stopwatch watch)
+        {
+            int maxSplits = Math.Max(0, tris.Count / 3 / RefineMaxSplitsFactor);
+            var v = verts.ToArray();
+            int splits = 0;
+            for (int sweep = 0; sweep < 8 && splits < maxSplits; sweep++)
+            {
+                int[] ringStart, ringFaces;
+                BuildFaceAdjacency(tris, out ringStart, out ringFaces);
+                MeshTopo topo = MeshTopo.Build(tris);
+                int nv = verts.Count / 3;
+                var dirty = new bool[nv];
+                bool any = false;
+                int nf = tris.Count / 3;
+                for (int t = 0; t + 2 < tris.Count && splits < maxSplits; t += 3)
+                {
+                    if ((t & 1023) == 0 && watch.ElapsedMilliseconds > maxMs) goto done;
+                    int a = tris[t], b = tris[t + 1], c = tris[t + 2];
+                    if (a < 0) continue;
+                    if (IsDirty(dirty, a) || IsDirty(dirty, b) || IsDirty(dirty, c)) continue;
+                    if (MinAngle(v, a, b, c) >= RefineMinAngleDegrees) continue;
+                    double e0 = Len(v, a, b), e1 = Len(v, b, c), e2 = Len(v, c, a);
+                    int p, q, r;
+                    double longest;
+                    if (e0 >= e1 && e0 >= e2) { p = a; q = b; r = c; longest = e0; }
+                    else if (e1 >= e2) { p = b; q = c; r = a; longest = e1; }
+                    else { p = c; q = a; r = b; longest = e2; }
+                    if (longest < RefineMinEdgeMeters) continue;
+                    double altitude = longest > 1e-9 ? 2.0 * Area(v, a, b, c) / longest : 0.0;
+                    if (altitude < RefineMinWidthMeters) continue;
+                    if (!SplitEdge(verts, tris, ref v, ringStart, ringFaces, topo, t / 3, p, q, r, dirty, st))
+                        continue;
+                    splits++;
+                    any = true;
+                    nf = tris.Count / 3;
+                }
+                if (!any) break;
+            }
+            done:
+            st.Refined = splits;
+            return;
+        }
+
+        // Split the edge (p,q) of face `f0` at its midpoint m: (p,q,r) -> (p,m,r),(m,q,r); when the edge is
+        // shared, the face `s` across it is split too (q,m,d),(m,p,d) so no T-junction is left. The new
+        // vertex lies on the old edge, so the surface is untouched.
+        private static bool SplitEdge(List<float> verts, List<int> tris, ref float[] v, int[] ringStart,
+            int[] ringFaces, MeshTopo topo, int f0, int p, int q, int r, bool[] dirty, Stats st)
+        {
+            int nf = tris.Count / 3;
+            if (f0 < 0 || f0 >= nf) return false;
+            int s = -1, d = -1;
+            for (int i = ringStart[p]; i < ringStart[p + 1]; i++)
+            {
+                int f = ringFaces[i];
+                if (f == f0 || f < 0 || f >= nf) continue;
+                int fa = tris[f * 3], fb = tris[f * 3 + 1], fc = tris[f * 3 + 2];
+                if (fa < 0) continue;
+                bool hp = fa == p || fb == p || fc == p;
+                bool hq = fa == q || fb == q || fc == q;
+                if (!hp || !hq) continue;
+                s = f;
+                d = (fa != p && fa != q) ? fa : (fb != p && fb != q) ? fb : fc;
+                break;
+            }
+            // Never leave a T-junction: if the edge is interior (two faces) and the neighbour was not found
+            // (it was rewritten earlier this sweep, so the CSR is stale for it), defer to the next sweep.
+            int edgeMult = 0;
+            topo.EdgeCount.TryGetValue(EdgeKey(p, q), out edgeMult);
+            if (s < 0 && edgeMult >= 2) { st.RejTopo++; return false; }
+            int m = verts.Count / 3;
+            float mx = (v[p * 3] + v[q * 3]) * 0.5f;
+            float my = (v[p * 3 + 1] + v[q * 3 + 1]) * 0.5f;
+            float mz = (v[p * 3 + 2] + v[q * 3 + 2]) * 0.5f;
+            var oldFaces = new List<int>(2);
+            oldFaces.Add(f0);
+            if (s >= 0) oldFaces.Add(s);
+            var newTris = new List<int>(12);
+            newTris.Add(p); newTris.Add(m); newTris.Add(r);
+            newTris.Add(m); newTris.Add(q); newTris.Add(r);
+            if (s >= 0)
+            {
+                newTris.Add(q); newTris.Add(m); newTris.Add(d);
+                newTris.Add(m); newTris.Add(p); newTris.Add(d);
+            }
+            if (!topo.CanReplace(tris, oldFaces, newTris)) { st.RejTopo++; return false; }
+            topo.Commit(tris, oldFaces, newTris);
+
+            verts.Add(mx); verts.Add(my); verts.Add(mz);
+            if (v.Length < verts.Count) Array.Resize(ref v, verts.Count + 3);
+            v[m * 3] = mx; v[m * 3 + 1] = my; v[m * 3 + 2] = mz;
+
+            tris[f0 * 3] = p; tris[f0 * 3 + 1] = m; tris[f0 * 3 + 2] = r;
+            if (s >= 0)
+            {
+                tris[s * 3] = q; tris[s * 3 + 1] = m; tris[s * 3 + 2] = d;
+                tris.Add(m); tris.Add(p); tris.Add(d);
+            }
+            else
+            {
+                tris.Add(m); tris.Add(q); tris.Add(r);   // outline edge: split the single face
+            }
+            // The neighbours of the surgery are deferred to the next sweep (their CSR rows/lists moved).
+            markDirty(dirty, p); markDirty(dirty, q); markDirty(dirty, r);
+            if (d >= 0) markDirty(dirty, d);
+            markDirty(dirty, m);
+            return true;
+        }
+
+        private static void markDirty(bool[] dirty, int v)
+        {
+            if (v >= 0 && v < dirty.Length) dirty[v] = true;
+        }
+
+        // New vertices (created by a split) are past the end of the per-sweep dirty array; anything past it
+        // is treated as clean, which is safe because a split's own faces always contain marked vertices.
+        private static bool IsDirty(bool[] dirty, int v)
+        {
+            return v >= 0 && v < dirty.Length && dirty[v];
         }
 
         // ---- 4. flip polish -----------------------------------------------------------------------

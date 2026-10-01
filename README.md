@@ -680,12 +680,20 @@ was the last quality gap versus the native generator.
 The pass runs on the final merged mesh, after the weld/stitch/prune and before the invariant gate:
 
 1. **Weld** vertices within 1 mm and drop degenerate/duplicate faces.
-2. **Decimate (primary).** Repeatedly remove a vertex that is incident to a needle (shortest altitude < 0.05 m
-   with a longest edge > 0.5 m) or a face thinner than 3 deg, and retriangulate the hole it leaves (best-quality
-   ear clip in one fixed best-fit plane). **Boundary vertices are candidates too** - a boundary needle's apex is
-   usually a sub-30 cm outline wobble; the outline *move* is bounded, not forbidden. A vertex that hangs off a
-   single face (a spike tip) is deleted with its face when the base edge is interior.
-3. **Flip polish.** Delaunay-style edge flips on the remaining near-coplanar quads (strict min-angle gain).
+2. **Decimate (short).** Repeatedly remove a vertex that is incident to a needle, a very thin face or a very
+   short edge and retriangulate the hole it leaves (best-quality ear clip in one fixed best-fit plane).
+   **Boundary vertices are candidates too** - a boundary needle's apex is usually a small outline wobble; the
+   outline *move* is bounded, not forbidden. A vertex that hangs off a single face (a spike tip) is deleted
+   with its face when the base edge is interior.
+3. **Slide (medium).** The ratio needles that cannot be folded - the canonical case is a 10 m span whose
+   "thin point" is 1 m wide - are usually just badly *placed*: sliding the offending vertex inside its local
+   surface plane (so the height field is untouched) fattens the whole fan. Each thin vertex tries a small set
+   of in-plane offsets (toward the ring's centroid, plus rings of directions out to 2 m) and keeps the one
+   that maximises its worst incident angle, subject to the same bounds.
+4. **Flip polish.** Delaunay-style edge flips on the remaining near-coplanar quads (strict min-angle gain).
+
+Adjacent component structure is protected twice: component counts must be unchanged, and components of 16
+faces or fewer are skipped entirely (a fold could otherwise delete a small island outright).
 
 Guards, all enforced before anything is applied: the surface may move at most **0.20 m** per removal
 (**0.30 m** on the outline), the fan must be planar enough, no new needle may be created, the component count
@@ -695,20 +703,28 @@ mesh's own promise (detail max error 0.25 m, contour simplification 0.325 m). De
 couple of seconds (`CleanupMaxMs`, default 6 s, is a hard cap on decimation, with the flip polish getting a
 short extra window).
 
-Measured (needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg):
+Measured (needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg, i.e. the user's
+"width < length/10" ratio class; faces include what the passes removed and the ~24%/2% growth the flip polish
+re-adds):
 
-| map | faces | needles | thin | outline moved | components | invariants |
+| map | faces | thin (<5 deg) | needles | mean quality | islands | invariants |
 |---|---|---|---|---|---|---|
-| Birtu | 50700 -> 49657 | 105 -> **9** (-91%) | 1981 -> 1119 (-44%) | 627 verts, max 0.30 m | 5 -> 5 | PASS |
-| CC_20 (caves) | 266526 -> 263607 | 188 -> **45** (-76%) | 5984 -> 3596 (-40%) | 1324 verts, max 0.30 m | 15 -> 15 | PASS |
-| Basamu | 540232 -> 534449 | 596 -> **150** (-75%) | 11608 -> 6939 (-40%) | 2018 verts, max 0.30 m | 1 -> 1 | PASS |
+| Birtu | 50700 -> 38657 (-24%) | 1981 -> **142 (-93%)** | 105 -> 3 | 0.649 -> **0.732** | 5 -> 5 | PASS |
+| CC_20 (caves) | 266526 -> 206826 (-22%) | 5984 -> **297 (-95%)** | 188 -> 10 | 0.679 -> **0.754** | 15 -> 15 | PASS |
+| Basamu | 540232 -> 441758 (-18%) | 11608 -> **374 (-97%)** | 596 -> 2 | 0.693 -> **0.754** | 1 -> 1 | PASS |
 
-Known limits, by design: a needle whose removal would fold the surface by more than 0.20 m (a genuine step or
-fold) or swing the outline by more than 0.30 m (a real zigzag) **survives** - the pass will not reshape the
-walkable surface to win a triangle count. The `cleanup:` log lines name, per surviving needle, which guard
-refused each of its vertices. Separately, an opening with less than ~2 voxel cells (0.5 m) of headroom over a
-crossing cannot be represented by the voxel core at all; that tiny-ladder-doorway case is accepted as bad
-mapping practice.
+The outline moves at up to 0.35 m on the vertices that carried a wobble (5053 on Birtu, 15255 on CC_20,
+19412 on Basamu - a small fraction of all boundary vertices), and the interior surface by at most 0.30 m
+(folds that would move more than that are refused: they are real steps and folds, not slivers).
+
+Known limits, by design: a needle whose removal would fold the surface by more than 0.30 m (a genuine step or
+fold) or swing the outline by more than 0.35 m (a real zigzag) **survives** - the pass will not reshape the
+walkable surface to win a triangle count. The "long" class (a span far longer than its width, whose ends
+cannot move and whose vertices cannot be deleted) is next: it needs an inserted vertex, and the insertion pass
+(RefineLongThin, built and measured) is disabled until its neighbour lookup is backed by an edge-keyed index -
+the per-sweep CSR version could leave T-junctions. Separately, an opening with less than ~2 voxel cells
+(0.5 m) of headroom over a crossing cannot be represented by the voxel core at all; that tiny-ladder-doorway
+case is accepted as bad mapping practice.
 
 Performance note (V3.36, measured): the builder's long-keyed maps (weld grid, prune, invariants, cleanup) were
 hashing structured `(x<<32)|z` keys with .NET's default `hi ^ lo`, which collapses them into a handful of
