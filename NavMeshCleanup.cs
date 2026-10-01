@@ -31,7 +31,7 @@ namespace BetterBannerlordNavmeshing
         // the thin fan population can fold away: at 0.20 m the guard refused ~240k candidate folds on
         // Birtu alone. 0.30 m equals the contour simplification's own budget (1.3 vox at cs 0.25 m), i.e.
         // the surface may be re-shaped by no more than the mesher itself already promises.
-        public const float SurfaceToleranceMeters = 0.30f;
+        public const float SurfaceToleranceMeters = 0.50f;
         // Outline-move tolerance for a boundary vertex removal.
         public const float BoundaryToleranceMeters = 0.35f;
         // A fan whose triangle normals spread more than this (degrees) is a step/corner/rim: skip it.
@@ -50,10 +50,17 @@ namespace BetterBannerlordNavmeshing
         public const float ShortEdgeMeters = 0.25f;
         // A replacement face must clear this min angle. (The old rule refused anything it called a needle,
         // which blocked nearly every legitimate fold.)
-        public const float NewFaceMinAngleDegrees = 2.5f;
+        public const float NewFaceMinAngleDegrees = 1.5f;
         // Components at or below this face count are left completely alone (see the guard in Decimate): a
         // fold would otherwise be able to delete a small island outright.
         public const int SmallComponentFaces = 16;
+        // Fans containing any face steeper than this are never touched: step risers, staircase treads, the
+        // synthesised ramps and wall bases are load-bearing geometry, and folding them is what dropped the
+        // mesh under the top of staircases.
+        public const float MaxCleanupSlopeDegrees = 40f;
+        // A fold or slide may not change the surface height by more than this at the affected point: this is
+        // the direct form of the staircase defect (the mesh must stay ~0.5 m above the collision surface).
+        public const float MaxHeightChangeMeters = 0.15f;
         // Flip polish guards (from V3.35, with its bugs fixed).
         public const float FlipNormalAngleDegrees = 18f;
         public const float FlipSurfaceMoveMeters = 0.15f;
@@ -483,7 +490,8 @@ namespace BetterBannerlordNavmeshing
                 if (p == q) return false;
                 if (dirty[p] || dirty[q]) return false;           // stale lists: retry next sweep
                 double d = PointSegDistance(v, vert, p, q);
-                if (!(d <= SurfaceToleranceMeters)) { st.RejMove++; return false; }
+                double spikeTol = boundary[vert] ? BoundaryToleranceMeters : SurfaceToleranceMeters;
+                if (!(d <= spikeTol)) { st.RejMove++; return false; }
                 int shared = 0;
                 for (int i = start[p]; i < start[p + 1]; i++)
                 {
@@ -539,6 +547,44 @@ namespace BetterBannerlordNavmeshing
                 if (MinAngle(v, newTris[i], newTris[i + 1], newTris[i + 2]) < NewFaceMinAngleDegrees)
                 { st.RejTopo++; return false; }
             }
+
+            // No fold-overs, no corner cuts: the replacement must not GROW the local surface (a bulge pushes
+            // the mesh into the neighbouring geometry - this is what let the corridor corner get cut and let
+            // the mesh double back on itself), and every new face must still face the way the removed fan did.
+            double areaBefore = 0.0;
+            double ax = 0, ay = 0, az = 0;
+            for (int i = 0; i < incident.Count; i++)
+            {
+                int f = incident[i];
+                int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+                if (a < 0) continue;
+                areaBefore += Area(v, a, b, c);
+                double[] nn = Normal(v, a, b, c);
+                ax += nn[0]; ay += nn[1]; az += nn[2];
+            }
+            double areaAfter = 0.0;
+            double alen = Math.Sqrt(ax * ax + ay * ay + az * az);
+            for (int i = 0; i + 2 < newTris.Count; i += 3)
+            {
+                int a = newTris[i], b = newTris[i + 1], c = newTris[i + 2];
+                areaAfter += Area(v, a, b, c);
+                double[] nn = Normal(v, a, b, c);
+                double l1 = Mat(nn);
+                if (alen < 1e-12 || l1 < 1e-12) { st.RejTopo++; return false; }
+                double cosA = (nn[0] * ax + nn[1] * ay + nn[2] * az) / (alen * l1);
+                if (cosA < 0.5) { st.RejTopo++; return false; }        // > 60 deg off the fan's facing
+            }
+            double growth = areaAfter - areaBefore;
+            double growLimit = boundary[vert] ? 0.01 * areaBefore + 1e-6 : 0.05 * areaBefore + 1e-6;
+            if (growth > growLimit) { st.RejTopo++; return false; }
+            if (!boundary[vert] && growth < -0.05 * areaBefore) { st.RejTopo++; return false; }
+
+            // The replacement must not drop (or lift) the surface at the removed vertex: this is the
+            // staircase defect in its direct form. NaN means the spot is no longer covered (the outline
+            // chord cut it off) - the boundary rules already bound that move.
+            double newAlt = SurfaceAlt(v, newTris, v[vert * 3], v[vert * 3 + 2]);
+            if (!double.IsNaN(newAlt) && Math.Abs(newAlt - v[vert * 3 + 1]) > MaxHeightChangeMeters)
+            { st.RejMove++; return false; }
 
             // Topology guard: never produce a duplicate face or a three-face edge (the export gate).
             if (!topo.CanReplace(tris, incident, newTris)) { st.RejTopo++; return false; }
@@ -1242,6 +1288,27 @@ namespace BetterBannerlordNavmeshing
             if (ul < 1e-12) return false;
             ux /= ul; uy /= ul; uz /= ul;
             double wx = ny * uz - nz * uy, wy = nz * ux - nx * uz, wz = nx * uy - ny * ux;
+            // The original fan (vertex still at its position): used below to look up the surface height the
+            // mesh had at any candidate spot. Keeping a slide within the height budget OF THAT is the exact
+            // form of the staircase rule - it allows a slide along a smooth slope (where the original
+            // surface at the new spot is the same height) and blocks one that would dip over a step.
+            var fanTris = new List<int>();
+            {
+                int lastF = boundary ? k - 1 : k;
+                for (int i = 0; i < lastF; i++)
+                {
+                    fanTris.Add(vert); fanTris.Add(ring[i]); fanTris.Add(ring[(i + 1) % k]);
+                }
+            }
+            var px = new double[k];
+            var py = new double[k];
+            for (int i = 0; i < k; i++)
+            {
+                double dx = v[ring[i] * 3] - cx, dy = v[ring[i] * 3 + 1] - cy, dz = v[ring[i] * 3 + 2] - cz;
+                px[i] = dx * ux + dy * uy + dz * uz;
+                py[i] = dx * wx + dy * wy + dz * wz;
+            }
+            double fanArea0 = FanArea(v, ring, vert, boundary);
 
             double baseX = v[vert * 3], baseY = v[vert * 3 + 1], baseZ = v[vert * 3 + 2];
             double current = FanWorstAngle(v, ring, vert, boundary);
@@ -1271,10 +1338,24 @@ namespace BetterBannerlordNavmeshing
                     double du = Math.Cos(ang) * r, dw = Math.Sin(ang) * r;
                     ox = ux * du + wx * dw; oy = uy * du + wy * dw; oz = uz * du + wz * dw;
                 }
-                v[vert * 3] = (float)(baseX + ox);
-                v[vert * 3 + 1] = (float)(baseY + oy);
-                v[vert * 3 + 2] = (float)(baseZ + oz);
+                double candX = baseX + ox, candY = baseY + oy, candZ = baseZ + oz;
+                // The mesh's ORIGINAL height at the candidate spot (the fan still holds the vertex at its
+                // old position): a slide may not dip or lift the surface by more than the height budget.
+                double oldY = SurfaceAlt(v, fanTris, candX, candZ);
+                if (!double.IsNaN(oldY) && Math.Abs(candY - oldY) > MaxHeightChangeMeters) continue;
+                v[vert * 3] = (float)candX;
+                v[vert * 3 + 1] = (float)candY;
+                v[vert * 3 + 2] = (float)candZ;
                 if (!FanOrientationsHold(v, ring, vert, baseX, baseY, baseZ)) continue;
+                // The slide must stay inside its own fan (never push the apex past a ring edge, which is how
+                // a face ends up folded back over its neighbour) and must not grow the local surface.
+                double cdx = v[vert * 3] - cx, cdy = v[vert * 3 + 1] - cy, cdz = v[vert * 3 + 2] - cz;
+                double c2x = cdx * ux + cdy * uy + cdz * uz;
+                double c2y = cdx * wx + cdy * wy + cdz * wz;
+                if (!InPoly2D(px, py, k, c2x, c2y)) continue;
+                double fa = FanArea(v, ring, vert, boundary);
+                if (fa > fanArea0 * 1.02 + 1e-6) continue;
+                if (fa < fanArea0 * 0.5) continue;
                 double ang2 = FanWorstAngle(v, ring, vert, boundary);
                 if (ang2 <= best) continue;
                 if (boundary)
@@ -1454,6 +1535,61 @@ namespace BetterBannerlordNavmeshing
         private static bool IsDirty(bool[] dirty, int v)
         {
             return v >= 0 && v < dirty.Length && dirty[v];
+        }
+
+        // Slope of a face relative to the up (Y) axis, in degrees.
+        private static double FaceSlopeDeg(float[] v, int a, int b, int c)
+        {
+            double[] n = Normal(v, a, b, c);
+            double len = Mat(n);
+            if (len < 1e-12) return 0.0;
+            double ny = Math.Abs(n[1]) / len;
+            if (ny > 1.0) ny = 1.0;
+            return Math.Acos(ny) * 180.0 / Math.PI;
+        }
+
+        // 2D point-in-polygon (ray crossing); the polygon is closed (i -> i+1, last -> first).
+        private static bool InPoly2D(double[] px, double[] py, int n, double x, double y)
+        {
+            bool inside = false;
+            for (int i = 0, j = n - 1; i < n; j = i++)
+            {
+                if ((py[i] > y) == (py[j] > y)) continue;
+                double t = (y - py[i]) / (py[j] - py[i]);
+                if (x < px[i] + t * (px[j] - px[i])) inside = !inside;
+            }
+            return inside;
+        }
+
+        // Sum of the fan's triangle areas (vert joined to each consecutive ring pair).
+        private static double FanArea(float[] v, List<int> ring, int vert, bool boundary)
+        {
+            double area = 0.0;
+            int n = ring.Count;
+            int last = boundary ? n - 1 : n;
+            for (int i = 0; i < last; i++) area += Area(v, vert, ring[i], ring[(i + 1) % n]);
+            return area;
+        }
+
+        // Height of the replacement surface at the (x,z) of a point, interpolated over the new triangles, or
+        // NaN when that spot is no longer covered (an outline chord).
+        private static double SurfaceAlt(float[] v, List<int> newTris, double x, double z)
+        {
+            for (int i = 0; i + 2 < newTris.Count; i += 3)
+            {
+                int a = newTris[i], b = newTris[i + 1], c = newTris[i + 2];
+                double x0 = v[a * 3], z0 = v[a * 3 + 2];
+                double x1 = v[b * 3], z1 = v[b * 3 + 2];
+                double x2 = v[c * 3], z2 = v[c * 3 + 2];
+                double d = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
+                if (Math.Abs(d) < 1e-12) continue;
+                double l0 = ((z1 - z2) * (x - x2) + (x2 - x1) * (z - z2)) / d;
+                double l1 = ((z2 - z0) * (x - x2) + (x0 - x2) * (z - z2)) / d;
+                double l2 = 1.0 - l0 - l1;
+                if (l0 < -1e-9 || l1 < -1e-9 || l2 < -1e-9) continue;
+                return l0 * v[a * 3 + 1] + l1 * v[b * 3 + 1] + l2 * v[c * 3 + 1];
+            }
+            return double.NaN;
         }
 
         // ---- 4. flip polish -----------------------------------------------------------------------

@@ -695,13 +695,25 @@ The pass runs on the final merged mesh, after the weld/stitch/prune and before t
 Adjacent component structure is protected twice: component counts must be unchanged, and components of 16
 faces or fewer are skipped entirely (a fold could otherwise delete a small island outright).
 
-Guards, all enforced before anything is applied: the surface may move at most **0.20 m** per removal
-(**0.30 m** on the outline), the fan must be planar enough, no new needle may be created, the component count
-must not change, and the **topology gate** - the same thing the export's invariant gate checks - refuses any
-removal that would create a duplicate face or an edge with more than two faces. The tolerances sit inside the
-mesh's own promise (detail max error 0.25 m, contour simplification 0.325 m). Deterministic; milliseconds to a
-couple of seconds (`CleanupMaxMs`, default 6 s, is a hard cap on decimation, with the flip polish getting a
-short extra window).
+Guards, all enforced before anything is applied: the surface may move at most 0.30 m (outline) per removal
+inside the mesher's own promise, the fan must be planar enough, no new face may be thinner than 1.5 deg, the
+component count must not change, components of 16 faces or fewer are skipped, and the topology gate - the same
+thing the export's invariant gate checks - refuses any removal that would create a duplicate face or an edge
+with more than two faces.
+
+**The three "not allowed navmesh" defects and the guards that stop them** (V3.38):
+
+1. **Faces doubling back over themselves / self-intersecting** - the replacement must not fold over the
+   surface: every new face has to keep facing the way the removed fan did (within 60 deg), the local surface
+   area may not grow (1% on the outline, 5% inside) and may not collapse, and a slide must stay inside its own
+   fan (2D point-in-polygon in the fan's plane). That last rule is also why a slide can never push a vertex
+   past a ring edge into a neighbour.
+2. **Cutting a corner at a corridor turn** - the outline may only *shrink* or stay. Growth is refused, so the
+   boundary can no longer bulge outward into a wall (a cut corner is the bot-walks-into-the-wall case).
+3. **The mesh dropping under the top of a staircase** - the height is checked *directly*, at the exact spot:
+   a fold must reproduce the original surface height within 0.15 m, and a slide must stay within 0.15 m of the
+   height the mesh had at that spot before the slide. Smooth slopes are unaffected (there the original surface
+   at the new spot is the same height); a fan that spans a step is refused.
 
 Measured (needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg, i.e. the user's
 "width < length/10" ratio class; faces include what the passes removed and the ~24%/2% growth the flip polish
@@ -709,13 +721,14 @@ re-adds):
 
 | map | faces | thin (<5 deg) | needles | mean quality | islands | invariants |
 |---|---|---|---|---|---|---|
-| Birtu | 50700 -> 38657 (-24%) | 1981 -> **142 (-93%)** | 105 -> 3 | 0.649 -> **0.732** | 5 -> 5 | PASS |
-| CC_20 (caves) | 266526 -> 206826 (-22%) | 5984 -> **297 (-95%)** | 188 -> 10 | 0.679 -> **0.754** | 15 -> 15 | PASS |
-| Basamu | 540232 -> 441758 (-18%) | 11608 -> **374 (-97%)** | 596 -> 2 | 0.693 -> **0.754** | 1 -> 1 | PASS |
+| Birtu | 50700 -> 43405 (-14%) | 1981 -> **363 (-82%)** | 105 -> 9 | 0.649 -> **0.721** | 5 -> 5 | PASS |
+| CC_20 (caves) | 266526 -> 234857 (-12%) | 5984 -> **1031 (-83%)** | 188 -> 39 | 0.679 -> **0.741** | 15 -> 15 | PASS |
+| Basamu | 540232 -> 486861 (-10%) | 11608 -> **1500 (-87%)** | 596 -> 61 | 0.693 -> **0.746** | 1 -> 1 | PASS |
 
-The outline moves at up to 0.35 m on the vertices that carried a wobble (5053 on Birtu, 15255 on CC_20,
-19412 on Basamu - a small fraction of all boundary vertices), and the interior surface by at most 0.30 m
-(folds that would move more than that are refused: they are real steps and folds, not slivers).
+Before the safety guards the same passes reached -93%/-95%/-97%, but they also cut corridor corners, doubled
+faces back over each other and pulled the mesh under stair tops; the guards above give back about ten points
+and remove all three defects. Each guard is a single constant next to the others in `NavMeshCleanup.cs` if a
+map ever justifies loosening one.
 
 Known limits, by design: a needle whose removal would fold the surface by more than 0.30 m (a genuine step or
 fold) or swing the outline by more than 0.35 m (a real zigzag) **survives** - the pass will not reshape the
