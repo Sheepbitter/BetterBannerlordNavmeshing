@@ -912,6 +912,51 @@ untouched (all 36 rows bit-identical, worst |coverage delta| = 0.0). **Residual,
 `stations=<all>/<all>`, i.e. their collision faces span the whole run and flatten the envelope too. They are
 `HasSteps` props with measured 100 % level coverage, so the ladder rule was not extended to them.
 
+**V3.28/V3.31: the offset symbolic connector (vertical ladders, and small doorways).** A vertical ladder has
+no horizontal run, so nothing can be laid inside its own footprint, and its collision (a climbing plane) is
+far too narrow to survive erosion. For a `Ladder` prop that the ordinary synthesis cannot connect, the
+synthesizer now emits an **offset symbolic connector**: a bottom anchor moved horizontally from the ladder's
+top so the slope is shallow enough to rasterise, joined to the ladder's own top. The rationale (from the
+editor): a ladder *must* be navmeshed for bots to traverse it, and the navmesh may sit **near** the geometry -
+the connector is a **link, not a surface an agent stands on beside the ladder**. The rules:
+
+- **Slope/width.** `ConnectorSlopeDegrees = 45 deg` (V3.31; was 62 deg). A **steeper connector rasterises as
+  one tall span per column** (e.g. `52..68` over a 2.9 m rise): the compact heightfield then takes the span's
+  *top* as the walkable floor, so the lower floor under the ramp is swallowed and the foot never merges - the
+  measured Test 26 break (ramp topped at 2.27 while the landing was at 3.40). At 45 deg each column's span is
+  only ~1-2 cells thick and every section merges. Width `ConnectorWidthMeters = 3.4 m` for the ramp itself
+  (what beats erosion).
+- **The top pad crosses the doorway.** A ladder often leads into an opening that "barely fits a person". The
+  pad runs **through the throat and overlaps the floor's first surviving navmesh cell** beyond it, or the link
+  dies at the opening. It is emitted in each direction the probe shows clear (the prop's own run + the four
+  axes), clipped at solid geometry. The pad is **narrow** (`ConnectorPadWidthMeters = 1.0 m`) because a wide pad
+  would overlap the wall on both sides of a narrow throat; being a connector cell it is erosion-exempt, so it
+  does not need a wide footprint. `ConnectorTopPadMeters = 3.0 m` (cap `3.6 m`).
+- **Scene probe.** `Synthesize` stays soup-free: the caller may set `Prop.IsFreeAt(engineX, engineY, height)` -
+  the collector wires it from the collected collision soup (`ScenePointFree`), the harness from the synthetic
+  scene. The probe (a) aims the pad at the opening, (b) clips the pad where solid blocks it, and (c) refuses
+  the **whole connector** if its ramp's centre line would pass through solid geometry, so a **walled-shut
+  doorway is never tunnelled**.
+- **Three exemptions**, all scoped to the connector's own cells: the **ledge** trim (a connector span the trim
+  nulled is restored), the **clearance** filter (walkable spans within `walkableHeight` above the connector are
+  unlinked so the link survives `FilterWalkableLowHeightSpans`), and **erosion** (the connector's own compact
+  span the erosion inset killed has its area restored; `ErodeWalkableArea` only writes `areas[]`, never the
+  span neighbours). Counters: `v2: connector: forcedInTile=<n> markedCells=<n> clearedCeilings=<n>
+  erosionExempt=<n>`; the collector logs each pad's reach/direction as `assets: connector pad '<prop>'
+  topPad=<m>m dir=(<x>,<y>)`.
+- **Ladder-flag only**, and **byte-neutral** where it does not fire: Birtu's two `civilian_ladder_*` connectors
+  stay 62.111/63.181 deg, islands 5, `forcedInTile=0` (both connect within their own footprint via the V3.18
+  hole-bridge chain, so the offset connector never runs there).
+
+Harness `Test 25` (a): a 90 deg ladder now connects (`sameIsland(foot,top)=True`, continuous climb).
+Harness `Test 26` (new): a 1.0 x 2.0 m doorway through a 1.6 m wall - `lower->upper=True` with the pad
+extension, `False` with the legacy 0.5 m pad (the control), and `False` when the doorway is walled shut (no
+tunnelling), F=83, invariants PASS. **Residual, open and documented:** `Test 25 (c)`, a 60 deg leaning ladder,
+still reports `connected=False` - it reaches the landing through the ordinary station/chain path (never the
+offset connector), and its chain geometry tops out short of the landing. The same mechanism (a steep or short
+chain not merging with the landing) is the remaining lever.
+
+
 ### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is

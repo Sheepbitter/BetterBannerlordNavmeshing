@@ -310,6 +310,7 @@ namespace BetterBannerlordNavmeshing
             int rampQuads = 0, rampStairs = 0, rampLadders = 0, rampHoles = 0, rampNoHoles = 0;
             int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
             var rampSkips = new List<SteppedPropRamps.Skip>();
+            var rampConnectorInfos = new List<SteppedPropRamps.RampInfo>();
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -427,6 +428,15 @@ namespace BetterBannerlordNavmeshing
                         for (int t = 0; t < wrote * 3; t++)
                             prop.Tris[t] = tris[firstTri * 3 + t] - firstVert;
 
+                        // Scene probe for the connector: is the engine point free of the collected solid
+                        // geometry? The soup is engine Z-up; a point is blocked when any triangle's XZ
+                        // projection contains it and its plane is at/above the point's height (within a
+                        // small band). O(soup) per probe but only for ladder connectors.
+                        prop.IsFreeAt = delegate (float px, float py, float pz)
+                        {
+                            return ScenePointFree(verts, tris, px, py, pz);
+                        };
+
                         SteppedPropRamps.Result ramps = SteppedPropRamps.Synthesize(
                             new SteppedPropRamps.Prop[] { prop },
                             rampCellSize, rampClimb, rampLedge);
@@ -438,6 +448,8 @@ namespace BetterBannerlordNavmeshing
                         rampSkippedLong += ramps.SkippedLong;
                         rampCapped += ramps.Capped;
                         for (int k = 0; k < ramps.Skips.Count; k++) rampSkips.Add(ramps.Skips[k]);
+                        for (int k = 0; k < ramps.Infos.Count; k++)
+                            if (ramps.Infos[k].TopPadMeters > 0f) rampConnectorInfos.Add(ramps.Infos[k]);
 
                         rampHoles += ramps.Holes;
                         rampNoHoles += ramps.NoHoles;
@@ -565,6 +577,15 @@ namespace BetterBannerlordNavmeshing
                         log("assets: " + SteppedPropRamps.DescribeSkip(foldedSkips[k]));
                     if (foldedSkips.Count > 20)
                         log("assets: ramps: skip ... (+" + (foldedSkips.Count - 20) + " more)");
+                    // Connector top-pad decisions (offset symbolic links): reach + direction.
+                    for (int k = 0; k < rampConnectorInfos.Count && k < 20; k++)
+                    {
+                        SteppedPropRamps.RampInfo ri = rampConnectorInfos[k];
+                        log("assets: connector pad '" + ri.Prop + "' topPad=" + ri.TopPadMeters.ToString("0.###",
+                            System.Globalization.CultureInfo.InvariantCulture) + "m dir=("
+                            + ri.DirX.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + ","
+                            + ri.DirHs.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + ")");
+                    }
                 }
                 else
                 {
@@ -587,6 +608,57 @@ namespace BetterBannerlordNavmeshing
                 || name.IndexOf("fence", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("tower", StringComparison.OrdinalIgnoreCase) >= 0
                 || name.IndexOf("gate", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Scene collision probe for the connector: true when the engine-space point (px,py,pz) is free
+        // of the collected solid soup. A triangle blocks the point when its XZ projection contains the
+        // point and the triangle's plane there is at/above the point's height within a small band (i.e.
+        // there is a solid surface just above/at the point). Engine Z-up: verts are (x, y, z).
+        private static bool ScenePointFree(List<float> verts, List<int> tris, float px, float py, float pz)
+        {
+            int triCount = tris.Count / 3;
+            for (int t = 0; t < triCount; t++)
+            {
+                int i0 = tris[t * 3 + 0], i1 = tris[t * 3 + 1], i2 = tris[t * 3 + 2];
+                float ax = verts[i0 * 3], ay = verts[i0 * 3 + 1], az = verts[i0 * 3 + 2];
+                float bx = verts[i1 * 3], by = verts[i1 * 3 + 1], bz = verts[i1 * 3 + 2];
+                float cx = verts[i2 * 3], cy = verts[i2 * 3 + 1], cz = verts[i2 * 3 + 2];
+                // Quick AABB reject in XZ.
+                if (px < Math.Min(ax, Math.Min(bx, cx)) || px > Math.Max(ax, Math.Max(bx, cx))) continue;
+                if (py < Math.Min(ay, Math.Min(by, cy)) || py > Math.Max(ay, Math.Max(by, cy))) continue;
+                if (!PointInTriXZ(px, py, ax, ay, bx, by, cx, cy)) continue;
+                float planeZ = TriHeightAtXZ(px, py, ax, az, ay, bx, bz, by, cx, cz, cy);
+                if (float.IsNaN(planeZ)) continue;
+                // Solid just at/above the probe blocks it.
+                if (planeZ >= pz - 0.3f) return false;
+            }
+            return true;
+        }
+
+        // Inside-or-on-edge XZ triangle test (py is the horizontal second axis here).
+        private static bool PointInTriXZ(float px, float py, float ax, float ay, float bx, float by,
+            float cx, float cy)
+        {
+            float d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+            float d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+            float d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+            bool neg = d1 < 0f || d2 < 0f || d3 < 0f;
+            bool pos = d1 > 0f || d2 > 0f || d3 > 0f;
+            return !(neg && pos);
+        }
+
+        // Barycentric height (engine Z) of a triangle at an XZ point (xa/ya, xb/yb, xc/yc are the
+        // horizontal coords; za/zb/zc the heights). NaN when the XZ projection is degenerate.
+        private static float TriHeightAtXZ(float px, float py, float xa, float za, float ya,
+            float xb, float zb, float yb, float xc, float zc, float yc)
+        {
+            float den = (yb - yc) * (xa - xc) + (xc - xb) * (ya - yc);
+            if (den > -1e-9f && den < 1e-9f) return float.NaN;
+            float inv = 1f / den;
+            float wa = ((yb - yc) * (px - xc) + (xc - xb) * (py - yc)) * inv;
+            float wb = ((yc - ya) * (px - xc) + (xa - xc) * (py - yc)) * inv;
+            float wc = 1f - wa - wb;
+            return wa * za + wb * zb + wc * zc;
         }
 
         private static bool IsFloor(string name)

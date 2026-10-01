@@ -85,11 +85,21 @@ namespace BetterBannerlordNavmeshing
         // horizontally from the ladder's top so the slope is shallow enough to rasterise (never 90 deg),
         // and the whole link sits near the geometry (the navmesh may sit inside the ladder's own
         // plank/hatch headroom - that is what the clearance exemption in the builder is for).
-        public const float ConnectorSlopeDegrees = 62f;   // target slope of the offset connector
+        public const float ConnectorSlopeDegrees = 45f;   // target slope of the offset connector
         public const float ConnectorMinRunMeters = 0.5f;  // never emit a degenerate near-vertical quad
         public const float ConnectorWidthMeters = 3.4f;   // wide enough to survive erosion (2 cells/side)
         public const float ConnectorFootPadMeters = 1.0f; // flat pad on the floor below the foot anchor
-        public const float ConnectorTopPadMeters = 0.5f;  // flat pad on the landing at the top anchor
+        // Top pad: long enough to cross a doorway throat and OVERLAP the floor's first surviving navmesh
+        // cell beyond it. The pad is a connector cell (ledge/clearance/erosion exempt); the cap bounds
+        // runaway and the guardrail refuses it into solid geometry.
+        public const float ConnectorTopPadMeters = 3.0f;
+        public const float ConnectorTopPadMaxMeters = 3.6f;
+        public const float ConnectorTopPadLegacyMeters = 0.5f;
+        // The pad is narrow: a ladder often leads into an opening that "barely fits a person", so a wide
+        // pad would overlap the wall on both sides of the throat. Exempt from erosion, it need not be wide.
+        public const float ConnectorPadWidthMeters = 1.0f;
+        // Test hook: false uses the legacy short pad (the V3.28 behaviour).
+        public static bool ConnectorTopPadExtension = true;
 
         public sealed class Prop
         {
@@ -97,6 +107,10 @@ namespace BetterBannerlordNavmeshing
             public int Flags;          // TaleWorlds BodyFlags as int
             public float[] VertsXyz;   // engine Z-up, 3 floats per vertex
             public int[] Tris;         // 0-based indices into VertsXyz
+            // Optional scene probe (soup-free synthesis): IsFreeAt(engineX, engineY, height) returns true
+            // when the point is FREE (no solid collision). The collector supplies it from the collision
+            // soup, the harness from the synthetic scene. Null => no probe (V3.28 behaviour).
+            public Func<float, float, float, bool> IsFreeAt;
         }
 
         public sealed class Result
@@ -306,14 +320,61 @@ namespace BetterBannerlordNavmeshing
             float hw = 0.5f * ConnectorWidthMeters;
             float px = -dirY * hw, py = dirX * hw;   // perpendicular half-width of the centre line
 
-            // Foot pad (flat on the floor), ramp, top pad (flat on the landing). All three are forced
-            // walkable; the pads are deliberately short - just long enough to share a span with the
-            // floor / landing so the link merges there.
+            // GUARDRAIL (no tunneling): the connector's RAMP must not pass through solid geometry. Walk
+            // its centre line and refuse the connector if any sample is inside the scene's solid (the
+            // probe). A walled-shut doorway therefore keeps the ladder unconnected rather than tunnelling.
+            if (p.IsFreeAt != null)
+            {
+                const float rampStep = 0.125f;
+                int rampSamples = Math.Max(1, (int)(run / rampStep));
+                for (int i = 0; i <= rampSamples; i++)
+                {
+                    float f = (float)i / rampSamples;
+                    float sx = footX + (tx - footX) * f;
+                    float sy = footY + (ty - footY) * f;
+                    float sz = zMin + (zMax - zMin) * f;
+                    // A hair above the ramp surface so the ramp's own plane does not read as solid.
+                    if (!p.IsFreeAt(sx, sy, sz + 0.05f)) return false;
+                }
+            }
+
+            // Foot pad (flat on the floor) and ramp. The RAMP's top anchor is (tx,ty,zMax) - see the
+            // top-pad block below for how the landing is reached.
             AppendConnectorQuad(r, footX - dirX * ConnectorFootPadMeters,
                 footY - dirY * ConnectorFootPadMeters, zMin, footX, footY, zMin, px, py);
             AppendConnectorQuad(r, footX, footY, zMin, tx, ty, zMax, px, py);
-            AppendConnectorQuad(r, tx, ty, zMax,
-                tx + dirX * ConnectorTopPadMeters, ty + dirY * ConnectorTopPadMeters, zMax, px, py);
+
+            // TOP PAD. A ladder often leads into a narrow doorway ("barely fits a person"): the pad must
+            // run THROUGH the throat and OVERLAP the floor's first surviving navmesh cell, or the link
+            // dies at the opening (the landing-level span is killed by the clearance filter when a
+            // merge-void span sits just above it). It is emitted in each direction the probe shows clear
+            // (own run + 4 axes), clipped at solid geometry (no tunneling), and is a connector cell so all
+            // three exemptions cover it. The pad's flat top is aligned to the landing height (padTop).
+            float padCap = ConnectorTopPadExtension ? ConnectorTopPadMeters : ConnectorTopPadLegacyMeters;
+            if (padCap > ConnectorTopPadMaxMeters) padCap = ConnectorTopPadMaxMeters;
+            float padHw = 0.5f * ConnectorPadWidthMeters;
+            float padTop = PadTopZ(p, tx, ty, zMax);
+            float bestReach = 0f;
+            float bestDirX = dirX, bestDirY = dirY;
+            float[] padDirs = { dirX, dirY, 1f, 0f, -1f, 0f, 0f, 1f, 0f, -1f };
+            for (int d = 0; d < padDirs.Length; d += 2)
+            {
+                float rx = padDirs[d], ry = padDirs[d + 1];
+                float reach = PadReach(p, tx, ty, padTop, rx, ry, padCap);
+                if (reach < 0f) reach = padCap;
+                if (reach <= 1e-3f) continue;
+                float sx = -ry * padHw, sy = rx * padHw;
+                AppendConnectorQuad(r, tx, ty, padTop, tx + rx * reach, ty + ry * reach, padTop, sx, sy);
+                if (reach > bestReach) { bestReach = reach; bestDirX = rx; bestDirY = ry; }
+            }
+            if (bestReach <= 1e-3f)
+            {
+                // No probe / nothing to cross: keep the short legacy pad on the run direction at zMax.
+                AppendConnectorQuad(r, tx, ty, zMax,
+                    tx + dirX * ConnectorTopPadLegacyMeters, ty + dirY * ConnectorTopPadLegacyMeters, zMax,
+                    px, py);
+                padTop = zMax;
+            }
 
             var info = new RampInfo();
             info.Prop = p.Name;
@@ -324,11 +385,78 @@ namespace BetterBannerlordNavmeshing
             info.SlopeDeg = (float)(Math.Atan2(rise, run) * 180.0 / Math.PI);
             info.FootX = footX; info.FootHz = footY;
             info.HeadX = tx; info.HeadHz = ty;
+            info.TopPadMeters = bestReach;
+            info.DirX = bestDirX; info.DirHs = bestDirY;
             r.Infos.Add(info);
             r.Ramps++;
             r.Ladders++;
             if (skip != null) UndoSkip(r, skip);
             return true;
+        }
+
+        // Where the pad's flat top should sit at the ladder's own top: with a scene probe, the landing's
+        // own top surface just below the ladder top (so the pad's spans merge with the floor beyond);
+        // without one, the prop's own top (zMax, V3.28). Probing at the anchor's own XZ (not out along
+        // the run) keeps this independent of direction.
+        private static float PadTopZ(Prop p, float tx, float ty, float zMax)
+        {
+            if (p.IsFreeAt == null) return zMax;
+            for (float dz = 0f; dz <= 1.0f; dz += 0.05f)
+            {
+                float z = zMax - dz;
+                if (p.IsFreeAt(tx, ty, z + 0.05f) && !p.IsFreeAt(tx, ty, z - 0.2f))
+                    return z;
+            }
+            return zMax;
+        }
+
+        // How far the pad may run from (tx,ty) along (dirX,dirY) at height padTop before SOLID geometry
+        // blocks it. With a scene probe the walk is over scene points IsFreeAt(engineX, engineY, height);
+        // without one it falls back to the prop's OWN geometry. Half-cell steps; returns the clear
+        // distance (m) or -1 when clear to the cap. Deterministic (fixed step, first hit wins).
+        private static float PadReach(Prop p, float tx, float ty, float padTop, float dirX, float dirY,
+            float cap)
+        {
+            const float step = 0.125f;
+            for (float s = step; s <= cap + 1e-4f; s += step)
+            {
+                float sx = tx + dirX * s, sy = ty + dirY * s;
+                if (p.IsFreeAt != null)
+                {
+                    // The pad's own level AND just below it must be open: a filled throat (a walled-shut
+                    // doorway) is solid at head height and blocks the pad - no tunneling over a wall.
+                    if (!p.IsFreeAt(sx, sy, padTop + 0.05f)) return s - step;
+                    if (!p.IsFreeAt(sx, sy, padTop - 0.55f)) return s - step;
+                }
+                else
+                {
+                    if (OwnGeometryBlocks(p, sx, sy, padTop)) return s - step;
+                }
+            }
+            return -1f;
+        }
+
+        // The prop's own geometry blocks a point on the pad path at the pad height: a triangle near the
+        // path whose top reaches that height (a plank/wall), as opposed to the ladder's open rungs.
+        private static bool OwnGeometryBlocks(Prop p, float sx, float sy, float padTop)
+        {
+            if (p == null || p.VertsXyz == null || p.Tris == null) return false;
+            int vertCount = p.VertsXyz.Length / 3;
+            for (int t = 0; t < p.Tris.Length / 3; t++)
+            {
+                int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
+                    continue;
+                float zx = Math.Max(p.VertsXyz[i0 * 3 + 2],
+                    Math.Max(p.VertsXyz[i1 * 3 + 2], p.VertsXyz[i2 * 3 + 2]));
+                if (zx < padTop - 0.3f) continue;
+                float cx = (p.VertsXyz[i0 * 3] + p.VertsXyz[i1 * 3] + p.VertsXyz[i2 * 3]) / 3f;
+                float cy = (p.VertsXyz[i0 * 3 + 1] + p.VertsXyz[i1 * 3 + 1] + p.VertsXyz[i2 * 3 + 1]) / 3f;
+                float ddx = cx - sx, ddy = cy - sy;
+                if (ddx * ddx + ddy * ddy > 0.45f * 0.45f) continue;
+                return true;
+            }
+            return false;
         }
 
         // One connector quad, recording its two triangle indices so the builder can single the connector
@@ -371,6 +499,9 @@ namespace BetterBannerlordNavmeshing
             // Engine-space horizontal endpoints of the centre line (X and the second horizontal axis).
             // Only set by the offset symbolic connector; zero for the ordinary ramp path.
             public float FootX, FootHz, HeadX, HeadHz;
+            // Offset connector only: the top pad's reach (m) and the direction it ran.
+            public float TopPadMeters;
+            public float DirX, DirHs;
         }
 
         public static bool IsSteppedOrLadder(int flags)
