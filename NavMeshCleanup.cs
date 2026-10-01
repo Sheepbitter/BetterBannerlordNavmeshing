@@ -74,6 +74,19 @@ namespace BetterBannerlordNavmeshing
         public const float QuadMergeThinMinAngleDegrees = 6f;
         public const float QuadMergeThinAspect = 8f;
         public const float QuadMergeFoldMaxDegrees = 25f;
+        // The engine's navmesh validator REJECTS a concave face outright - importing a mesh that
+        // contains one raises the editor dialog "Concave Navigation Mesh Face Detected" and refuses
+        // the map. So a merge is only allowed when the resulting quad is STRICTLY convex (every
+        // interior angle strictly below 180 deg); a concave pair stays two triangles, which the engine
+        // always accepts. QuadConvexMaxInteriorAngleDegrees is "strictly below 180" with a 0.1 deg
+        // margin: a corner that close to straight is a redundant vertex sitting on the segment between
+        // its neighbours (1.7 mm off it on a 1 m edge, versus the mesh's own 0.05 m cleanup tolerance),
+        // it is the shape float noise manufactures on an exactly collinear triple, and emitting it
+        // would hand the engine's n-gon triangulator a zero-area corner triangle. It is measured to be worth
+        // almost nothing: dropping the ceiling entirely (179.99999) buys 1 extra quad on Birtu and 9 on
+        // CC_20 (0.15% / 0.46%), and with it disabled the worst emitted corner really does reach
+        // 180.0000 deg - i.e. the degenerate corners it exists to catch do occur on real maps.
+        public const float QuadConvexMaxInteriorAngleDegrees = 179.9f;
 
         public sealed class Stats
         {
@@ -1951,8 +1964,12 @@ namespace BetterBannerlordNavmeshing
         // smallest perimeter) subject to: (a) neither face already merged; (b) four distinct vertices;
         // (c) the quad walk is simple with the surface winding; (d) the two faces fold by <= 25 deg;
         // (e) geometry unchanged (above); (f) the writer derives the honest is_concave value from the
-        // same walk. Face indices are stable here (no compaction after FlipEdges), so QuadPairs indexes
-        // the final mesh directly.
+        // same walk; (g) THE QUAD IS STRICTLY CONVEX - every interior angle < 180 deg. Constraint (g)
+        // is what makes the flag in (f) always come out 0, because the engine's navmesh validator
+        // refuses a concave face ("Concave Navigation Mesh Face Detected" on import); the honest answer
+        // is not to flag a concave quad but never to build one. A refused pair simply stays two
+        // triangles, which the engine accepts unconditionally. Face indices are stable here (no
+        // compaction after FlipEdges), so QuadPairs indexes the final mesh directly.
         private static void MergeQuads(List<float> verts, List<int> tris, Stats st)
         {
             int nf = tris.Count / 3;
@@ -2032,9 +2049,12 @@ namespace BetterBannerlordNavmeshing
         // Builds the quad's boundary walk for the two triangles sharing (u,w), where (u,w) is directed
         // along f0's winding and x/y are the two apexes. The walk q->x->u->y (q=w, p=u) reproduces f0
         // and the neighbour triangle with their original winding. Returns the quad's worst interior
-        // angle (degrees) and perimeter (m); false when the projection is degenerate or the walk is
-        // self-intersecting (a bowtie - the two faces are inconsistently wound or overlap), i.e.
-        // constraint (c).
+        // angle (degrees) and perimeter (m); false when the projection is degenerate, or when the walk
+        // is not STRICTLY CONVEX in the quad's own plane - which covers both the old constraint (c)
+        // (a self-intersecting bowtie, i.e. the two faces are inconsistently wound or overlap) and the
+        // new constraint (g) (one reflex corner = the concave 4-gon the engine refuses to import).
+        // Because a convex quad's four interior angles sum to 360, `worst` is a true convexity measure
+        // and stays a valid ranking key for the best-neighbour choice.
         private static bool QuadWorstAndPerimeter(float[] v, int u, int w, int x, int y,
             out double worst, out double perim)
         {
@@ -2082,15 +2102,30 @@ namespace BetterBannerlordNavmeshing
             for (int i = 0; i < 4; i++) { int j = (i + 1) % 4; area2 += px[i] * py[j] - px[j] * py[i]; }
             if (Math.Abs(area2) < 1e-12) return false;
 
+            // Strict convexity (constraint (g)). In the quad's own projected plane, a boundary walk is
+            // convex exactly when all four successive cross products cr_i = (p_i - p_i-1) x (p_i+1 - p_i-1)
+            // share the sign of the polygon's own signed area area2. One cr of the opposite sign is a
+            // reflex corner - a concave 4-gon, which the engine's navmesh validator rejects outright.
+            // cr == 0 exactly is a collinear triple (a straight 180 deg corner), which is not convex in
+            // the strict sense either, hence the strict > 0 rather than >= 0.
+            //
+            // The angle ceiling is the epsilon: with float inputs at map scale (~1000 m, so ~6e-5 m of
+            // coordinate noise) a geometrically straight corner does not land on cr == 0 but on noise
+            // of either sign, so the sign test alone cannot catch it - the corner must also come in
+            // strictly under QuadConvexMaxInteriorAngleDegrees. 0.1 deg is ~14x that noise while still
+            // costing nothing real: a corner that close to straight is a redundant vertex lying on the
+            // segment between its neighbours, and handing the engine's n-gon triangulator a zero-area
+            // corner triangle is worse than leaving the pair as two triangles.
+            //
+            // This also subsumes the old bowtie rejection (two opposite-sign corners): a self-
+            // intersecting walk always has mixed turn signs, so it is refused on its first bad corner.
             worst = 180.0;
-            int opposite = 0;   // vertices whose turn sign is opposite the polygon's: reflex / bowtie
             for (int i = 0; i < 4; i++)
             {
                 int pa = (i + 3) % 4, pb = i, pc = (i + 1) % 4;
                 double cr = (px[pb] - px[pa]) * (py[pc] - py[pa]) - (py[pb] - py[pa]) * (px[pc] - px[pa]);
-                bool reflex = cr * area2 < -1e-12;
-                if (reflex) opposite++;
-                // Interior angle at this corner, [0,360): reflex corners see the far side.
+                if (cr * area2 <= 0.0) return false;
+                // Interior angle at this corner, in (0,180) once the test above has passed.
                 double e1x = px[pa] - px[pb], e1y = py[pa] - py[pb];
                 double e2x = px[pc] - px[pb], e2y = py[pc] - py[pb];
                 double l1 = Math.Sqrt(e1x * e1x + e1y * e1y), l2 = Math.Sqrt(e2x * e2x + e2y * e2y);
@@ -2098,11 +2133,9 @@ namespace BetterBannerlordNavmeshing
                 double cosA = (e1x * e2x + e1y * e2y) / (l1 * l2);
                 if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
                 double ang = Math.Acos(cosA) * 180.0 / Math.PI;
-                if (reflex) ang = 360.0 - ang;
+                if (ang >= QuadConvexMaxInteriorAngleDegrees) return false;
                 if (ang < worst) worst = ang;
             }
-            // A simple quad has at most one reflex corner; two or more is a self-intersecting bowtie.
-            if (opposite >= 2) return false;
 
             for (int i = 0; i < 4; i++)
             {

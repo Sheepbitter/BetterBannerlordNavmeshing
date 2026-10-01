@@ -145,6 +145,13 @@ namespace BetterBannerlordNavmeshing
         // boundary edges are written, and field 0 (is_concave, >= v2) carries the honest reflex flag.
         // Unpaired faces keep their 3-vertex record unchanged. Native navmeshes are polygon-based with
         // exactly this per-face vertex count + is_concave layout, so the importer already accepts n-gons.
+        //
+        // The flag is computed honestly here and is NOT a licence to emit concave quads: the engine's
+        // navmesh validator refuses a concave face outright (the editor raises "Concave Navigation Mesh
+        // Face Detected" and refuses the map), so NavMeshCleanup.MergeQuads - the only producer of
+        // quadPairs - only ever records strictly convex pairs. The flag therefore comes out 0 for every
+        // emitted quad; this stays a real per-face computation so the writer remains correct for any
+        // caller that hands it a concave pair.
         public static byte[] WriteInterleaved(float[] xyz, int vertexCount,
             int[] tri, int faceCount, int[] quadPairs, out int edgeCount)
         {
