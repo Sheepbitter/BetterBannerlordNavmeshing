@@ -73,6 +73,16 @@ namespace BetterBannerlordNavmeshing
         // with the surface's winding, and neither face may already be merged.
         public const float QuadMergeThinMinAngleDegrees = 6f;
         public const float QuadMergeThinAspect = 8f;
+        // Fold allowance between the two merged faces - i.e. the dihedral across the shared edge. It
+        // is a SENSE guard, not a safety guard: it exists to stop a step rim or two stacked levels
+        // sharing an edge from becoming one polygon. It was briefly tightened to 12 deg on the theory
+        // that a bent quad was the source of the XZ-reflex class, and the measurement refuted that
+        // theory: three of the five faces the engine actually complained about folded only 6.8 / 7.3 /
+        // 14.1 deg, so a 25 deg cap never let them through, and the XZ test (h1..h3 below) drives the
+        // reflex/flat/orientation counts to 0 with this cap left at 25. Tightening it cost 127 / 587 /
+        // 1214 merges on Birtu / CC_20 / Basamu - 32% and 41% of the remaining merges on the two big
+        // maps - for no measured reduction in any concave-XZ count. So it stays at 25 and the XZ
+        // test carries the safety.
         public const float QuadMergeFoldMaxDegrees = 25f;
         // The engine's navmesh validator REJECTS a concave face outright - importing a mesh that
         // contains one raises the editor dialog "Concave Navigation Mesh Face Detected" and refuses
@@ -87,6 +97,16 @@ namespace BetterBannerlordNavmeshing
         // CC_20 (0.15% / 0.46%), and with it disabled the worst emitted corner really does reach
         // 180.0000 deg - i.e. the degenerate corners it exists to catch do occur on real maps.
         public const float QuadConvexMaxInteriorAngleDegrees = 179.9f;
+        // The engine's navmesh is a 2D structure and its concave-face validator can only see the XZ
+        // projection, so a quad that is convex in its OWN best-fit plane can still be reflex in XZ
+        // (a quad bent along its shared edge projects to a concave 4-gon). So the XZ frame gets its
+        // own convexity test, with its own (much larger) margin: QuadXzMaxInteriorAngleDegrees. The
+        // margin is 5 deg, i.e. 50x the 0.1 deg plane epsilon, and it exists because the engine's
+        // test has an unknown epsilon of its own: a corner that is within a fraction of a degree of
+        // straight in XZ is one float rounding away from being straight in ITS arithmetic, and we
+        // cannot see that epsilon. 5 deg costs very little (see the README measurement) and is
+        // comfortably wider than any plausible engine tolerance.
+        public const float QuadXzMaxInteriorAngleDegrees = 175f;
 
         public sealed class Stats
         {
@@ -110,6 +130,12 @@ namespace BetterBannerlordNavmeshing
             // quad in the FINAL mesh's face numbering (no compaction happens after this stage).
             public int Quads;
             public List<int> QuadPairs;
+            // Worst XZ (ground-projection) interior angle over the emitted quads, and how many
+            // emitted quads sit within QuadXzMaxInteriorAngleDegrees of straight there. The engine's
+            // validator only sees XZ, so this is the figure that has to stay clean - it goes on the
+            // cleanup: line so a regression is visible in the run log, not only in the tests.
+            public double QuadXzWorstAngle;
+            public int QuadXzNearStraight;
             public string EdgeHist;
             // Why each surviving needle's vertices were not removable (capped; goes to the run log).
             public List<string> Diag;
@@ -1903,6 +1929,22 @@ namespace BetterBannerlordNavmeshing
                  - (v[b * 3 + 2] - v[a * 3 + 2]) * (v[p * 3] - v[a * 3]);
         }
 
+        // Signed XZ area x2 of the triangle (a,b,c) in walk order. Note this is the negation of the
+        // Y-up normal, so every consistently wound upward face has the same sign here.
+        private static double XzTriArea2(float[] v, int a, int b, int c)
+        {
+            return (double)v[a * 3] * v[b * 3 + 2] - (double)v[b * 3] * v[a * 3 + 2]
+                 + (double)v[b * 3] * v[c * 3 + 2] - (double)v[c * 3] * v[b * 3 + 2]
+                 + (double)v[c * 3] * v[a * 3 + 2] - (double)v[a * 3] * v[c * 3 + 2];
+        }
+
+        // XZ cross product (ib-ia) x (ic-ia) - the turn at corner ib of the XZ walk.
+        private static double XZCross(float[] v, int ia, int ib, int ic)
+        {
+            return (v[ib * 3] - v[ia * 3]) * (v[ic * 3 + 2] - v[ia * 3 + 2])
+                 - (v[ib * 3 + 2] - v[ia * 3 + 2]) * (v[ic * 3] - v[ia * 3]);
+        }
+
         private static double DistToPlane(float[] v, int u, int x, int w, int y)
         {
             double[] n = Normal(v, u, x, w);
@@ -1964,12 +2006,16 @@ namespace BetterBannerlordNavmeshing
         // smallest perimeter) subject to: (a) neither face already merged; (b) four distinct vertices;
         // (c) the quad walk is simple with the surface winding; (d) the two faces fold by <= 25 deg;
         // (e) geometry unchanged (above); (f) the writer derives the honest is_concave value from the
-        // same walk; (g) THE QUAD IS STRICTLY CONVEX - every interior angle < 180 deg. Constraint (g)
-        // is what makes the flag in (f) always come out 0, because the engine's navmesh validator
-        // refuses a concave face ("Concave Navigation Mesh Face Detected" on import); the honest answer
-        // is not to flag a concave quad but never to build one. A refused pair simply stays two
-        // triangles, which the engine accepts unconditionally. Face indices are stable here (no
-        // compaction after FlipEdges), so QuadPairs indexes the final mesh directly.
+        // same walk; (g) THE QUAD IS STRICTLY CONVEX IN ITS OWN PLANE - every interior angle < 180 deg;
+        // (h) AND STRICTLY CONVEX IN THE ENGINE'S OWN FRAME, the XZ projection, with a 5 deg margin
+        // and the winding preserved (see QuadWorstAndPerimeter). Constraint (g) alone was NOT enough:
+        // the engine's validator works on the ground projection, so a quad bent along its shared edge
+        // can be convex in its own plane and reflex in XZ - that is exactly what V3.41 shipped, and
+        // the engine named all five of Birtu's. Constraints (g) and (h) together are what make the
+        // flag in (f) always come out 0; the honest answer is not to flag a concave quad but never to
+        // build one. A refused pair simply stays two triangles, which the engine accepts
+        // unconditionally. Face indices are stable here (no compaction after FlipEdges), so QuadPairs
+        // indexes the final mesh directly.
         private static void MergeQuads(List<float> verts, List<int> tris, Stats st)
         {
             int nf = tris.Count / 3;
@@ -2025,6 +2071,67 @@ namespace BetterBannerlordNavmeshing
 
             st.Quads = pairs.Count / 2;
             st.QuadPairs = pairs;
+            MeasureXz(pairs, tris, v, st);
+        }
+
+        // Reporting pass over the recorded pairs: the worst XZ interior angle actually emitted and how
+        // many land within the XZ margin of straight. Cheap (O(quads)) and the figure the engine
+        // actually judges, so it belongs in the run log.
+        private static void MeasureXz(List<int> pairs, List<int> tris, float[] v, Stats st)
+        {
+            st.QuadXzWorstAngle = 0.0;
+            st.QuadXzNearStraight = 0;
+            for (int k = 0; k + 1 < pairs.Count; k += 2)
+            {
+                int f0 = pairs[k], f1 = pairs[k + 1];
+                int a0 = tris[f0 * 3], b0 = tris[f0 * 3 + 1], c0 = tris[f0 * 3 + 2];
+                int a1 = tris[f1 * 3], b1 = tris[f1 * 3 + 1], c1 = tris[f1 * 3 + 2];
+                int p, q, x;
+                if (SharePair(a0, b0, a1, b1, c1)) { p = a0; q = b0; x = c0; }
+                else if (SharePair(b0, c0, a1, b1, c1)) { p = b0; q = c0; x = a0; }
+                else { p = c0; q = a0; x = b0; }
+                int y = a1 != p && a1 != q ? a1 : (b1 != p && b1 != q ? b1 : c1);
+                double worst = WorstXzAngle(v, q, x, p, y);
+                if (worst > st.QuadXzWorstAngle) st.QuadXzWorstAngle = worst;
+                // Log-only headroom gauge: quads within half a degree of the margin.
+                if (worst >= QuadXzMaxInteriorAngleDegrees - 0.5) st.QuadXzNearStraight++;
+            }
+        }
+
+        private static bool SharePair(int u, int w, int a, int b, int c)
+        {
+            return (u == a || u == b || u == c) && (w == a || w == b || w == c);
+        }
+
+        // Largest XZ interior angle (degrees) of the quad walk q -> x -> p -> y. >180 = the engine's
+        // frame sees a reflex corner. 0 when the projection is degenerate (which cannot happen for a
+        // recorded pair: MergeQuads already refused those).
+        private static double WorstXzAngle(float[] v, int q, int x, int p, int y)
+        {
+            int[] w = { q, x, p, y };
+            double area2 = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                int ia = w[i], ib = w[(i + 1) % 4];
+                area2 += (double)v[ia * 3] * v[ib * 3 + 2] - (double)v[ib * 3] * v[ia * 3 + 2];
+            }
+            if (Math.Abs(area2) < 1e-9) return 0.0;
+            double worst = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                int ia = w[(i + 3) % 4], ib = w[i], ic = w[(i + 1) % 4];
+                double cr = XZCross(v, ia, ib, ic);
+                double e1x = v[ia * 3] - v[ib * 3], e1z = v[ia * 3 + 2] - v[ib * 3 + 2];
+                double e2x = v[ic * 3] - v[ib * 3], e2z = v[ic * 3 + 2] - v[ib * 3 + 2];
+                double l1 = Math.Sqrt(e1x * e1x + e1z * e1z), l2 = Math.Sqrt(e2x * e2x + e2z * e2z);
+                if (l1 < 1e-12 || l2 < 1e-12) return 0.0;
+                double cosA = (e1x * e2x + e1z * e2z) / (l1 * l2);
+                if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
+                double ang = Math.Acos(cosA) * 180.0 / Math.PI;
+                if (cr * area2 < 0) ang = 360.0 - ang;
+                if (ang > worst) worst = ang;
+            }
+            return worst;
         }
 
         // A face is a quad-merge candidate while still thin by either predicate.
@@ -2135,6 +2242,49 @@ namespace BetterBannerlordNavmeshing
                 double ang = Math.Acos(cosA) * 180.0 / Math.PI;
                 if (ang >= QuadConvexMaxInteriorAngleDegrees) return false;
                 if (ang < worst) worst = ang;
+            }
+
+            // ---- THE ENGINE'S FRAME (constraint (h)) ----
+            // The engine's navmesh is a 2D structure: it triangulates and validates a face from its
+            // GROUND projection, so its concave-face test can only see XZ. A quad that is convex in
+            // its own best-fit plane can still be REFLEX in XZ, because the plane projection turns
+            // each corner's edges differently than the XZ projection does. Measured on the real maps:
+            // V3.41 emitted exactly 5 such quads on Birtu and the engine's dialog named exactly those
+            // five (their centroids, to the centimetre). So XZ gets its own test:
+            //   (h1) the XZ projection is non-degenerate;
+            //   (h2) the XZ walk's shoelace sign agrees with BOTH triangles it replaces - a merge
+            //        must never flip a face's winding in the engine's frame;
+            //   (h3) all four XZ interior angles are strictly below QuadXzMaxInteriorAngleDegrees,
+            //        with a 5 deg margin rather than the plane test's 0.1 deg.
+            // The margin is deliberately far wider than the numerical noise. Coordinates are floats
+            // at map scale (up to ~2.1 km on CC_20), so one coordinate carries ~2.4e-4 m of rounding
+            // and an interior angle measured over the shortest edge the merge accepts (0.25 m) has
+            // ~2*2.4e-4/0.25 = 2e-3 rad = 0.11 deg of pure noise. 5 deg is ~45x that worst case, and
+            // it is also the level at which such a corner sits no more than 0.044*L off the segment
+            // between its neighbours - below the cleanup's own 0.05 m tolerance for a 1 m quad side,
+            // i.e. such a corner is a vertex the mesh never promised to keep in the first place.
+            double xzArea2 = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                int ia = walk[i], ib = walk[(i + 1) % 4];
+                xzArea2 += (double)v[ia * 3] * v[ib * 3 + 2] - (double)v[ib * 3] * v[ia * 3 + 2];
+            }
+            double xzTotal = XzTriArea2(v, u, w, x) + XzTriArea2(v, w, u, y);
+            if (Math.Abs(xzArea2) < 1e-9) return false;                       // (h1) vertical quad
+            if (Math.Abs(xzTotal) < 1e-9) return false;
+            if (xzArea2 * xzTotal <= 0.0) return false;                         // (h2) winding flip
+            for (int i = 0; i < 4; i++)
+            {
+                int ia = walk[(i + 3) % 4], ib = walk[i], ic = walk[(i + 1) % 4];
+                double cr = XZCross(v, ia, ib, ic);
+                if (cr * xzArea2 <= 0.0) return false;                          // (h3) reflex / flat
+                double f1x = v[ia * 3] - v[ib * 3], f1z = v[ia * 3 + 2] - v[ib * 3 + 2];
+                double f2x = v[ic * 3] - v[ib * 3], f2z = v[ic * 3 + 2] - v[ib * 3 + 2];
+                double m1 = Math.Sqrt(f1x * f1x + f1z * f1z), m2 = Math.Sqrt(f2x * f2x + f2z * f2z);
+                if (m1 < 1e-12 || m2 < 1e-12) return false;
+                double cc = (f1x * f2x + f1z * f2z) / (m1 * m2);
+                if (cc > 1) cc = 1; if (cc < -1) cc = -1;
+                if (Math.Acos(cc) * 180.0 / Math.PI >= QuadXzMaxInteriorAngleDegrees) return false;
             }
 
             for (int i = 0; i < 4; i++)

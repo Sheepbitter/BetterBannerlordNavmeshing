@@ -292,7 +292,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelPruneIsolatedIslands` | `true` | Remove small isolated islands after the merge (sealed-void lids, stray fragments) so they cannot sit where no agent can reach. Never touches the big networks (> cap). See *Island pruning*. |
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **inserts** a midpoint into long thin faces (first, so the later passes clean its children), **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, slides ratio needles, and finishes with a Delaunay-style flip polish. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
-| `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex** - the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
+| `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -732,20 +732,56 @@ would create a duplicate face or an edge with more than two faces.
 
 The quad merge has its own small guard set, all checked per candidate pair before the pair is recorded:
 neither face may already be merged; the union's four vertices must be distinct; the two faces may fold by at
-most 25 deg, so a step rim or two stacked levels sharing an edge never become one polygon; and the resulting
-quad must be **strictly convex in its own plane**. That last guard is the important one, and it exists because
-**the engine refuses a concave navmesh face**: importing a mesh that contains one raises the editor dialog
+most 25 deg, so a step rim or two stacked levels sharing an edge never become one polygon; the resulting quad
+must be **strictly convex in its own plane**; and it must be **strictly convex in the engine's own frame,
+the XZ ground projection**, with a 5 deg margin. The last two guards are the important ones, and they exist
+because **the engine refuses a concave navmesh face**: importing a mesh that contains one raises the editor
+dialog
 
 > Concave Navigation Mesh Face Detected
 > Concave faces detected on navigation mesh at locations: 1) x=..., z=..., y=... (and so on)
 
 and the map will not load. `is_concave` exists in the NMG8 face record precisely because the engine's
 validator knows the flag; setting it honestly is not the fix, because a flagged concave face is a rejected
-face either way. The fix is to **never build one**: a pair whose merged walk has a single reflex corner is
-simply left as two triangles, which the engine accepts unconditionally. So the emitted `is_concave` is 0
-everywhere, by construction rather than by assertion.
+face either way. The fix is to **never build one**: a pair whose merged walk has a reflex corner in the
+engine's frame is simply left as two triangles, which the engine accepts unconditionally. So the emitted
+`is_concave` is 0 everywhere, by construction rather than by assertion.
 
-The convexity test is a probe of all four corners in the quad's own projected plane (the same Newell-normal
+**The engine tests the GROUND projection, not the quad's plane.** This is the whole reason the guard exists in
+two frames. The engine's navmesh is a 2D structure - it routes in XZ and triangulates a face from its ground
+projection - so whatever concavity test it runs can only see XZ. The plane test alone was **not** enough:
+V3.41 emitted five quads on Birtu that are convex in their own best-fit plane (worst angle `179.85` deg,
+inside V3.41's own `179.9` ceiling) and **reflex in XZ** (up to `188.13` deg), and the engine's dialog named
+exactly those five. That is a measured, one-to-one correspondence: the dialog prints each face's centroid in
+the engine's Z-up frame, and all five centroids match the five XZ-reflex quads to **0.00-0.01 m**:
+
+| engine dialog (x, y, z=height) | our centroid (x, y=height, z) | plane worst | XZ worst | fold |
+|---|---|---|---|---|
+| 513.38, 111.81, 44.70 | 513.38, 44.70, 111.81 | 179.85 deg | **184.76 deg** | 7.3 deg |
+| 304.71, 265.83, 39.95 | 304.71, 39.95, 265.83 | 178.51 deg | **181.25 deg** | 14.1 deg |
+| 350.44, 327.81, 37.60 | 350.44, 37.60, 327.81 | 163.10 deg | **180.00 deg** | 6.8 deg |
+| 264.75, 376.99, 21.15 | 264.75, 21.15, 376.99 | 179.01 deg | **188.13 deg** | 16.6 deg |
+| 362.35, 400.80, 21.73 | 362.35, 21.73, 400.80 | 172.53 deg | **180.56 deg** | 23.2 deg |
+
+**The fold cap is a sense guard, not a safety guard, and the measurement says so.** Three of the five faces
+the engine actually complained about folded only **6.8 / 7.3 / 14.1 deg** - i.e. V3.41's 25 deg cap never let
+them through, so "a bent quad is the XZ risk" is refuted by the engine's own five. The fold allowance was
+briefly tightened to 12 deg on that theory; running all three configurations settles it:
+
+| config | Birtu quads | CC_20 quads | Basamu quads | concave / reflex / flat / straight / orientation-bad XZ quads |
+|---|---|---|---|---|
+| A: fold 25, plane test only (V3.41) | 659 | 1954 | 3196 | 5 reflex on Birtu, 11 CC_20, 35 Basamu |
+| B: fold 25 **+ XZ test** | **603** | **1857** | **2955** | **0 / 0 / 0 / 0 / 0** |
+| C: fold 12 + XZ test | 476 | 1270 | 1741 | 0 / 0 / 0 / 0 / 0 |
+
+So the XZ test takes **every** metric to zero on its own (config B, which is what ships), and the fold
+tightening moves no count at all while costing **127 / 587 / 1214 merges** - 32% of CC_20's and 41% of
+Basamu's remaining merges on the two big maps, i.e. a straight routing-cost regression bought with nothing.
+The cap therefore stays at **25 deg**, where it does its actual job (keeping a step rim or two stacked levels
+out of one polygon) and the XZ test carries the safety. The history of the editor dialog is **100+ faces ->
+5 -> 0 by construction**; only the user's re-import can confirm the 0.
+
+The plane test is a probe of all four corners in the quad's own projected plane (the same Newell-normal
 + orthonormal-basis projection the stage already used for the angle/perimeter ranking, so there is one
 definition of the quad's plane). In that plane the walk is convex exactly when all four successive cross
 products share the sign of the polygon's own signed area; one of the opposite sign is the reflex corner, and
@@ -761,6 +797,28 @@ on Birtu and 9 on CC_20 (0.15% / 0.46%) - while with it disabled the worst emitt
 `180.0000` deg, i.e. the degenerate corners it exists to catch do occur on real maps. The same test also
 subsumes the old bowtie rejection, because a self-intersecting walk always has mixed turn signs.
 
+The **XZ test** repeats the same probe on the ground projection, and it is the one the engine actually
+applies. Three conditions: (h1) the XZ projection is non-degenerate (`|area2| > 1e-9`), which also refuses a
+vertical quad; (h2) the XZ walk's shoelace sign agrees with the XZ signed area of **both** triangles it
+replaces, so a merge can never flip a face's winding in the engine's frame (CC_20 had one such quad); and
+(h3) all four XZ interior angles are strictly below `QuadXzMaxInteriorAngleDegrees`. Every XZ corner test is
+strict (`cr * area2 > 0`), so a numerically straight corner is refused too - and one of the five measured
+engine complaints is *exactly* straight in XZ (`180.0000` deg), so that case is real, not hypothetical.
+
+**Why the XZ margin is 5 deg (`175 deg`) and not the plane test's 0.1 deg.** The plane epsilon is sized
+against the noise in our own arithmetic, which we can measure. The engine's epsilon is a black box, so the
+margin has to be sized against everything that could plausibly make the engine disagree with us, and one of
+the five measured complaints is reflex by `0.0005` deg - i.e. a corner one float rounding away from being
+flat, which the engine's own arithmetic could easily put on the other side of the line. Coordinates are
+floats at map scale (up to ~2.1 km on CC_20), so one coordinate carries ~2.4e-4 m of rounding; an interior
+angle measured over the shortest edge the merge accepts (0.25 m) therefore has ~2*2.4e-4/0.25 = 2e-3 rad =
+**0.11 deg of pure noise**. 5 deg is ~45x that worst case, and it is also the level at which such a corner
+sits no more than `0.044*L` off the segment between its neighbours - below the cleanup's own 0.05 m tolerance
+for a 1 m quad side, so a corner rejected by the margin is a vertex the mesh never promised to keep anyway.
+The `cleanup:` log line reports the figure directly (`quadsXZworst=<deg>deg (margin 175deg,
+nearStraight=<n>)`), so the headroom is visible on every run: measured worst emitted XZ angle is **174.98 /
+174.92 / 174.96 deg** on Birtu / CC_20 / Basamu, i.e. sitting just under the ceiling by construction.
+
 Because the shared edge had exactly two incident faces in the manifold input, deleting it keeps the emitted
 mesh manifold. Face indices are stable at this point (`MergeQuads` runs after the flip polish and nothing
 compacts `tris` afterwards), so the recorded pair list indexes the final mesh directly. The merge stage is
@@ -768,9 +826,19 @@ the **only** producer of 4-vertex faces in the codebase: `quadPairs` originates 
 the v1 writer path (`WriteFlat`/`BuildEdges`) always emits 3. The toggle `NavMeshVoxelQuadMerge` (default on)
 turns the whole stage off instantly - the emitted bin then goes back to triangles only - as an A/B.
 
-Measured quads emitted (convex-only): **Birtu 659, CC_20 1954, Basamu 3202, all with 0 concave quads** -
-down from 808 / 2379 / 4116 before the convexity guard, of which 170 / 523 / 1070 were concave. Every
-other metric is unchanged, since the triangle mesh is untouched (see below).
+Harness `Test 27` owns the assertions: a hand-made concave quad is still refused, a convex patch still
+merges, a **real Birtu XZ-reflex patch** captured verbatim from the mesh (the first row of the table above:
+plane worst `179.9` deg, fold `7.3` deg, XZ worst `184.76` deg) must be refused - and it can only be
+refused by the XZ test, since the fold cap (25 deg) and the plane ceiling both pass it - and in the
+real-pipeline case every emitted quad must be XZ-convex within the margin, orientation-matched, with 0
+concave and 0 straight corners. The `--xzprobe` harness mode reproduces the table above on demand.
+
+Measured quads emitted (convex in **both** frames, fold <= 25 deg): **Birtu 603, CC_20 1857, Basamu 2955**,
+all with **0 concave, 0 reflex, 0 flat, 0 straight and 0 orientation-bad XZ quads** - down from 659 / 1954 /
+3196 with V3.41's plane-only guard, of which 5 / 11 / 35 were XZ-reflex. The whole cost is the XZ test:
+56 / 97 / 241 quads. Every other metric is unchanged, since the triangle mesh is untouched (see below) -
+needles, thin faces and long-thin counts are bit-identical on Birtu
+and CC_20.
 
 Refinement's own guarantee is **topological, not just geometric**. Each sweep builds an exact edge -> faces
 index (key = the `(a,b)` edge; value = the two face indices packed into one long, face0 in the low 32 bits,
@@ -795,24 +863,26 @@ lookup went 5 -> 153 on Birtu while the vertex-based component count stayed 5.
    height the mesh had at that spot before the slide. Smooth slopes are unaffected (there the original surface
    at the new spot is the same height); a fan that spans a step is refused.
 
-Measured (V3.40 + convex-only quads; needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg,
+Measured (V3.40 + convex-in-both-frames quads; needles = alt < 0.05 m and longest edge > 0.5 m; thin = min angle < 5 deg,
 i.e. the user's "width < length/10" ratio class; long-thin = aspect `longest^2/(2*area)` > 8 with
 `longest >= 4 m`, the refine criterion; islands are **edge**-islands, the T-junction witness; faces include
 what the passes removed and the growth the flip polish re-adds). "before" is the cleanup-off build, "after"
 the shipped one:
 
-| map | faces | thin (<5 deg) | needles | long-thin (aspect>8) | mean quality | quads (concave) | worst quad angle | islands | inv | build |
+| map | faces | thin (<5 deg) | needles | long-thin (aspect>8) | mean quality | quads (concave) | worst quad angle (plane / XZ) | islands | inv | build |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Birtu | 50700 -> 44645 (-12%) | 1981 -> **356 (-82%)** | 104 -> 8 | 3648 -> **760 (-79%)** | 0.649 -> **0.722** | 659 (**0**) | 179.85 deg | 5 -> 5 | PASS | 5.0 s |
-| CC_20 (caves) | 266526 -> 241641 (-9%) | 5984 -> **1037 (-83%)** | 187 -> 38 | 15239 -> **1894 (-88%)** | 0.679 -> **0.741** | 1954 (**0**) | 179.85 deg | 15 -> 15 | PASS | 29.0 s |
-| Basamu | 540232 -> 492616 (-9%) | 11608 -> **1499 (-87%)** | 596 -> 61 | 21878 -> **2979 (-86%)** | 0.693 -> **0.746** | 3202 (**0**) | 179.90 deg | 1 -> 1 | PASS | 33.6 s |
+| Birtu | 50700 -> 44645 (-12%) | 1981 -> **356 (-82%)** | 104 -> 8 | 3648 -> **760 (-79%)** | 0.649 -> **0.722** | 603 (**0**) | 175.27 / 174.98 deg | 5 -> 5 | PASS | 4.7 s |
+| CC_20 (caves) | 266526 -> 241641 (-9%) | 5984 -> **1037 (-83%)** | 187 -> 38 | 15239 -> **1894 (-88%)** | 0.679 -> **0.741** | 1857 (**0**) | 178.38 / 174.92 deg | 15 -> 15 | PASS | 24.9 s |
+| Basamu | 540232 -> 492616 (-9%) | 11608 -> **1499 (-87%)** | 596 -> 61 | 21878 -> **2979 (-86%)** | 0.693 -> **0.746** | 2955 (**0**) | 178.78 / 174.96 deg | 1 -> 1 | PASS | 32.0 s |
 
-Re-measured after the convexity guard, so the comparison is like-for-like on this machine. Note that the
-cleanup's decimate/slide/flip passes are **wall-clock budgeted** (their deadlines are shifted by how long the
-insert pass actually took), so the last digits of the triangle metrics drift a fraction of a percent between
-runs - Basamu was observed at 1497/1501 thin and 2969/2977/2979/2987 long-thin across repeats of the *same*
-binary. Birtu and CC_20 reproduce exactly; the quad column does too (it is pure bookkeeping over a fixed
-mesh), and `worst quad angle` shows the 179.9 deg ceiling is genuinely the binding limit, not slack.
+Re-measured after the two-frame convexity guard, so the comparison is like-for-like on this machine. Note
+that the cleanup's decimate/slide/flip passes are **wall-clock budgeted** (their deadlines are shifted by
+how long the insert pass actually took), so the last digits of the triangle metrics drift a fraction of a
+percent between runs - Basamu was observed at 1497/1498/1501 thin, 2942/2955/2962 quads and long-thin at
+2954-2982 across repeats of the *same* binary (its triangle mesh moves, so its quad count moves with it).
+Birtu and CC_20 reproduce exactly, and both quad columns track that fixed mesh. The two
+worst-angle columns show each guard is genuinely the binding limit, not slack: the plane worst angle sits
+just under the `179.9` plane ceiling and the XZ worst angle sits just under the `175` deg XZ ceiling.
 
 The V3.38 reference for the removed classes was Birtu 363/9, CC_20 1031/39, Basamu 1500/61 (harness convention);
 the insert pass keeps those within ~1% while cutting the long-thin population by 79-88%. The refine sweep over

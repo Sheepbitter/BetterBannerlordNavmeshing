@@ -149,7 +149,8 @@ namespace BetterBannerlordNavmeshing
         // The flag is computed honestly here and is NOT a licence to emit concave quads: the engine's
         // navmesh validator refuses a concave face outright (the editor raises "Concave Navigation Mesh
         // Face Detected" and refuses the map), so NavMeshCleanup.MergeQuads - the only producer of
-        // quadPairs - only ever records strictly convex pairs. The flag therefore comes out 0 for every
+        // quadPairs - only ever records pairs that are strictly convex BOTH in the quad's own plane
+        // AND in the engine's ground (XZ) projection. The flag therefore comes out 0 for every
         // emitted quad; this stays a real per-face computation so the writer remains correct for any
         // caller that hands it a concave pair.
         public static byte[] WriteInterleaved(float[] xyz, int vertexCount,

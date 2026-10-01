@@ -869,7 +869,11 @@ namespace BetterBannerlordNavmeshing
                     quadPairs = cln.QuadPairs.ToArray();
                 Log(log, "cleanup: welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
                     + cln.Decimated + " relaxed=" + cln.Relaxed + " refined=" + cln.Refined
-                    + " flipped=" + cln.Flipped + " quads=" + cln.Quads + " needles before=" + cln.NeedlesBefore
+                    + " flipped=" + cln.Flipped + " quads=" + cln.Quads
+                    + " quadsXZworst=" + F((float)cln.QuadXzWorstAngle) + "deg (margin "
+                    + NavMeshCleanup.QuadXzMaxInteriorAngleDegrees + "deg, nearStraight="
+                    + cln.QuadXzNearStraight + ")"
+                    + " needles before=" + cln.NeedlesBefore
                     + " after=" + cln.NeedlesAfter + " thin before=" + cln.ThinBefore + " after="
                     + cln.ThinAfter + " boundaryMoved=" + cln.BoundaryMovedCount + " boundaryMaxMove="
                     + F(cln.BoundaryMaxMove) + "m components " + cln.ComponentsBefore + "->"
