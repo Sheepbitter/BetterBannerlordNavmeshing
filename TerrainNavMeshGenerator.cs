@@ -1350,10 +1350,21 @@ namespace BetterBannerlordNavmeshing
         }
 
         // Picks the module folder that receives the navmesh prefab. Order:
-        // an explicit override, then the module whose SceneObj owns the scene,
-        // then the scene's own (verified) module path, then the module that
-        // contains this script's assembly. Anything unverifiable is rejected
-        // and logged rather than guessed at.
+        //   1. an explicit override (NavMeshExportFolder) - always wins;
+        //   2. the module the ENGINE says the scene came from,
+        //      Scene.GetModulePath() (IScene.GetModulePath RID 1217,
+        //      [EngineMethod("get_module_path", ...)]), accepted only when it
+        //      really is a module (it has a SubModule.xml);
+        //   3. a RANKED search of the modules whose SceneObj holds the scene -
+        //      the engine resolves a scene by NAME, so several module folders can
+        //      match (Modules\DedicatedCustomServerHelper and Modules\MyMaps both
+        //      hold SceneObj\CC_20_siege) and the first in folder order is the
+        //      wrong one whenever the alphabetically earlier folder is not the
+        //      scene's home. The winner is the module this session loaded; the
+        //      ranking and every match are logged by
+        //      NavMeshPrefabIndex.DescribeSceneModuleMatches;
+        //   4. the module that contains this script's assembly.
+        // Anything unverifiable is rejected and logged rather than guessed at.
         public static string ResolveFolder(Scene scene, string folderOverride, System.Action<string> log)
         {
             if (!string.IsNullOrEmpty(folderOverride))
@@ -1363,7 +1374,6 @@ namespace BetterBannerlordNavmeshing
                 return folderOverride;
             }
 
-            // Most reliable: find the module whose SceneObj contains the scene.
             string sceneName = null;
             try
             {
@@ -1374,59 +1384,91 @@ namespace BetterBannerlordNavmeshing
                 sceneName = null;
             }
 
+            // (2) The engine's own answer. get_module_path returns
+            // rglScene::module_path_ - the module directory the scene's data was
+            // loaded from, and the same field load_nav_mesh_prefab asserts is
+            // non-empty. A brand-new scene has none, and a path that is not a
+            // module root must never be chosen, so both are rejected here.
+            string engineModulePath = null;
             if (!string.IsNullOrEmpty(sceneName))
             {
-                foreach (string gameRoot in GetGameRootCandidates())
+                try
                 {
-                    try
-                    {
-                        string modulesDir = System.IO.Path.Combine(gameRoot, "Modules");
-                        if (!Directory.Exists(modulesDir))
-                            continue;
+                    engineModulePath = scene.GetModulePath();
+                }
+                catch (Exception ex)
+                {
+                    engineModulePath = null;
+                    if (log != null)
+                        log("folder: Scene.GetModulePath() failed: " + ex.Message);
+                }
 
-                        foreach (string moduleDir in Directory.GetDirectories(modulesDir))
-                        {
-                            if (Directory.Exists(System.IO.Path.Combine(moduleDir, "SceneObj", sceneName)))
-                            {
-                                if (log != null)
-                                    log("folder: module containing the scene: " + moduleDir);
-                                return System.IO.Path.Combine(moduleDir, "NavMeshPrefabs");
-                            }
-                        }
-                    }
-                    catch (Exception)
+                if (!string.IsNullOrEmpty(engineModulePath)
+                    && File.Exists(System.IO.Path.Combine(engineModulePath, "SubModule.xml")))
+                {
+                    if (log != null)
                     {
-                        // Skip an unreadable candidate root and try the next one.
+                        log("folder: scene '" + sceneName + "' - module from Scene.GetModulePath(): "
+                            + engineModulePath);
+                        log("folder:   (the engine's own answer: native get_module_path returns"
+                            + " rglScene::module_path_, the module directory the scene was loaded from;"
+                            + " it has a SubModule.xml, so it really is a module)");
                     }
+
+                    return System.IO.Path.Combine(engineModulePath, "NavMeshPrefabs");
+                }
+
+                if (log != null)
+                {
+                    log(string.IsNullOrEmpty(engineModulePath)
+                        ? "folder: Scene.GetModulePath() returned nothing (a scene that was never loaded"
+                          + " from a module has none); falling back to the SceneObj search"
+                        : "folder: rejected Scene.GetModulePath() result (not a module): " + engineModulePath);
+                }
+            }
+
+            // (3) The SceneObj search, ranked instead of first-match. This is the
+            //     step that used to be wrong: the engine composes the relative tail
+            //     "SceneObj/<scene>", so EVERY module folder holding that folder
+            //     matches, and the first in Directory.GetDirectories order (NTFS
+            //     order, i.e. alphabetical) won - which for CC_20_siege was
+            //     DedicatedCustomServerHelper, a folder with no SubModule.xml.
+            if (!string.IsNullOrEmpty(sceneName))
+            {
+                System.Action<string> warn = null;
+                if (log != null)
+                {
+                    // QueryActiveModules prefixes its diagnostics "prefab index: "
+                    // because that is where it usually runs; here the folder is
+                    // being resolved, so the same lines are re-labelled rather
+                    // than duplicated.
+                    warn = delegate(string line) { log("folder: " + WithoutIndexPrefix(line)); };
+                }
+
+                NavMeshPrefabIndex.ActiveModules active = NavMeshPrefabIndex.QueryActiveModules(warn);
+                List<NavMeshPrefabIndex.SceneModuleMatch> matches =
+                    NavMeshPrefabIndex.FindSceneModuleMatches(sceneName, active, GetGameRootCandidates());
+
+                string rule;
+                int tied;
+                NavMeshPrefabIndex.SceneModuleMatch chosen =
+                    NavMeshPrefabIndex.ChooseSceneModule(matches, out rule, out tied);
+
+                NavMeshPrefabIndex.DescribeSceneModuleMatches(log, sceneName, matches, chosen,
+                    rule, tied, engineModulePath);
+
+                if (chosen != null)
+                {
+                    if (log != null)
+                        log("folder: module containing the scene: " + chosen.ModuleDir);
+                    return chosen.Folder;
                 }
 
                 if (log != null)
                     log("folder: scene '" + sceneName + "' not found under any module's SceneObj");
             }
 
-            // Then the scene's own module path -- accepted only if it really is
-            // a module (i.e. it has a SubModule.xml).
-            try
-            {
-                string modulePath = scene.GetModulePath();
-                if (!string.IsNullOrEmpty(modulePath) &&
-                    File.Exists(System.IO.Path.Combine(modulePath, "SubModule.xml")))
-                {
-                    if (log != null)
-                        log("folder: Scene.GetModulePath()");
-                    return System.IO.Path.Combine(modulePath, "NavMeshPrefabs");
-                }
-
-                if (log != null)
-                    log("folder: rejected Scene.GetModulePath() result (not a module): " + modulePath);
-            }
-            catch (Exception ex)
-            {
-                if (log != null)
-                    log("folder: Scene.GetModulePath() failed: " + ex.Message);
-            }
-
-            // Last resort: the module that contains this script's assembly.
+            // (4) Last resort: the module that contains this script's assembly.
             try
             {
                 string assemblyLocation = typeof(TerrainNavMeshGenerator).Assembly.Location;
@@ -1454,6 +1496,16 @@ namespace BetterBannerlordNavmeshing
 
             throw new InvalidOperationException(
                 "Could not resolve the module NavMeshPrefabs folder. Set NavMeshExportFolder manually.");
+        }
+
+        private const string IndexLogPrefix = "prefab index: ";
+
+        private static string WithoutIndexPrefix(string line)
+        {
+            if (line != null && line.StartsWith(IndexLogPrefix, StringComparison.Ordinal))
+                return line.Substring(IndexLogPrefix.Length);
+
+            return line;
         }
 
         // Distinct likely game-root folders, from two independent sources so a

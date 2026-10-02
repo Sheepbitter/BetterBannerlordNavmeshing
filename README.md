@@ -18,7 +18,7 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
-| `NavMeshPrefabIndex.cs` | **Managed mirror of the engine's navmesh-prefab index** (see `NavMeshPrefabIndex.md` for the full disassembly record). Decides whether `Scene.ImportNavigationMeshPrefab` is worth calling at all, and says exactly why not. Rule: a name resolves **only** if a **loaded** module (`Utilities.GetModulesNames()` - the `_MODULES_*A*B*_MODULES_` list, matched by each module's `SubModule.xml` `<Id>`, *not* by folder name) already had `Modules\<M>\NavMeshPrefabs\<name>.bin` when the engine built its index at start-up. Anything else is skipped, which is what keeps the engine's own `No navigation mesh prefab was found with name "<name>"!` out of the log. When the scene's own module is **not** loaded, the same bin is additionally written to this module's `NavMeshPrefabs` (loaded by definition, folder created by `build.ps1`) so the name works from the **next** editor start. |
+| `NavMeshPrefabIndex.cs` | **Managed mirror of the engine's navmesh-prefab index** (see `NavMeshPrefabIndex.md` for the full disassembly record). Decides whether `Scene.ImportNavigationMeshPrefab` is worth calling at all, and says exactly why not. Rule: a name resolves **only** if a **loaded** module (`Utilities.GetModulesNames()` - the `_MODULES_*A*B*_MODULES_` list, matched by each module's `SubModule.xml` `<Id>`, *not* by folder name) already had `Modules\<M>\NavMeshPrefabs\<name>.bin` when the engine built its index at start-up. Anything else is skipped, which is what keeps the engine's own `No navigation mesh prefab was found with name "<name>"!` out of the log. When the scene's own module is **not** loaded, the same bin is additionally written to this module's `NavMeshPrefabs` (loaded by definition, folder created by `build.ps1`) so the name works from the **next** editor start. Also owns the **scene -> module** resolution (`SceneModuleMatch` / `FindSceneModuleMatches` / `ChooseSceneModule`), because a scene name does not say which module it is in and two module folders can hold `SceneObj\<the same name>`. |
 | `NavMeshLog.cs` | Per-session **log file** (+ console mirror). In-editor console output is invisible; this is the real trace. See Logs. |
 
 ## Build & install
@@ -169,6 +169,8 @@ NavMesh: importing prefab '<scene>_navmesh' (shift 0)...
 NavMesh: import call returned.
 NavMesh: faces after import: N
 NavMesh: <F> faces, <V> vertices, <E> edges (culled: <S> slope, <H> height)
+```
+
 NavMesh: bin written: ...\<scene>_navmesh.bin
 NavMesh: faces imported into scene as '<scene>_navmesh' (static).
 NavMesh: import check: existing=<before> afterImport=<after> clearExisting=<bool> increased=<bool>
@@ -176,6 +178,68 @@ NavMesh: import warning: no faces appeared. Either this prefab name was not in t
 NavMesh: timings: buildMs=<n> writeMs=<n> objMs=<n|0> clearMs=<n> importMs=<n> facesAfterMs=<n>
 NavMesh: done: totalMs=<n> bin=<n> bytes V=<v> E=<e> F=<f>
 ```
+
+### Which module gets the write (`folder:` block)
+
+A scene name does **not** say which module it belongs to - the engine composes the
+relative tail `SceneObj/<scene>` and finds the owner itself - so more than one
+module folder can hold `SceneObj\<the same name>`. On this install two do:
+
+| folder | contents | dated |
+|---|---|---|
+| `Modules\MyMaps\SceneObj\CC_20_siege` | the scene that was open and saved (`flowmap.dds`, no `navmesh.bin`) | 2026-10-01 22:15 |
+| `Modules\DedicatedCustomServerHelper\SceneObj\CC_20_siege` | a stale shipped copy, **with** a baked `navmesh.bin` | 2023-10 |
+
+`Modules\MyMaps\SceneEditData\CC_20_siege\terrain_ed.bin` exists too, and the
+engine derives that path as `<module_path_>SceneEditData/<scene>`, so the open
+scene's `module_path_` was `...\Modules\MyMaps\`. Taking the first match in
+`Directory.GetDirectories` order picked the other one, because NTFS lists entries
+alphabetically and `DedicatedCustomServerHelper` sorts before `MyMaps` - which is
+why the previous run left a 21 MB `CC_20_siege_navmesh.bin` in
+`Modules\DedicatedCustomServerHelper\NavMeshPrefabs` (a folder whose parent is
+not a module at all) and none in `Modules\MyMaps\NavMeshPrefabs`.
+
+`ResolveFolder` therefore resolves in this order, and `NavMeshExportFolder` still
+wins over all of it:
+
+1. **`NavMeshExportFolder`** - an explicit override, used verbatim.
+2. **`Scene.GetModulePath()`** - the engine's own answer (`IScene.GetModulePath`
+   RID 1217, `[EngineMethod("get_module_path", ...)]`, returning
+   `rglScene::module_path_`: the module directory the scene was loaded from).
+   Accepted only when that directory really has a `SubModule.xml`.
+3. **A ranked `SceneObj` search.** Every module folder holding
+   `SceneObj\<scene>` is listed and ranked; the highest rank wins:
+
+   | rank | match |
+   |---|---|
+   | 3 | a module this session **loaded** - the only kind of folder whose bins the engine's index can hold |
+   | 2 | loaded but not a module (unreachable while the loaded set is known) |
+   | 1 | a real module this session does **not** load - still where a correct install reads it |
+   | 0 | not a module at all - nothing written here can ever be indexed |
+
+   Ties keep the first in listing order **and say `AMBIGUOUS`** instead of
+   pretending the choice was evidence-based.
+4. The module containing this script's own assembly (last resort).
+
+Every match, its rank, the rule and a cross-check against what
+`Scene.GetModulePath()` said are printed, so the decision is never invisible:
+
+```
+NavMesh: folder: scene 'CC_20_siege' - module from Scene.GetModulePath(): D:\...\Modules\MyMaps
+NavMesh: folder:   (the engine's own answer: native get_module_path returns rglScene::module_path_, the module directory the scene was loaded from; it has a SubModule.xml, so it really is a module)
+```
+
+```
+NavMesh: folder: rejected Scene.GetModulePath() result (not a module): D:\...\Modules\DedicatedCustomServerHelper
+NavMesh: folder: scene 'CC_20_siege' is in 2 module folder(s). The engine resolves a scene by name, not by module, so every one of them matches; they are ranked, not taken in folder order:
+NavMesh: folder:   ignored D:\...\Modules\DedicatedCustomServerHelper module=DedicatedCustomServerHelper moduleId='' NOT-A-MODULE (no SubModule.xml) loaded=False rank=0 (not a module: a prefab written here can never be indexed)
+NavMesh: folder:   CHOSEN  D:\...\Modules\MyMaps module=MyMaps moduleId='My Maps' loaded=True rank=3 (a module this session loaded)  <- this run's write folder
+NavMesh: folder:   rule: prefer the module folder the engine loaded in this session - it is the only kind of folder whose NavMeshPrefabs bins the engine's index can hold; winner module 'MyMaps'
+NavMesh: folder:   cross-check: Scene.GetModulePath() said 'D:\...\Modules\DedicatedCustomServerHelper', which was REJECTED above (it is not a module folder), so the ranking decided instead.
+NavMesh: folder: module containing the scene: D:\...\Modules\MyMaps
+```
+
+Evidence and the native record: `NavMeshPrefabIndex.md` §3.6 and §5.7.
 
 The `prefab index:` block is the mirror of the engine's own index (see
 `NavMeshPrefabIndex.md`). Read it before anything else when an import misbehaves:
@@ -303,7 +367,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
 | `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the whole emitted mesh (terrain **and** structures), so it does not intersect either. 0 = as flush as the voxel lattice allows. |
 | `NavMeshPrefabName` | `""` | Defaults to `<scene name>_navmesh`. |
-| `NavMeshExportFolder` | `""` | Override for the output folder. It must be the `NavMeshPrefabs` of a **loaded** module (has a `SubModule.xml` **and** is enabled in the launcher) for the in-editor import to find it; the `prefab index:` block reports `loaded=` per module. When the resolved folder's module is not loaded, the bin is additionally copied into this module's `NavMeshPrefabs` (see *Freshly written prefab workflow*). |
+| `NavMeshExportFolder` | `""` | Override for the output folder, and the highest-priority rule in the folder resolution (see *Which module gets the write*). Use it to pin the module when the ranked `SceneObj` search reports `AMBIGUOUS`. It must be the `NavMeshPrefabs` of a **loaded** module (has a `SubModule.xml` **and** is enabled in the launcher) for the in-editor import to find it; the `prefab index:` block reports `loaded=` per module. When the resolved folder's module is not loaded, the bin is additionally copied into this module's `NavMeshPrefabs` (see *Freshly written prefab workflow*). |
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
@@ -1283,8 +1347,8 @@ rasterizer merges the pad, the opening and the lintel into a **single solid span
 landing span to keep. That is below the resolution the voxel core can represent, not a merge bug.
 
 **The dump folder.** `DumpSnapshotFromEditor` wrote the three snapshot files without creating the target
-folder; a scene in another module (e.g. `CC_20_siege` in `DedicatedCustomServerHelper`, which has `SceneObj`
-but no `NavMeshPrefabs`) failed with `DirectoryNotFoundException`. The dump now calls
+folder; a scene in another module (e.g. `CC_20_siege` in `MyMaps`, which has `SceneObj` but no
+`NavMeshPrefabs`) failed with `DirectoryNotFoundException`. The dump now calls
 `Directory.CreateDirectory(folder)` (the export path already did). Behaviour is unchanged when the folder
 exists.
 
@@ -1467,6 +1531,11 @@ effective walkable slope falls short of `NavMeshMaxSlopeDegrees`.
   `Modules\BetterBannerlordNavmeshing\NavMeshPrefabs` (it logs `fallback bin written: ...`); **restart the
   editor once**, then **Import Only**. To make the *game* and the dedicated server pick the prefab up as well,
   enable the scene's module in the launcher - the canonical bin is and stays in the scene's own module.
+- **`folder: ... AMBIGUOUS: N folder(s) share the winning rank`** (or a `folder:   ignored ...` line for a
+  module you expected): more than one module folder holds `SceneObj\<this scene>`, so the scene name alone
+  cannot pick one. See *Which module gets the write* above. The tool logs **every** match with its rank and
+  states the rule; if the loser is the one you want, set `NavMeshExportFolder` to that module's
+  `NavMeshPrefabs` - it overrides all of this.
 - `fallback=True` in `grid ready`: the bulk per-node read failed validation (look for `bulk read failed:` /
   `NEITHER order matches` above it). The point-sampled grid is still correct, just slower.
 - **No log file**: check `NavMeshWriteLogFile` is `true`; the `log file:` path is printed at the top of the run

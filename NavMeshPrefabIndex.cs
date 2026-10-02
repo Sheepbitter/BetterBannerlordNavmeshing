@@ -84,6 +84,9 @@ namespace BetterBannerlordNavmeshing
     //      a key, in any session, until that module is enabled. This class then
     //      also writes the same bin into a loaded module (ours), so the name
     //      becomes resolvable from the NEXT editor start - see FallbackFolder.
+    //   d) The bin went to the WRONG module, because the scene's name does not
+    //      say which module it is in and more than one module folder can hold
+    //      SceneObj\<that name>. See "Step 0" below and ResolveFolder.
     //
     // One more native quirk worth guarding: load_nav_mesh_prefab copies the name
     // into a fixed 0x80-byte buffer (rva 0x97988A-0x979892) and trips
@@ -409,6 +412,297 @@ namespace BetterBannerlordNavmeshing
                 keep = 1;
 
             return full.Substring(0, keep) + digest;
+        }
+
+        // ==================================================================
+        // Step 0: which module folder does this scene actually live in?
+        // ==================================================================
+        // The engine resolves a scene by NAME, not by module: the loader
+        // composes the relative tail "SceneObj/<scene>" and lets the module
+        // manager find it (FUN_7ff8d00ab1f0, and FUN_7ff8d00ab450 which stores
+        // both that tail and "<module_path_>SceneEditData/<scene>"). Two module
+        // folders can therefore hold SceneObj\<the same name> - and on this
+        // install they do: Modules\DedicatedCustomServerHelper\SceneObj\
+        // CC_20_siege AND Modules\MyMaps\SceneObj\CC_20_siege. "First match in
+        // Directory.GetDirectories order" is then decided by NTFS ordering, i.e.
+        // alphabetically, which is how the export folder used to end up in the
+        // wrong one: DedicatedCustomServerHelper has no SubModule.xml, so it is
+        // not a module at all and nothing written there can ever be indexed
+        // (see 3.5).
+        //
+        // The engine's own answer exists and is used first (see
+        // TerrainNavMeshGenerator.ResolveFolder): Scene.GetModulePath(), i.e.
+        // IScene.GetModulePath RID 1217, [EngineMethod("get_module_path", ...)],
+        // which returns rglScene::module_path_ - the module directory the scene
+        // was loaded from, and the very field load_nav_mesh_prefab asserts
+        // non-empty and composes <module_path_>NavMeshPrefabs against. It is
+        // filled by the scene-load path (FUN_7ff8d015d3e0, which then goes on to
+        // produce "<module_path_>SceneEditData/<scene>", observed on disk as
+        // Modules/MapConverter/SceneEditData/scn_village_Boras/terrain_ed.bin).
+        //
+        // When it is unavailable, empty, or points at something that is not a
+        // module, the SceneObj search below still runs - but on a rank instead
+        // of on folder order, and every match is logged.
+        public sealed class SceneModuleMatch
+        {
+            public string ModuleDir;
+            public string ModuleId;           // the folder leaf
+            public string ModuleSubModuleId;  // <Id value="..."/>, null when there is no SubModule.xml
+            public bool IsModule;             // has a SubModule.xml, i.e. the engine can load it
+            public bool Active;
+            public bool ActiveKnown;
+
+            public string Folder { get { return Path.Combine(ModuleDir, FolderName); } }
+
+            //   3 = a module the engine loaded in this session. Nothing can beat
+            //       it: this is the only kind of folder whose bins the engine's
+            //       index can hold, so this is where a prefab has to go to be
+            //       importable here.
+            //   2 = loaded but not a module. Unreachable while the loaded set is
+            //       known (the engine cannot load a folder with no
+            //       SubModule.xml); kept so an unexpected set cannot be ignored.
+            //   1 = a real module this session does not load. Still the right
+            //       place for a correct install, just not resolvable right now.
+            //   0 = not a module, and not loaded: a prefab written here can never
+            //       be indexed, in this session or any later one.
+            public int Rank
+            {
+                get { return (ActiveKnown && Active ? 2 : 0) + (IsModule ? 1 : 0); }
+            }
+
+            public string ActiveText
+            {
+                get { return ActiveKnown ? (Active ? "True" : "False") : "unknown"; }
+            }
+        }
+
+        // Every Modules\<Module> that holds SceneObj\<sceneName>, with everything
+        // the ranking needs. One directory listing per game root and one small
+        // SubModule.xml read per matching module; no engine call. The game roots
+        // are passed in so the offline tests can point this at a fixture.
+        public static List<SceneModuleMatch> FindSceneModuleMatches(string sceneName,
+            ActiveModules active, IList<string> gameRoots)
+        {
+            var results = new List<SceneModuleMatch>();
+            if (string.IsNullOrEmpty(sceneName) || gameRoots == null)
+                return results;
+
+            var seen = new List<string>();
+            for (int r = 0; r < gameRoots.Count; r++)
+            {
+                try
+                {
+                    string modulesDir = Path.Combine(gameRoots[r], "Modules");
+                    if (!Directory.Exists(modulesDir))
+                        continue;
+
+                    string[] moduleDirs = Directory.GetDirectories(modulesDir);
+                    for (int i = 0; i < moduleDirs.Length; i++)
+                    {
+                        string moduleDir = moduleDirs[i];
+                        string key = NormalizePath(moduleDir);
+                        if (ContainsIgnoreCase(seen, key))
+                            continue;
+
+                        bool holds;
+                        try
+                        {
+                            holds = Directory.Exists(Path.Combine(moduleDir, "SceneObj", sceneName));
+                        }
+                        catch (Exception)
+                        {
+                            holds = false;
+                        }
+
+                        if (!holds)
+                            continue;
+
+                        // Only a folder that actually holds the scene is recorded,
+                        // so a module that appears in two game roots without the
+                        // scene in the first one is still found in the second.
+                        seen.Add(key);
+
+                        var match = new SceneModuleMatch();
+                        match.ModuleDir = moduleDir;
+                        match.ModuleId = Path.GetFileName(key);
+                        match.ModuleSubModuleId = ReadModuleIdFromSubModuleXml(moduleDir);
+                        match.IsModule = !string.IsNullOrEmpty(match.ModuleSubModuleId);
+                        ApplyActive(match, active);
+                        results.Add(match);
+                    }
+                }
+                catch (Exception)
+                {
+                    // An unreadable game root is skipped, exactly as in
+                    // FindCandidates: the next root may still have the scene.
+                }
+            }
+
+            return results;
+        }
+
+        private static void ApplyActive(SceneModuleMatch match, ActiveModules active)
+        {
+            if (active == null || !active.Known)
+            {
+                match.ActiveKnown = false;
+                match.Active = false;
+                return;
+            }
+
+            match.ActiveKnown = true;
+            match.Active = active.ContainsId(match.ModuleSubModuleId)  // the real module id
+                || active.ContainsId(match.ModuleId)                   // the folder leaf, as a fallback
+                || active.ContainsFolder(match.ModuleDir);
+        }
+
+        // The ranking, and why the winner won. Pure - the same list always gives
+        // the same answer - so it is what the offline tests drive. rule is a
+        // short token (see DescribeSceneModuleRule) and tied is the number of
+        // folders that share the winning rank.
+        public static SceneModuleMatch ChooseSceneModule(List<SceneModuleMatch> matches,
+            out string rule, out int tied)
+        {
+            rule = null;
+            tied = 0;
+            if (matches == null || matches.Count == 0)
+                return null;
+
+            SceneModuleMatch best = null;
+            int bestRank = -1;
+            for (int i = 0; i < matches.Count; i++)
+            {
+                SceneModuleMatch m = matches[i];
+                if (m == null)
+                    continue;
+
+                int rank = m.Rank;
+                if (rank > bestRank)
+                {
+                    bestRank = rank;
+                    best = m;
+                    tied = 1;
+                }
+                else if (rank == bestRank)
+                {
+                    tied++;
+                    if (best == null)
+                        best = m;
+                }
+            }
+
+            if (best == null)
+                return null;
+
+            if (bestRank >= 3)
+                rule = "loaded-module";
+            else if (bestRank == 2)
+                rule = "loaded-not-a-module";
+            else if (bestRank == 1)
+                rule = "module-not-loaded";
+            else
+                rule = "not-a-module";
+
+            return best;
+        }
+
+        // Prose for ChooseSceneModule's rule token, so the log states the rule
+        // rather than just its name.
+        public static string DescribeSceneModuleRule(string rule)
+        {
+            if (rule == null)
+                return "no rule applied (nothing matched)";
+
+            if (rule == "loaded-module")
+            {
+                return "prefer the module folder the engine loaded in this session - it is the only"
+                    + " kind of folder whose " + FolderName + " bins the engine's index can hold";
+            }
+
+            if (rule == "loaded-not-a-module")
+            {
+                return "prefer a loaded folder over a module that is not loaded (only reachable when"
+                    + " the loaded-module set could not be asked, so nothing is really known)";
+            }
+
+            if (rule == "module-not-loaded")
+            {
+                return "no match is loaded in this session, so the best real module wins over a folder"
+                    + " that is not a module at all (the write still cannot be resolved here, but it is"
+                    + " where a correct install - game, dedicated server - will read it)";
+            }
+
+            return "no match is a module at all, so the first in Modules\\ listing order was taken;"
+                + " nothing written into such a folder can ever be indexed";
+        }
+
+        // The "folder:" block that lists EVERY matching module, not just the one
+        // that won. Without it the resolution is invisible, and the whole point
+        // is that more than one module folder can hold SceneObj\<the same name>.
+        public static void DescribeSceneModuleMatches(System.Action<string> log, string sceneName,
+            List<SceneModuleMatch> matches, SceneModuleMatch chosen, string rule, int tied,
+            string engineModulePath)
+        {
+            if (log == null || matches == null || matches.Count == 0)
+                return;
+
+            log("folder: scene '" + sceneName + "' is in " + matches.Count
+                + " module folder(s). The engine resolves a scene by name, not by module, so every one"
+                + " of them matches; they are ranked, not taken in folder order:");
+
+            for (int i = 0; i < matches.Count; i++)
+            {
+                SceneModuleMatch m = matches[i];
+                if (m == null)
+                    continue;
+
+                bool isChosen = chosen != null
+                    && string.Equals(NormalizePath(m.ModuleDir), NormalizePath(chosen.ModuleDir),
+                        StringComparison.OrdinalIgnoreCase);
+
+                log("folder:   " + (isChosen ? "CHOSEN  " : "ignored ")
+                    + m.ModuleDir
+                    + " module=" + m.ModuleId
+                    + " moduleId='" + (m.ModuleSubModuleId ?? "") + "'"
+                    + (m.IsModule ? "" : " NOT-A-MODULE (no SubModule.xml)")
+                    + " loaded=" + m.ActiveText
+                    + " rank=" + m.Rank + RankMeaning(m.Rank)
+                    + (isChosen ? "  <- this run's write folder" : ""));
+            }
+
+            log("folder:   rule: " + DescribeSceneModuleRule(rule)
+                + (chosen != null ? "; winner module '" + chosen.ModuleId + "'" : "; no winner"));
+
+            if (tied > 1)
+            {
+                log("folder:   AMBIGUOUS: " + tied + " folder(s) share the winning rank and cannot be told"
+                    + " apart from here, so the first in Modules\\ listing order was taken. Set"
+                    + " NavMeshExportFolder to pin the module explicitly.");
+            }
+
+            if (!string.IsNullOrEmpty(engineModulePath))
+            {
+                bool engineWon = chosen != null
+                    && string.Equals(NormalizePath(engineModulePath), NormalizePath(chosen.ModuleDir),
+                        StringComparison.OrdinalIgnoreCase);
+
+                log("folder:   cross-check: Scene.GetModulePath() said '" + engineModulePath + "'"
+                    + (engineWon
+                        ? ", which is the folder chosen above - the engine's own answer and the ranking agree."
+                        : ", which was REJECTED above (it is not a module folder), so the ranking decided"
+                          + " instead."));
+            }
+        }
+
+        private static string RankMeaning(int rank)
+        {
+            if (rank >= 3)
+                return " (a module this session loaded)";
+            if (rank == 2)
+                return " (loaded, but the loaded set could not be asked)";
+            if (rank == 1)
+                return " (a module this session does not load)";
+            return " (not a module: a prefab written here can never be indexed)";
         }
 
         // ==================================================================
