@@ -1004,6 +1004,90 @@ buckets and degenerates every map to quadratic chains. With the existing `LongKe
 them, the same builds get much faster - Birtu ~2x, CC_20 ~3.5x (66 s -> 19 s), Basamu ~5.7x (127 s -> 22 s) -
 with byte-identical output for the maps that already worked.
 
+### Malformed faces: no downward normals, no bowties, no overlap (V3.46)
+
+The user reported two things on CC_20 (screenshot folder `Feedback/3.42`): at `x 1107.68, y 1042.09,
+z 126.13` *"the navmesh overlaps and crisscrosses with itself, like an X"*, and at the
+`european_castle_ladder` base (`x 1119.57, y 1079.10, z 108.02`) *"you can see some navmesh bits jumping
+way up and one inverted navmesh face among them"*. Both classes are now defined, measured and guarded:
+
+**A navmesh face is a 2D polygon standing on the ground.** It has a *ground footprint* - the signed XZ area
+of its walk order, in m^2 - and that footprint has to face up. Three things can break that, and the same
+number (`NavMeshCleanup.MinGroundFootprintM2`, 1e-9 m^2, i.e. numerically vertical) judges all of them in the
+cleanup's guards, in the repairs and in the export gate:
+
+| class | footprint | what the engine does with it |
+|---|---|---|
+| walkable | `> 0` | fine |
+| inverted | `< 0` | drawn inside out; the writer always writes the per-face `inverted` flag `0`, so nothing downstream ever catches it |
+| wall | `= 0` | no ground footprint at all - the engine's n-gon triangulator makes a degenerate polygon out of it |
+
+**What was actually happening, measured stage by stage** (the harness can dump the mesh after every cleanup
+stage; the per-stage downward-face count on CC_20 was 1 -> 1 -> **7** -> 3 -> 3 -> 3):
+
+* **RefineLongThin is sound.** Its children are sub-triangles of the parent they replace (the inserted vertex
+  IS the midpoint of the split edge), so it inherits each parent's plane and winding by construction.
+  Instrumenting every committed child over 13k+ splits found **0** vertical or inverted ones. V3.46 states the
+  property as an assertion instead of assuming it (one cross product per child), so a future change cannot
+  quietly break it.
+* **Decimate was the one stage that manufactured malformed faces.** Its fan removal retriangulates the ring
+  in the ring's best-fit plane; `EmitTri` can only flip a *negative* footprint positive, so a **vertical**
+  ear (footprint exactly 0) sails through, and the orientation guard did not stop it either: it compares each
+  new face against the fan's **mean** normal with a 60 deg cone, and a sideways-facing triangle is inside
+  that cone whenever the mean is itself tilted. Measured 22-29 such faces per CC_20 run, every one of them
+  exactly vertical (e.g. a ring whose three vertices share one Z: `A=(71.5,84.5,409.25) B=(68.5,86.3,
+  409.25) C=(65.75,88.3,409.25)` against a fan whose summed normal was `(68.25,109.56,-86.54)` - cos 0.56,
+  inside the cone). **Guard (A)**: every emitted face must have a strictly positive footprint, else the whole
+  retriangulation is refused.
+* **Decimate could also lay a new face on top of a face it never touched**, which is the X: ear-clipping a
+  ring whose *ground projection folds over itself* (a staircase rim, a wall base, a saddle) puts triangles
+  outside the hole. **Guard (B)**: the ring's XZ projection must be a **simple polygon** (non-degenerate
+  shoelace, no two non-adjacent edges crossing) before it may be retriangulated at all.
+* **MergeQuads never produced either class**, and by construction it cannot: it does not touch `tris` at all,
+  it only records which triangle pair the writer emits as one 4-gon, and every pair it records is strictly
+  convex in its own plane *and* in XZ with the winding of both triangles. Measured on CC_20: 1857 emitted
+  quads, **0** bowties, **0** XZ-reflex, **0** orientation flips, and the downward/overlap counts are
+  byte-identical before and after that stage. The gate now re-derives each walk anyway
+  (`CheckQuadWalks`), because the writer trusts `QuadPairs` completely.
+* **The inverted face the user saw at the ladder was never in the cleanup's remit**: it is present in its
+  *input*, at `(1120.500, 117.367, 1077.000)`, and it is the detail mesh following the prop geometry -
+  `stairs_bo` + `bd_wood_heap_b` + `european_castle_ladder` packed into a 2 x 3 m spot with 6 m of height
+  range. A navmesh face cannot be inverted by a cleanup pass that has already run, so this class is repaired
+  where it is born.
+
+**The repairs** (`TiledNavMeshBuilder.RepairFaceQuality`, after the cleanup and before the result arrays are
+built, with the recorded quad pairs renumbered through the same compaction so a pair can never point at a
+removed face):
+
+* every face with a non-positive footprint is dropped and counted (1 on CC_20 - the ladder face - 11 on
+  Basamu, 0 on Birtu);
+* the redundant face of every **vertex-disjoint** same-level overlapping pair is dropped (2 faces on CC_20),
+  but only when the drop does not change the island count: dropping either face of an edge-sharing pair
+  disconnects one-face-wide necks, and measured on CC_20 dropping the 64 edge-sharing slivers takes the map
+  from 15 islands to 51 - the engine would turn those into 36 fragments. Drops that would fragment the mesh
+  are reverted and counted. Both log their own wall clock (`... in <n>ms`), so the cost is visible per run.
+
+**The permanent guard** (`ComputeInvariants`, the same gate that already blocks the write on
+`maxEdgeMult>2` / duplicate faces / self-loops) now also measures and blocks `inverted`, `vertical` and
+`badQuadWalks`, and reports `selfOverlap=disjoint/all`. `disjoint/all` is deliberately *reported, not
+blocking*, for the reason in the bullet above: the whole remaining class on CC_20 is one pair on a
+one-face-wide neck. Cost, measured on the 241k-face CC_20 build and logged on both lines
+(`faceQualityMs`, and the repair's own `in <n>ms`): **122 ms for the gate's two face scans and 229 ms for
+the repairs, ~1.1% of a 33 s build**. Birtu (45k faces) is under 25 ms each.
+
+Before / after, same machine, same snapshots, `--ramps on --quality` (the cleanup's passes are wall-clock
+budgeted, so the last digits drift; Birtu and CC_20 reproduce exactly, Basamu is the sensitive one):
+
+| map | downward/vertical faces | disjoint overlapping pairs | all same-level pairs | quads | needles | thin | islands | gate |
+|---|---|---|---|---|---|---|---|---|
+| Birtu | 0 -> **0** | 0 -> 0 | 9 -> 9 | 603 -> 603 | 8 -> 8 | 356 -> 356 | 5 -> 5 | PASS -> PASS |
+| CC_20 | **4 -> 0** | **4 -> 2** | 91 -> 89 | 1857 -> 1855 | 39 -> 39 | 1037 -> 1035 | 15 -> 15 | PASS -> PASS |
+| Basamu | **11 -> 0** | 0 -> 0 | 99 -> 85 | 3303 -> 3333 | 65 -> 65 | 1638 -> 1655 | 1 -> 1 | PASS -> PASS |
+
+(Basamu's quad count is 3303 -> 3333 here rather than the 2962 quoted earlier for this map: that number was
+measured on a different machine, and its cleanup is the most budget-sensitive of the three - repeats of the
+same binary were observed at 2942/2955/2962 elsewhere.)
+
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 
 Two mechanisms for props whose body flags include `HasSteps` (`0x800`) or `Ladder` (`0x40`) - Birtu has 84 of
@@ -1437,7 +1521,9 @@ NavMesh: v2: merge-stitch: pairs=<n> added=<n> refused=<n> (cap=6 cells)        
 NavMesh: v2: prune: removed <n> islands, <n> faces (<=400 faces each); largest removed=<n> at (x,y,z); kept=<n> islands
 NavMesh: v2: prune: exempt-formed islands=<n> faces=<n> largest=<n> at (x,y,z) (restored stepped-prop leftovers, pruned regardless of the cap)   <- only when NavMeshVoxelSteppedProps=true and such an island exists
 NavMesh: v2: weld verts=... -> ... faces=... edges=... degenerate=... (weldMerged=...)
-NavMesh: v2: invariants: faces=... edges=... boundary=... maxEdgeMult=.. dupFaces=.. selfLoops=.. minEdges=.. -> PASS
+NavMesh: v2: repaired mesh: removed <n> non-manifold faces
+NavMesh: v2: repaired mesh: <n> bad facing(s) (... inverted + ... vertical, first at (x,y,z)), same-level overlaps dropped <n> (<a> of <b> overlapping pair(s) are disjoint, dropped <c> face(s)[, <d> reverted to keep the island count]), quads kept <k>/<m> in <t>ms
+NavMesh: v2: invariants: faces=... edges=... boundary=... maxEdgeMult=.. dupFaces=.. selfLoops=.. minEdges=.. inverted=.. vertical=.. selfOverlap=<a>/<b> badQuadWalks=.. faceQualityMs=.. -> PASS
 NavMesh: v2: islands=<n> totalFaces=... largest=[0:faces=... area=...m2 centroid=(x,y,z) zr=[min..max] | 1:... ] top10
 NavMesh: v2: mesh V=... E=... F=... degenerate=... binBytes=... buildMs=...
 NavMesh: v2 timings: tilesMs=... mergeMs=... totalMs=...
@@ -1470,6 +1556,18 @@ NavMesh: v2: tileMs min/avg/max=.../.../...
   exemption faces (see *Stairs & ladders*), plus `v2: prune: kept islands worst exemption fraction=<x>% of <n>
   faces` as the check that the real networks stay mixed-provenance.
 - `v2: weld verts=... -> ... faces=... degenerate=...` - cross-tile welding, dropped zero-area faces.
+- `v2: repaired mesh: removed <n> non-manifold faces` - the deterministic manifold repair (edge shared by
+  more than two faces), unchanged by V3.46.
+- `v2: repaired mesh: <n> bad facing(s) ... same-level overlaps dropped <n> ...` - the V3.46
+  face-quality repair (see *Malformed faces*), with the first dropped face's position, how many of
+  the overlapping pairs are vertex-disjoint (the only ones it will drop, because dropping either face
+  of an edge-sharing pair can disconnect a one-face-wide neck), how many of its drops were reverted to
+  keep the island count, and how many recorded quads survived the face renumbering.
+- `v2: invariants: ... inverted=.. vertical=.. selfOverlap=<a>/<b> badQuadWalks=.. faceQualityMs=..` - the
+  export gate; `faceQualityMs` is what the two new face scans cost.
+  `inverted`/`vertical`/`badQuadWalks` are **blocking** (any of them means the bin is not written);
+  `selfOverlap` is `disjointPairs/allPairs` and is **measured, not blocking** - see
+  *Malformed faces* for why clearing the edge-sharing class would cost the island count.
 - `v2: islands=... totalFaces=... largest=[...]` - always on and cheap: connected components by face adjacency,
   with the ten largest by area (`faces`, `area` m^2, area-weighted `centroid`, and the island's Y range `zr`).
   This is the data used to choose a rule for pruning sealed-void lids.

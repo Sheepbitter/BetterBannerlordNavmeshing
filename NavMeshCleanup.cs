@@ -58,6 +58,12 @@ namespace BetterBannerlordNavmeshing
         // synthesised ramps and wall bases are load-bearing geometry, and folding them is what dropped the
         // mesh under the top of staircases.
         public const float MaxCleanupSlopeDegrees = 40f;
+        // A face is only a navmesh surface if its GROUND FOOTPRINT (the signed XZ area in walk order, in
+        // m^2) is strictly positive: positive = faces up (walkable), zero = a wall (no footprint at all -
+        // the engine's n-gon triangulator makes a degenerate polygon out of it and the editor draws it as
+        // a face turned inside out), negative = inside out. 1e-9 m^2 is a 1e-4 m x 1e-5 m triangle, i.e.
+        // numerically vertical. The export gate asserts the same threshold on the final mesh.
+        public const double MinGroundFootprintM2 = 1e-9;
         // A fold or slide may not change the surface height by more than this at the affected point: this is
         // the direct form of the staircase defect (the mesh must stay ~0.5 m above the collision surface).
         public const float MaxHeightChangeMeters = 0.15f;
@@ -594,6 +600,13 @@ namespace BetterBannerlordNavmeshing
             var ring = new List<int>();
             if (!BuildRing(tris, incident, vert, ring)) { st.RejRing++; return false; }
             if (ring.Count < 3) { st.RejRing++; return false; }
+            // (V3.46, guard (B)) The ring must be a SIMPLE polygon in the ground projection. A ring whose
+            // XZ projection folds over itself - a staircase rim, a wall base, a saddle - describes a hole
+            // that is not a hole: ear clipping it in 3D then drops triangles that land outside the removed
+            // fan, ON TOP of faces that were never touched. That is how the decimation pass produced the
+            // user's "the navmesh overlaps and crisscrosses with itself, like an X". A non-simple ring is
+            // refused: the removal simply does not happen.
+            if (!RingSimpleXz(v, ring)) { st.RejRing++; return false; }
 
             float tol = boundary[vert] ? BoundaryToleranceMeters : SurfaceToleranceMeters;
             // Move: the removed vertex's distance to the ring's best-fit plane bounds how far the surface
@@ -850,10 +863,51 @@ namespace BetterBannerlordNavmeshing
             return (float)Math.Sqrt(ex * ex + ez * ez);
         }
 
+        // (V3.46, guard (A)) True when the ring's ground projection is a simple polygon: a non-degenerate
+        // shoelace and no pair of NON-ADJACENT edges crossing. The ring walk itself is unique and is closed
+        // by the new outline chord, so these two conditions are exactly "simple polygon"; given them, ear
+        // clipping only ever removes convex ears, so every emitted triangle lies inside the hole it fills
+        // and the replacement can never cover a face outside the fan.
+        private static bool RingSimpleXz(float[] v, List<int> ring)
+        {
+            int n = ring.Count;
+            double area2 = 0.0;
+            for (int i = 0; i < n; i++)
+            {
+                int a = ring[i], b = ring[(i + 1) % n];
+                area2 += (double)v[a * 3] * v[b * 3 + 2] - (double)v[b * 3] * v[a * 3 + 2];
+            }
+            if (Math.Abs(area2) < 1e-9) return false;              // a wall / a degenerate hole
+            for (int i = 0; i < n; i++)
+            {
+                int a0 = ring[i], a1 = ring[(i + 1) % n];
+                for (int j = i + 1; j < n; j++)
+                {
+                    if (j == i || (j + 1) % n == i || (i + 1) % n == j) continue;
+                    if (SegsCrossXZ(v, a0, a1, ring[j], ring[(j + 1) % n])) return false;
+                }
+            }
+            return true;
+        }
+
+        // Proper crossing of the 2D (XZ) segments a-b and c-d. Shared endpoints and touching do not count.
+        private static bool SegsCrossXZ(float[] v, int a, int b, int c, int d)
+        {
+            double ax = v[a * 3], az = v[a * 3 + 2], bx = v[b * 3], bz = v[b * 3 + 2];
+            double cx = v[c * 3], cz = v[c * 3 + 2], dx = v[d * 3], dz = v[d * 3 + 2];
+            double d1 = (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
+            double d2 = (bx - ax) * (dz - az) - (bz - az) * (dx - ax);
+            double d3 = (dx - cx) * (az - cz) - (dz - cz) * (ax - cx);
+            double d4 = (dx - cx) * (bz - cz) - (dz - cz) * (bx - cx);
+            return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+                && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+        }
+
         // Ear-clip the ring (a simple polygon, potentially an open chain closed by the new outline chord)
         // in ONE fixed best-fit plane, choosing the best-quality ear each step. The first attempt picked
         // a projection axis PER TRIANGLE, which is meaningless on a sliver (its normal is noise) and
-        // caused both rejects and bad output. Emitted triangles get the surface's (+Y) winding.
+        // caused both rejects and bad output. Emitted triangles get the surface's (+Y) winding, and
+        // (V3.46, guard (A)) must have a real ground footprint: see FootprintOk.
         private static bool TriangulateRing(float[] v, List<int> ring, List<int> outTris)
         {
             outTris.Clear();
@@ -927,11 +981,30 @@ namespace BetterBannerlordNavmeshing
                 int bb = idx[bestI];
                 int aa = idx[(bestI + idx.Count - 1) % idx.Count];
                 int cc = idx[(bestI + 1) % idx.Count];
+                int at = outTris.Count;
                 EmitTri(v, ring, aa, bb, cc, outTris);
+                if (!FootprintOk(v, outTris, at)) return false;      // (A) a wall / an inverted face
                 idx.RemoveAt(bestI);
             }
-            if (idx.Count == 3) EmitTri(v, ring, idx[0], idx[1], idx[2], outTris);
+            if (idx.Count == 3)
+            {
+                int at = outTris.Count;
+                EmitTri(v, ring, idx[0], idx[1], idx[2], outTris);
+                if (!FootprintOk(v, outTris, at)) return false;      // (A)
+            }
             return outTris.Count >= 3;
+        }
+
+        // (V3.46, guard (A)) The triangle written at `at` must have a strictly positive ground footprint.
+        // EmitTri already flips a negative footprint positive, so this catches exactly the two cases it
+        // cannot fix by reordering: a VERTICAL triangle (no footprint at all) and a ring whose plane is
+        // so close to vertical that the projected ear is inside-out. Both used to be committed: the
+        // "faces the way the fan did" guard is a comparison against the fan's MEAN normal, and a
+        // sideways-facing triangle can be within 60 deg of a mean that is itself tilted (measured: 22-29
+        // such faces per CC_20 run, all of them exactly vertical - zero footprint, drawn inside out).
+        private static bool FootprintOk(float[] v, List<int> tris, int at)
+        {
+            return NormalY(v, tris[at], tris[at + 1], tris[at + 2]) > MinGroundFootprintM2;
         }
 
         // Emits a ring-local triangle as world indices, with the surface's (+Y) winding.
@@ -1689,6 +1762,20 @@ namespace BetterBannerlordNavmeshing
             for (int i = 0; i + 2 < newTris.Count; i += 3)
             {
                 if (IsNeedle(v, newTris[i], newTris[i + 1], newTris[i + 2]))
+                {
+                    verts.RemoveRange(verts.Count - 3, 3);
+                    st.RejTopo++;
+                    return false;
+                }
+                // (V3.46) The split is surface-exact BY CONSTRUCTION - the inserted vertex is the midpoint of
+                // (p,q), so each child is a sub-triangle of the parent it replaces and inherits its plane and
+                // its winding - so this is an ASSERTION of that property, not a heuristic, and it costs one
+                // cross product per child. It is stated rather than assumed because the alternative is what the
+                // user reported: a zero-footprint (vertical) or inside-out face reaching the writer, which the
+                // engine then draws turned inside out. It fires only when the parent's own edge is vertical
+                // (both endpoints share an XZ coordinate), which the mesher's own slope filter never produces
+                // - measured 0 hits over 13k+ splits on CC_20 - and on such a face the split is refused.
+                if (NormalY(v, newTris[i], newTris[i + 1], newTris[i + 2]) <= MinGroundFootprintM2)
                 {
                     verts.RemoveRange(verts.Count - 3, 3);
                     st.RejTopo++;

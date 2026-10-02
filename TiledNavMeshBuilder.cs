@@ -235,6 +235,15 @@ namespace BetterBannerlordNavmeshing
             public int DuplicateFaces;
             public int SelfLoops;
             public int RequiredEdges;   // (3*faces + boundary) / 2
+        // V3.46 face-quality invariants: none of these may be non-zero on a shipped mesh.
+        public int InvertedFaces;       // a face whose ground footprint is negative (it looks down)
+        public int VerticalFaces;       // a face whose ground footprint is zero (a wall, no footprint)
+        public int SelfOverlapPairs;    // two vertex-disjoint faces of one level laid across each other
+        public int OverlappingFacesAny; // the same count including edge-sharing pairs (measured, not gated)
+        public int BadQuadWalks;        // an emitted quad that is not a simple walk with the right winding
+        // Wall clock of the two V3.46 face-quality scans (overlap + quad walk), so the cost of the
+        // guard is visible in the run log next to the build it protects.
+        public int FaceQualityMs;
         }
 
         // ------------------------------------------------------------------
@@ -885,6 +894,12 @@ namespace BetterBannerlordNavmeshing
                 if (cln.DecimDiag != null) Log(log, "cleanup: " + cln.DecimDiag);
             }
 
+            // V3.46: the last pass that rewrites faces, so the face-quality repairs run HERE - after the
+            // sliver cleanup has finished and BEFORE the result arrays are built, and the recorded quad
+            // pairs are remapped through the same compaction (a pair whose face was dropped goes with
+            // it, so the writer can never emit a quad over a hole).
+            quadPairs = RepairFaceQuality(merged, quadPairs, log);
+
             int mergedVertices = merged.X.Count;
             var result = new VoxelMeshResult();
             result.VertexCount = mergedVertices;
@@ -928,7 +943,7 @@ namespace BetterBannerlordNavmeshing
             result.QuadPairs = quadPairs;
 
             // --- topology + invariants (gate) ---
-            ComputeInvariants(result, result.Tris, result.FaceCount);
+            ComputeInvariants(result, result.Tris, result.FaceCount, quadPairs);
 
             Log(log, "v2: weld verts=" + tileVertexSum + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
@@ -936,9 +951,17 @@ namespace BetterBannerlordNavmeshing
             Log(log, "v2: invariants: faces=" + result.FaceCount + " edges=" + result.EdgeCount
                 + " boundary=" + result.BoundaryEdges + " maxEdgeMult=" + result.MaxEdgeMultiplicity
                 + " dupFaces=" + result.DuplicateFaces + " selfLoops=" + result.SelfLoops
-                + " minEdges=" + result.RequiredEdges + " -> " + (result.InvariantsPassed ? "PASS" : "FAIL"));
+                + " minEdges=" + result.RequiredEdges
+                + " inverted=" + result.InvertedFaces + " vertical=" + result.VerticalFaces
+                + " selfOverlap=" + result.SelfOverlapPairs + "/" + result.OverlappingFacesAny
+                + " badQuadWalks=" + result.BadQuadWalks
+                + " faceQualityMs=" + result.FaceQualityMs
+                + " -> " + (result.InvariantsPassed ? "PASS" : "FAIL"));
             if (!result.InvariantsPassed)
                 Log(log, "v2: ERROR mesh invariants failed: maxEdgeMult=" + result.MaxEdgeMultiplicity
+                    + " inverted=" + result.InvertedFaces + " vertical=" + result.VerticalFaces
+                    + " selfOverlap=" + result.SelfOverlapPairs
+                    + " badQuadWalks=" + result.BadQuadWalks
                     + " dupFaces=" + result.DuplicateFaces + " selfLoops=" + result.SelfLoops
                     + " edges=" + result.EdgeCount + " required=" + result.RequiredEdges
                     + "; mesh is non-manifold/duplicated and must not be imported");
@@ -3297,6 +3320,356 @@ namespace BetterBannerlordNavmeshing
             return removedCount;
         }
 
+        // ------------------------------------------------------------------
+        // V3.46 REPAIRS: the malformed-face classes the user reported, fixed where they are born.
+        // ------------------------------------------------------------------
+        // A navmesh face is a 2D polygon standing on the ground: it has a FOOTPRINT (its signed XZ area
+        // in walk order) and that footprint must face up. Two things break that, and both were measured
+        // on CC_20 at the coordinates the user reported:
+        //   * a face with no footprint (exactly vertical) or a negative one (inside out). The writer
+        //     always writes the per-face inverted flag 0, so such a face reaches the engine as a normal
+        //     face and the editor draws it turned inside out - the inverted navmesh face the user saw
+        //     next to european_castle_ladder at (1120.500, 117.367, 1077.000), where the prop cluster
+        //     stairs_bo + bd_wood_heap_b + european_castle_ladder folds under itself in a 2 x 3 m spot.
+        //   * two faces of the same walkable surface laid across each other - the navmesh overlapping
+        //     and crisscrossing with itself, like an X.
+        // Neither is born in the sliver cleanup: measured stage by stage, both classes are already in its
+        // INPUT. They are dropped here, next to the non-manifold repair, so everything downstream (stitch,
+        // prune, cleanup, writer, gate) sees faces that are all real walkable surfaces and the export gate
+        // can ASSERT that instead of merely reporting it.
+        // Runs BOTH face-quality repairs as one compaction and remaps the recorded quad pairs through it.
+        // A pair whose face was dropped goes with it (the writer must never emit a quad over a hole), so the
+        // quad count moves by a handful of faces at most - measured on CC_20: 1 dropped quad for 2 dropped
+        // faces. quadPairs may be null (cleanup off, or nothing merged).
+        private static int[] RepairFaceQuality(MergeOutput o, int[] quadPairs, Action<string> log)
+        {
+            var repairWatch = System.Diagnostics.Stopwatch.StartNew();
+            int faceCount0 = o.Tris.Count / 3;
+            var drop = new bool[faceCount0];
+            var overlapDrop = new bool[faceCount0];
+            string facingsLog;
+            int badFacings = MarkBadFacings(o, drop, out facingsLog);
+            string overlapsLog;
+            int overlaps = MarkSelfOverlaps(o, drop, overlapDrop, out overlapsLog);
+            int reverted = KeepConnectivitySafe(o, drop, overlapDrop);
+            overlaps -= reverted;
+            if (badFacings == 0 && overlaps == 0)
+                return quadPairs;   // nothing dropped: the mesh and its quad pairs are untouched
+
+            // Old face index -> new face index for the faces that survive (the compaction keeps their order).
+            var map = new int[faceCount0];
+            int kept = 0;
+            for (int i = 0; i < faceCount0; i++) map[i] = drop[i] ? -1 : kept++;
+            CompactFaces(o, drop);
+
+            int keptQuads = 0, lostQuads = 0;
+            if (quadPairs != null && quadPairs.Length >= 2)
+            {
+                for (int k = 0; k + 1 < quadPairs.Length; k += 2)
+                {
+                    int f0 = quadPairs[k], f1 = quadPairs[k + 1];
+                    if (f0 < 0 || f1 < 0 || f0 >= faceCount0 || f1 >= faceCount0) continue;
+                    int n0 = map[f0], n1 = map[f1];
+                    if (n0 < 0 || n1 < 0 || n0 == n1) { lostQuads++; continue; }
+                    quadPairs[k] = n0;
+                    quadPairs[k + 1] = n1;
+                    keptQuads++;
+                }
+                if (keptQuads * 2 < quadPairs.Length)
+                {
+                    var trimmed = new int[keptQuads * 2];
+                    int w = 0;
+                    for (int k = 0; k + 1 < quadPairs.Length; k += 2)
+                    {
+                        if (quadPairs[k] < 0) continue;
+                        trimmed[w++] = quadPairs[k];
+                        trimmed[w++] = quadPairs[k + 1];
+                    }
+                    quadPairs = trimmed;
+                }
+            }
+
+            string msg = badFacings + " bad facing(s) (" + facingsLog + "), same-level overlaps dropped "
+                + overlaps + " (" + overlapsLog
+                + (reverted > 0 ? ", " + reverted + " reverted to keep the island count" : "")
+                + "), quads kept " + keptQuads + "/" + (keptQuads + lostQuads) + " in " + repairWatch.ElapsedMilliseconds + "ms";
+            Log(log, "v2: repaired mesh: " + msg);
+            return quadPairs;
+        }
+
+        // Marks (does not yet remove) every face whose ground footprint is not a real walkable polygon:
+        // negative = it looks DOWN (the inverted navmesh face the user saw), zero = it is a wall with no
+        // footprint at all. The navmesh writer always writes the per-face inverted flag 0, so nothing
+        // downstream would ever catch these.
+        private static int MarkBadFacings(MergeOutput o, bool[] drop, out string log)
+        {
+            int faceCount = o.Tris.Count / 3;
+            int removedCount = 0, inverted = 0, vertical = 0;
+            float firstX = 0f, firstY = 0f, firstZ = 0f;
+            for (int i = 0; i < faceCount; i++)
+            {
+                int a = o.Tris[i * 3], b = o.Tris[i * 3 + 1], c = o.Tris[i * 3 + 2];
+                double ny = FootprintM2(o.X, o.Y, o.Z, a, b, c);
+                if (ny > NavMeshCleanup.MinGroundFootprintM2) continue;
+                drop[i] = true;
+                removedCount++;
+                if (ny < 0) inverted++; else vertical++;
+                if (removedCount == 1)
+                {
+                    firstX = (o.X[a] + o.X[b] + o.X[c]) / 3f;
+                    firstY = (o.Y[a] + o.Y[b] + o.Y[c]) / 3f;
+                    firstZ = (o.Z[a] + o.Z[b] + o.Z[c]) / 3f;
+                }
+            }
+            log = inverted + " inverted + " + vertical + " vertical, first at ("
+                + F(firstX) + "," + F(firstY) + "," + F(firstZ) + ")";
+            return removedCount;
+        }
+
+        // Marks (does not remove) the redundant face of every same-level overlap - the face whose ground
+        // centroid lies inside the other's, always the smaller of the two. This is the navmesh overlapping
+        // and crisscrossing with itself: two surfaces of one walkable level laid across each other. For the
+        // vertex-disjoint pairs (two sheets crossing - the X) dropping the smaller costs NO coverage at all,
+        // because the bigger face already covers the same footprint; for the adjacent pairs it costs the
+        // sliver's own area, which is exactly the visual garbage the sliver cleanup exists to remove.
+        // Reverts the OVERLAP drops inside any component they would split apart. Dropping a face can disconnect the
+        // surface when that face is the only link between two halves (a one-face neck), and the island count
+        // is a hard acceptance criterion - the engine creates one island per component, so a repair that
+        // fragments the mesh is worse than the defect it removes. Cost: two union-find passes over the face
+        // graph (one before, one on the tentatively-dropped set) plus one triangle-list copy; measured on
+        // CC_20 (241k faces) it is a few tens of milliseconds. Bad FACINGS are never reverted - a face with
+        // no ground footprint is malformed whatever it costs.
+        private static int KeepConnectivitySafe(MergeOutput o, bool[] drop, bool[] overlapDrop)
+        {
+            int nf = o.Tris.Count / 3;
+            int touched = 0;
+            for (int f = 0; f < nf; f++) if (drop[f] && overlapDrop[f]) touched++;
+            if (touched == 0) return 0;
+
+            int[] comp0 = FaceComponentsOf(o.Tris, nf);
+            var map = new int[nf];
+            var kept = new List<int>(o.Tris.Count);
+            for (int f = 0; f < nf; f++)
+            {
+                if (drop[f] && overlapDrop[f]) { map[f] = -1; continue; }
+                map[f] = kept.Count / 3;
+                kept.Add(o.Tris[f * 3]);
+                kept.Add(o.Tris[f * 3 + 1]);
+                kept.Add(o.Tris[f * 3 + 2]);
+            }
+            int nf2 = kept.Count / 3;
+            if (nf2 == 0) return 0;
+            int[] comp1 = FaceComponentsOf(kept, nf2);
+
+            // For every original component that had a drop: did its survivors end up in one component?
+            var survivors = new Dictionary<int, int>();
+            var split = new HashSet<int>();
+            for (int f = 0; f < nf; f++)
+            {
+                if (map[f] < 0) continue;
+                int c0 = FaceFind(comp0, f);
+                int c1 = FaceFind(comp1, map[f]);
+                int prev;
+                if (survivors.TryGetValue(c0, out prev)) { if (prev != c1) split.Add(c0); }
+                else survivors[c0] = c1;
+            }
+            if (split.Count == 0) return 0;
+
+            int reverted = 0;
+            for (int f = 0; f < nf; f++)
+            {
+                if (!drop[f] || !overlapDrop[f]) continue;
+                if (!split.Contains(FaceFind(comp0, f))) continue;
+                drop[f] = false;
+                reverted++;
+            }
+            return reverted;
+        }
+
+        // Union-find over the face graph (faces joined by a shared edge), returning the raw parent array so
+        // the caller can FaceFind() a root. Same edge rule as the prune's island count.
+        private static int[] FaceComponentsOf(List<int> tris, int nf)
+        {
+            var fp = new int[nf];
+            for (int i = 0; i < nf; i++) fp[i] = i;
+            var edgeFirst = new Dictionary<long, int>(LongKeyComparer.Instance);
+            for (int f = 0; f < nf; f++)
+            {
+                int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+                FaceUnionEdge(edgeFirst, fp, f, a, b);
+                FaceUnionEdge(edgeFirst, fp, f, b, c);
+                FaceUnionEdge(edgeFirst, fp, f, c, a);
+            }
+            return fp;
+        }
+
+        private static int MarkSelfOverlaps(MergeOutput o, bool[] drop, bool[] overlapDrop, out string log)
+        {
+            int faceCount = o.Tris.Count / 3;
+            if (faceCount == 0) { log = "no faces"; return 0; }
+            var xyz = new float[o.X.Count * 3];
+            for (int i = 0; i < o.X.Count; i++)
+            {
+                xyz[i * 3] = o.X[i];
+                xyz[i * 3 + 1] = o.Y[i];
+                xyz[i * 3 + 2] = o.Z[i];
+            }
+            var dropList = new List<int>();
+            int total;
+            int pairs = ScanSelfOverlaps(xyz, o.Tris, faceCount, SelfOverlapSameLevelMeters, dropList,
+                true, out total);
+            int n = 0;
+            for (int i = 0; i < dropList.Count; i++)
+            {
+                int f = dropList[i];
+                if (f < 0 || f >= faceCount || drop[f]) continue;
+                drop[f] = true;
+                overlapDrop[f] = true;
+                n++;
+            }
+            log = pairs + " of " + total + " overlapping pair(s) are disjoint, dropped " + n + " face(s)";
+            return n;
+        }
+
+        private static void CompactFaces(MergeOutput o, bool[] removed)
+        {
+            int faceCount = o.Tris.Count / 3;
+            var keep = new List<int>(o.Tris.Count);
+            for (int i = 0; i < faceCount; i++)
+            {
+                if (removed[i]) continue;
+                keep.Add(o.Tris[i * 3]);
+                keep.Add(o.Tris[i * 3 + 1]);
+                keep.Add(o.Tris[i * 3 + 2]);
+            }
+            o.Tris.Clear();
+            o.Tris.AddRange(keep);
+        }
+
+        // The signed ground footprint (m^2) of triangle (a,b,c) in walk order: the Y component of its
+        // normal, positive when the face looks up. Identical to NavMeshCleanup's NormalY, so the
+        // cleanup's guards, these repairs and the export gate all judge a face by one number.
+        private static double FootprintM2(IList<float> x, IList<float> y, IList<float> z, int a, int b, int c)
+        {
+            double ux = x[b] - x[a], uz = z[b] - z[a];
+            double vx = x[c] - x[a], vz = z[c] - z[a];
+            return uz * vx - ux * vz;
+        }
+
+        private static double FootprintM2(float[] xyz, int a, int b, int c)
+        {
+            double ux = xyz[b * 3] - xyz[a * 3], uz = xyz[b * 3 + 2] - xyz[a * 3 + 2];
+            double vx = xyz[c * 3] - xyz[a * 3], vz = xyz[c * 3 + 2] - xyz[a * 3 + 2];
+            return uz * vx - ux * vz;
+        }
+
+        // Two faces are the same walkable surface when their centroid heights agree within this many
+        // metres. It is the cleanup's own outline-move tolerance (NavMeshCleanup.BoundaryToleranceMeters):
+        // two sheets of one floor never sit that far apart, while a genuine floor over a ceiling on a
+        // multi-level map does. Measured on CC_20 the class saturates fast - 57 pairs at 0.15 m, 91 at
+        // 0.35 m, 141 at 0.75 m - so this tolerance is generous rather than tight.
+        public const float SelfOverlapSameLevelMeters = 0.35f;
+
+        // Counts (and optionally collects) the faces that overlap a face of the same walkable surface: a
+        // face overlaps when its ground centroid lies strictly inside the other's XZ triangle. This ONE
+        // implementation backs both the repair above and the export gate, so the two can never disagree
+        // about what clean means. Cost is O(F) expected: one uniform XZ grid over the face boxes, then one
+        // point-in-triangle test per candidate pair, with early-outs on the height and the boxes.
+        // drop receives the face indices to remove (the contained/smaller one); null = count only.
+        private static int ScanSelfOverlaps(float[] xyz, List<int> tris, int faceCount, float levelMeters,
+            List<int> drop, bool disjointOnly, out int totalPairs)
+        {
+            const float cell = 4f;
+            var ccx = new float[faceCount]; var ccy = new float[faceCount]; var ccz = new float[faceCount];
+            var lox = new float[faceCount]; var hix = new float[faceCount];
+            var loz = new float[faceCount]; var hiz = new float[faceCount];
+            var area = new float[faceCount];
+            var grid = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
+            for (int f = 0; f < faceCount; f++)
+            {
+                int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+                double ax = xyz[a * 3], ay = xyz[a * 3 + 1], az = xyz[a * 3 + 2];
+                double bx = xyz[b * 3], by = xyz[b * 3 + 1], bz = xyz[b * 3 + 2];
+                double ex = xyz[c * 3], ey = xyz[c * 3 + 1], ez = xyz[c * 3 + 2];
+                ccx[f] = (float)((ax + bx + ex) / 3.0);
+                ccy[f] = (float)((ay + by + ey) / 3.0);
+                ccz[f] = (float)((az + bz + ez) / 3.0);
+                lox[f] = (float)Math.Min(ax, Math.Min(bx, ex));
+                hix[f] = (float)Math.Max(ax, Math.Max(bx, ex));
+                loz[f] = (float)Math.Min(az, Math.Min(bz, ez));
+                hiz[f] = (float)Math.Max(az, Math.Max(bz, ez));
+                double nx = (by - ay) * (ez - az) - (bz - az) * (ey - ay);
+                double ny = (bz - az) * (ex - ax) - (bx - ax) * (ez - az);
+                double nz = (bx - ax) * (ey - ay) - (by - ay) * (ex - ax);
+                area[f] = (float)(0.5 * Math.Sqrt(nx * nx + ny * ny + nz * nz));
+                int x0 = (int)Math.Floor(lox[f] / cell), x1 = (int)Math.Floor(hix[f] / cell);
+                int z0 = (int)Math.Floor(loz[f] / cell), z1 = (int)Math.Floor(hiz[f] / cell);
+                for (int gx = x0; gx <= x1; gx++)
+                    for (int gz = z0; gz <= z1; gz++)
+                    {
+                        long key = ((long)gx << 32) ^ (uint)gz;
+                        List<int> list;
+                        if (!grid.TryGetValue(key, out list)) { list = new List<int>(8); grid[key] = list; }
+                        list.Add(f);
+                    }
+            }
+
+            int pairs = 0;
+            totalPairs = 0;
+            var seen = drop != null ? new HashSet<int>() : null;
+            foreach (KeyValuePair<long, List<int>> kv in grid)
+            {
+                List<int> cand = kv.Value;
+                int n = cand.Count;
+                for (int i = 0; i < n; i++)
+                {
+                    int f = cand[i];
+                    for (int j = i + 1; j < n; j++)
+                    {
+                        int g = cand[j];
+                        if (Math.Abs(ccy[f] - ccy[g]) > levelMeters) continue;
+                        if (lox[f] > hix[g] || lox[g] > hix[f] || loz[f] > hiz[g] || loz[g] > hiz[f]) continue;
+                        bool inF = CentroidInTri(xyz, tris, g, ccx[f], ccz[f]);
+                        bool inG = CentroidInTri(xyz, tris, f, ccx[g], ccz[g]);
+                        if (!inF && !inG) continue;
+                        totalPairs++;
+                        if (disjointOnly && SharesVert(tris, f, g)) continue;
+                        pairs++;
+                        if (drop == null) continue;
+                        int loser = inF ? (inG ? (area[f] <= area[g] ? f : g) : f) : g;
+                        if (seen.Add(loser)) drop.Add(loser);
+                    }
+                }
+            }
+            return pairs;
+        }
+
+        private static bool SharesVert(List<int> tris, int f, int g)
+        {
+            int v0 = tris[f * 3], v1 = tris[f * 3 + 1], v2 = tris[f * 3 + 2];
+            return HasVertex(tris, g, v0) || HasVertex(tris, g, v1) || HasVertex(tris, g, v2);
+        }
+
+        private static bool HasVertex(List<int> tris, int f, int v)
+        {
+            return v == tris[f * 3] || v == tris[f * 3 + 1] || v == tris[f * 3 + 2];
+        }
+
+        private static bool CentroidInTri(float[] xyz, List<int> tris, int f, float px, float pz)
+        {
+            int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+            double ax = xyz[a * 3], az = xyz[a * 3 + 2];
+            double bx = xyz[b * 3], bz = xyz[b * 3 + 2];
+            double ex = xyz[c * 3], ez = xyz[c * 3 + 2];
+            double d1 = (px - bx) * (az - bz) - (ax - bx) * (pz - bz);
+            double d2 = (px - ex) * (bz - ez) - (bx - ex) * (pz - ez);
+            double d3 = (px - ax) * (ez - az) - (ex - ax) * (pz - az);
+            const double eps = 1e-6;
+            bool neg = d1 < -eps || d2 < -eps || d3 < -eps;
+            bool pos = d1 > eps || d2 > eps || d3 > eps;
+            return !(neg && pos);
+        }
+
         private static void AddFaceEdge(Dictionary<long, int> count, Dictionary<long, List<int>> perEdge,
             int face, int a, int b)
         {
@@ -3321,11 +3694,33 @@ namespace BetterBannerlordNavmeshing
                 count[key] = c - 1;
         }
 
-        // Topology invariants for the merged mesh. A well-formed triangle soup over a surface has
-        // every edge shared by at most 2 faces, no duplicate faces and no self-loops; then
+        // Topology AND face-quality invariants for the merged mesh. A well-formed triangle soup over a
+        // surface has every edge shared by at most 2 faces, no duplicate faces and no self-loops; then
         // E == (3F + boundary)/2 exactly. These gate the bin write + import.
-        private static void ComputeInvariants(VoxelMeshResult result, int[] tris, int faceCount)
+        //
+        // V3.46 adds the two malformed-face classes the user reported, so they can never ship silently
+        // again (the writer always writes the per-face inverted flag 0, so nothing downstream would ever
+        // catch them):
+        //   InvertedFaces - a face whose ground footprint is negative (it looks DOWN). Never produced by
+        //                   the cleanup any more (V3.46 guard A in NavMeshCleanup/TriangulateRing).
+        //   VerticalFaces - a face whose ground footprint is zero (a wall: no footprint at all, which the
+        //                   engine's n-gon triangulator turns into a degenerate polygon).
+        //   SelfOverlapPairs - two vertex-disjoint faces of the same walkable surface (centroid heights
+        //                   within SelfOverlapSameLevelMeters) whose footprints contain each other's
+        //                   centroid: two surfaces laid across each other, the crisscrossing X.
+        //   BadQuadWalks - an emitted 4-vertex face that is not a simple walk with the winding and the XZ
+        //                   convexity of the two triangles it replaces (a bowtie would be the X).
+        // The first three are removed by the repairs above; the fourth is guaranteed by MergeQuads. All
+        // four are re-measured here, so a regression anywhere between them fails the gate instead of
+        // reaching the engine.
+        private static void ComputeInvariants(VoxelMeshResult result, int[] tris, int faceCount, int[] quadPairs)
         {
+            result.InvertedFaces = 0;
+            result.VerticalFaces = 0;
+            result.SelfOverlapPairs = 0;
+            result.BadQuadWalks = 0;
+            result.OverlappingFacesAny = 0;
+            result.FaceQualityMs = 0;
             if (tris == null || faceCount == 0)
             {
                 result.EdgeCount = 0;
@@ -3342,6 +3737,8 @@ namespace BetterBannerlordNavmeshing
             var faces = new Dictionary<FaceKey, int>();
             int selfLoops = 0;
             int dupFaces = 0;
+            int inverted = 0;
+            int vertical = 0;
 
             for (int f = 0; f < faceCount; f++)
             {
@@ -3366,6 +3763,11 @@ namespace BetterBannerlordNavmeshing
                     faces[fk] = 1;
                 }
 
+                double fp = result.VertsXyz != null
+                    ? FootprintM2(result.VertsXyz, a, b, c) : 1.0;
+                if (fp <= 0) inverted++;
+                if (fp <= NavMeshCleanup.MinGroundFootprintM2) vertical++;
+
                 AddEdgeMult(edgeMult, a, b);
                 AddEdgeMult(edgeMult, b, c);
                 AddEdgeMult(edgeMult, c, a);
@@ -3379,14 +3781,138 @@ namespace BetterBannerlordNavmeshing
                 if (kv.Value > maxMult) maxMult = kv.Value;
             }
 
+            var qualityWatch = System.Diagnostics.Stopwatch.StartNew();
+            int selfOverlaps = 0;
+            if (result.VertsXyz != null)
+            {
+                var triList = new List<int>(tris);
+                int totalOverlaps;
+                selfOverlaps = ScanSelfOverlaps(result.VertsXyz, triList, faceCount,
+                    SelfOverlapSameLevelMeters, null, true, out totalOverlaps);
+                result.OverlappingFacesAny = totalOverlaps;
+            }
+            int badQuads = CheckQuadWalks(result, quadPairs);
+            result.FaceQualityMs = (int)qualityWatch.ElapsedMilliseconds;
+
             result.EdgeCount = edgeMult.Count;
             result.BoundaryEdges = boundary;
             result.MaxEdgeMultiplicity = maxMult;
             result.DuplicateFaces = dupFaces;
             result.SelfLoops = selfLoops;
             result.RequiredEdges = (3 * faceCount + boundary) / 2;
+            result.InvertedFaces = inverted;
+            result.VerticalFaces = vertical;
+            result.SelfOverlapPairs = selfOverlaps;
+            result.BadQuadWalks = badQuads;
+            // SelfOverlapPairs is deliberately NOT part of the verdict, and that is a measured decision, not
+            // an oversight: clearing it costs real coverage. The repair drops the redundant face of every
+            // vertex-disjoint overlapping pair whose removal keeps the island count - and on CC_20 every
+            // remaining pair sits on a ONE-FACE-WIDE neck, where dropping either face disconnects the
+            // surface (measured: dropping the 64 edge-sharing slivers takes the map from 15 islands to
+            // 51, which the engine would turn into 36 fragments). So the class is measured, reported and
+            // repaired as far as connectivity allows, and the count goes on the invariants line so a
+            // regression is visible instead of silent. The malformed-face classes below are hard.
             result.InvariantsPassed = maxMult <= 2 && dupFaces == 0 && selfLoops == 0
-                && result.EdgeCount >= result.RequiredEdges;
+                && result.EdgeCount >= result.RequiredEdges
+                && inverted == 0 && vertical == 0 && badQuads == 0;
+        }
+
+        // Re-derives every emitted quad's boundary walk exactly the way the writer and the merge stage do,
+        // and refuses anything that is not a simple 4-cycle with the surface's winding and XZ convexity.
+        // MergeQuads already enforces all of it; this is the independent second opinion the export gate
+        // needs, because the writer trusts QuadPairs completely.
+        private static int CheckQuadWalks(VoxelMeshResult result, int[] quadPairs)
+        {
+            if (quadPairs == null || quadPairs.Length < 2 || result.VertsXyz == null) return 0;
+            int bad = 0;
+            for (int k = 0; k + 1 < quadPairs.Length; k += 2)
+            {
+                int f0 = quadPairs[k], f1 = quadPairs[k + 1];
+                if (f0 < 0 || f1 < 0 || f0 >= result.FaceCount || f1 >= result.FaceCount || f0 == f1)
+                {
+                    bad++;
+                    continue;
+                }
+                int[] w = QuadWalkOf(result, f0, f1);
+                // four distinct vertices, in a cycle that is not a bowtie (all four corners turn the same way)
+                if (w[0] == w[1] || w[1] == w[2] || w[2] == w[3] || w[3] == w[0]
+                    || w[0] == w[2] || w[1] == w[3])
+                {
+                    bad++;
+                    continue;
+                }
+                double area2 = XzShoelace2(result.VertsXyz, w);
+                double t0 = XzTriArea2(result.VertsXyz, result.Tris, f0);
+                double t1 = XzTriArea2(result.VertsXyz, result.Tris, f1);
+                if (Math.Abs(area2) < 1e-9 || Math.Abs(t0) < 1e-9 || Math.Abs(t1) < 1e-9) { bad++; continue; }
+                if (area2 * t0 <= 0 || area2 * t1 <= 0) { bad++; continue; }   // winding flip
+                bool reflex = false;
+                for (int i = 0; i < 4 && !reflex; i++)
+                {
+                    int ia = w[(i + 3) % 4], ib = w[i], ic = w[(i + 1) % 4];
+                    double cr = (result.VertsXyz[ib * 3] - result.VertsXyz[ia * 3])
+                        * (double)(result.VertsXyz[ic * 3 + 2] - result.VertsXyz[ia * 3 + 2])
+                        - (result.VertsXyz[ib * 3 + 2] - result.VertsXyz[ia * 3 + 2])
+                        * (double)(result.VertsXyz[ic * 3] - result.VertsXyz[ia * 3]);
+                    if (cr * area2 <= 0) reflex = true;                        // reflex or flat corner
+                    if (SegsCrossXZ(result.VertsXyz, w[0], w[1], w[2], w[3])
+                        || SegsCrossXZ(result.VertsXyz, w[1], w[2], w[3], w[0])) reflex = true;
+                }
+                if (reflex) bad++;
+            }
+            return bad;
+        }
+
+        // The 4-vertex boundary walk of the quad formed by two triangles sharing the edge (u,w): with the
+        // shared edge directed along f0's winding, the walk is q -> x -> p -> y. Same derivation as
+        // NavMeshCleanup.MergeQuads and Nmg8Writer.BuildQuad.
+        private static int[] QuadWalkOf(VoxelMeshResult result, int f0, int f1)
+        {
+            int[] t = result.Tris;
+            int a0 = t[f0 * 3], b0 = t[f0 * 3 + 1], c0 = t[f0 * 3 + 2];
+            int a1 = t[f1 * 3], b1 = t[f1 * 3 + 1], c1 = t[f1 * 3 + 2];
+            int p, q, x;
+            if (Shares(a0, b0, a1, b1, c1)) { p = a0; q = b0; x = c0; }
+            else if (Shares(b0, c0, a1, b1, c1)) { p = b0; q = c0; x = a0; }
+            else { p = c0; q = a0; x = b0; }
+            int y = a1 != p && a1 != q ? a1 : (b1 != p && b1 != q ? b1 : c1);
+            return new int[] { q, x, p, y };
+        }
+
+        private static bool Shares(int u, int w, int a, int b, int c)
+        {
+            return (u == a || u == b || u == c) && (w == a || w == b || w == c);
+        }
+
+        private static double XzShoelace2(float[] xyz, int[] w)
+        {
+            double s = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+                int a = w[i], b = w[(i + 1) % 4];
+                s += (double)xyz[a * 3] * xyz[b * 3 + 2] - (double)xyz[b * 3] * xyz[a * 3 + 2];
+            }
+            return s;
+        }
+
+        private static double XzTriArea2(float[] xyz, int[] tris, int f)
+        {
+            int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+            return (double)xyz[a * 3] * xyz[b * 3 + 2] - (double)xyz[b * 3] * xyz[a * 3 + 2]
+                 + (double)xyz[b * 3] * xyz[c * 3 + 2] - (double)xyz[c * 3] * xyz[b * 3 + 2]
+                 + (double)xyz[c * 3] * xyz[a * 3 + 2] - (double)xyz[a * 3] * xyz[c * 3 + 2];
+        }
+
+        private static bool SegsCrossXZ(float[] xyz, int a, int b, int c, int d)
+        {
+            double ax = xyz[a * 3], az = xyz[a * 3 + 2], bx = xyz[b * 3], bz = xyz[b * 3 + 2];
+            double cx = xyz[c * 3], cz = xyz[c * 3 + 2], dx = xyz[d * 3], dz = xyz[d * 3 + 2];
+            double d1 = (bx - ax) * (cz - az) - (bz - az) * (cx - ax);
+            double d2 = (bx - ax) * (dz - az) - (bz - az) * (dx - ax);
+            double d3 = (dx - cx) * (az - cz) - (dz - cz) * (ax - cx);
+            double d4 = (dx - cx) * (bz - cz) - (dz - cz) * (bx - cx);
+            return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+                && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
         }
 
         private static void AddEdgeMult(Dictionary<long, int> map, int a, int b)
