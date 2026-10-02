@@ -167,6 +167,9 @@ namespace BetterBannerlordNavmeshing
             public float HoleRise;      // ... its rise (m)
             public float HoleSlopeDeg;  // ... its implied slope
             public int HoleCount;       // how many holes hit that reason
+            public float FlightSlopeDeg;   // the flight's implied slope over its whole supported run
+            public int SteepTris;          // the prop's own triangles steeper than the navigable cap
+            public int TreadTris;          // ... and the walkable (tread/rung) ones
             public int Counter;         // which Result counter this skip bumped (1 flat, 2 steep, 3 long,
                                         // 4 capped, 5 no-holes) so it can be undone if a fallback runs
             public int Instances = 1;   // how many props folded into this line
@@ -562,6 +565,10 @@ namespace BetterBannerlordNavmeshing
               .Append(" z=[").Append(Num(s.ZMin)).Append("..").Append(Num(s.ZMax)).Append("]")
               .Append(" runSpan=").Append(Num(s.RunSpan)).Append("m stations=").Append(s.Supported)
               .Append("/").Append(s.Stations);
+            if (s.FlightSlopeDeg > 0f)
+                sb.Append(" flightSlope=").Append(Num(s.FlightSlopeDeg)).Append("deg");
+            if (s.SteepTris > 0)
+                sb.Append(" steepTris=").Append(s.SteepTris).Append(" treads=").Append(s.TreadTris);
             if (s.Instances > 1) sb.Append(" (x").Append(s.Instances).Append(" props)");
             return sb.ToString();
         }
@@ -668,6 +675,7 @@ namespace BetterBannerlordNavmeshing
             var cz = new float[triCount];
             var topZ = new float[triCount];
             var compactOf = new int[triCount];
+            var origOf = new int[triCount];
             int used = 0;
             float zMin = float.MaxValue, zMax = float.MinValue;
             for (int t = 0; t < triCount; t++)
@@ -687,6 +695,7 @@ namespace BetterBannerlordNavmeshing
                 cz[used] = z;
                 topZ[used] = tz;
                 compactOf[t] = used;
+                origOf[used] = t;
                 if (bz < zMin) zMin = bz;
                 if (tz > zMax) zMax = tz;
                 used++;
@@ -695,6 +704,17 @@ namespace BetterBannerlordNavmeshing
             skip.Tris = used;
             skip.ZMin = zMin;
             skip.ZMax = zMax;
+            // How the prop's own collision is built up: a flight is treads (walkable tops) PLUS risers /
+            // walls / stringers (faces steeper than anything a Recast build keeps walkable). The ratio is
+            // what separates a real stepped flight - thin treads separated by steep faces - from a solid
+            // ramp, and it is reported on every skip line so the decision is visible.
+            for (int k = 0; k < used; k++)
+            {
+                int ot = origOf[k] * 3;
+                if (TriSlopeDegrees(p, p.Tris[ot], p.Tris[ot + 1], p.Tris[ot + 2]) > slopeCapDegrees)
+                    skip.SteepTris++;
+                else skip.TreadTris++;
+            }
             if (zMax - zMin < MinRiseMeters)
             {
                 r.SkippedFlat++;
@@ -844,6 +864,12 @@ namespace BetterBannerlordNavmeshing
                     return;
                 return;
             }
+            skip.Supported = sup.Count;
+            // The flight's implied slope: its own envelope rise over the horizontal distance its bottom
+            // and top supported stations' centres are apart. This is the number that says whether the
+            // TREADS can be the path (a flight at or under the walkable cap) or whether the flight has to
+            // be carried by a synthesized chain, and it is reported on every skip line.
+            skip.FlightSlopeDeg = FlightSlopeDegrees(stX, stY, stZ, sup, runSpan);
 
             // -------- holes: maximal stretches of the run where the prop supplies NO collision. A ramp
             // chunk bridges exactly one hole - from the last supported station before it to the first
@@ -1096,6 +1122,41 @@ namespace BetterBannerlordNavmeshing
             tx = hx / hn; ty = hy / hn;
             return true;
         }
+        // The face's own angle from horizontal, in degrees (90 = exactly vertical). Used to split a
+        // prop's collision into treads (walkable tops) and risers/walls (anything steeper than the build
+        // can keep walkable) - the shape signature of a real stepped flight.
+        private static float TriSlopeDegrees(Prop p, int i0, int i1, int i2)
+        {
+            float ax = p.VertsXyz[i0 * 3], ay = p.VertsXyz[i0 * 3 + 1], az = p.VertsXyz[i0 * 3 + 2];
+            float bx = p.VertsXyz[i1 * 3], by = p.VertsXyz[i1 * 3 + 1], bz = p.VertsXyz[i1 * 3 + 2];
+            float cx = p.VertsXyz[i2 * 3], cy = p.VertsXyz[i2 * 3 + 1], cz = p.VertsXyz[i2 * 3 + 2];
+            double ux = bx - ax, uy = by - ay, uz = bz - az;
+            double wx = cx - ax, wy = cy - ay, wz = cz - az;
+            double nx = uy * wz - uz * wy;
+            double ny = uz * wx - ux * wz;
+            double nz = ux * wy - uy * wx;
+            double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (len < 1e-12) return 0f;
+            double ay2 = Math.Abs(ny) / len;
+            if (ay2 > 1.0) ay2 = 1.0;
+            return (float)(Math.Acos(ay2) * 180.0 / Math.PI);
+        }
+
+        // The flight's PITCH: its envelope rise over the prop's own horizontal run extent along the flight's
+        // direction (RunSpan), NOT over the straight-line distance between its bottom and top stations.
+        // A switchback flight climbs two legs that end up back beside each other, so the net chord is
+        // short and would report a gentle slope for a flight that is really steep (measured on CC_20:
+//        european_castle_corner_c_l3_stairs reads 37deg as a chord and 64deg as a pitch). The pitch is
+        // what says whether the treads alone can carry an agent, so that is what is measured.
+        private static float FlightSlopeDegrees(float[] stX, float[] stY, float[] stZ, List<int> sup,
+            float runSpan)
+        {
+            if (sup == null || sup.Count < 2) return 0f;
+            float rise = stZ[sup[sup.Count - 1]] - stZ[sup[0]];
+            if (runSpan < 1e-3f) return 90f;
+            return (float)(Math.Atan2(rise, runSpan) * 180.0 / Math.PI);
+        }
+
         private static int BandOf(float z, float zMin, int bandCount)
         {
             int b = (int)((z - zMin) / LayerHeightMeters);
