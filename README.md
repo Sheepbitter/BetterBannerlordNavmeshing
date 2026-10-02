@@ -18,6 +18,7 @@ heights from the scene itself (editor first; in-game hotkey as an experimental s
 | `SceneTerrainSampler.cs` | Reads a scene's **live in-memory** terrain into a flat height grid (bulk per-node API, with point-sampling fallback + validation). |
 | `SceneNavMeshExporter.cs` | **Editor (primary).** `ScriptComponentBehavior` with an `Export NavMesh` button; also hosts the shared pipeline `RunPipeline(...)`. |
 | `SceneNavMeshMissionLogic.cs` | **EXPERIMENTAL in-game path (secondary).** `MissionLogic`; hotkey `~`, deferred to the next tick. Singleplayer only. |
+| `NavMeshPrefabIndex.cs` | **Managed mirror of the engine's navmesh-prefab index** (see `NavMeshPrefabIndex.md` for the full disassembly record). Decides whether `Scene.ImportNavigationMeshPrefab` is worth calling at all, and says exactly why not. Rule: a name resolves **only** if a **loaded** module (`Utilities.GetModulesNames()` - the `_MODULES_*A*B*_MODULES_` list, matched by each module's `SubModule.xml` `<Id>`, *not* by folder name) already had `Modules\<M>\NavMeshPrefabs\<name>.bin` when the engine built its index at start-up. Anything else is skipped, which is what keeps the engine's own `No navigation mesh prefab was found with name "<name>"!` out of the log. When the scene's own module is **not** loaded, the same bin is additionally written to this module's `NavMeshPrefabs` (loaded by definition, folder created by `build.ps1`) so the name works from the **next** editor start. |
 | `NavMeshLog.cs` | Per-session **log file** (+ console mirror). In-editor console output is invisible; this is the real trace. See Logs. |
 
 ## Build & install
@@ -71,12 +72,25 @@ validation lines are the proof that the mesh matches what is currently in the ed
 Buttons: **Export NavMesh** (full pipeline), **Import Only** (imports the already-written prefab - no sampling
 or build), **Probe Geometry** (collision-geometry diagnostic, see Probe Geometry).
 
-**Freshly written prefab workflow.** The engine builds its navmesh-prefab list at **startup**, so the first
-Export cannot find the prefab it just wrote (the log shows `import warning`). Then either:
+**Freshly written prefab workflow.** The engine builds its navmesh-prefab list at **startup**, from the
+`*.bin` files that already exist in the `NavMeshPrefabs` folder of every module the editor **loaded**
+(launcher -> `_MODULES_*A*B*_MODULES_` -> `Utilities.GetModulesNames()`). Two rules follow, and the
+`prefab index:` log block says which one you hit:
 
-1. Export (writes the bin) -> **restart the editor** -> **Import Only** (fast; imports the existing prefab,
-   no rebuild), or
-2. Export -> restart -> **Export** again (also works - it just rebuilds and rewrites the same bin).
+* **The name is new** (`absent` in the block): the first Export cannot find the prefab it just wrote. Then
+  either: (1) Export (writes the bin) -> **restart the editor** -> **Import Only** (fast; imports the existing
+  prefab, no rebuild), or (2) Export -> restart -> **Export** again (also works - it just rebuilds and
+  rewrites the same bin).
+* **The bin exists but its module is not loaded** (`FOUND-inactive` in the block): the scene lives in a
+  module that is not enabled in the launcher, or in a folder that is not a module at all (no
+  `SubModule.xml`). The engine never scanned it, so the name can never resolve there - restarting does not
+  help. The tool therefore **also writes the same bin into this module's `NavMeshPrefabs`** (kept as a
+  copy; the canonical one stays in the scene's module, which is what the game and the dedicated server
+  load), logs
+  `import SKIPPED ... scene module not active ... wrote a copy to 'BetterBannerlordNavmeshing' - restart the
+  editor once, then Import Only`, and stops there. **Restart the editor once**, then **Import Only** works -
+  and from then on in-session imports of that name are normal. Enabling the scene's module in the launcher is
+  the other fix, and the only one that makes the *game* and the dedicated server find the prefab too.
 
 ### In-game (experimental, secondary)
 
@@ -142,7 +156,13 @@ Then the mesher/import lines (same as Build 3):
 NavMesh: build done: samples=... V=... E=... F=... culled(slope=...,height=...) z=[...] binBytes=... elapsedMs=...
 NavMesh: prefab name: <scene>_navmesh (scene-derived default)
 NavMesh: folder: module containing the scene: ...\Modules\<Mod>
-NavMesh: folder resolved: ...\Modules\<Mod>\NavMeshPrefabs
+NavMesh: prefab index: folder=...\Modules\<Mod>\NavMeshPrefabs folderExistedBefore=<bool> binExistedBefore=<bool> module=<Mod> moduleId='<id>' moduleActive=<bool|unknown>
+NavMesh: prefab index: name='<scene>_navmesh' length=<n> ok
+NavMesh: prefab index: loaded modules: TaleWorlds.Engine.Utilities.GetModulesNames() (native get_modules_code, ...)
+NavMesh: prefab index:   FOUND          ...\Modules\<Mod>\NavMeshPrefabs\<scene>_navmesh.bin module=<Mod> moduleId='<id>' loaded=True indexed=True  <- this run
+NavMesh: prefab index:   FOUND-inactive ...\Modules\<Other>\NavMeshPrefabs\<scene>_navmesh.bin module=<Other> moduleId='<id>' loaded=False indexed=False (module-not-loaded)
+NavMesh: prefab index: verdict: 1 of 2 existing copies of '<scene>_navmesh' are in the engine's index (<n> module folder(s) scanned)
+NavMesh: prefab index: write folder: ...\Modules\<Mod>\NavMeshPrefabs (module '<Mod>', moduleId '<id>', is loaded in this session, ...)
 NavMesh: writing bin: ...\<scene>_navmesh.bin
 NavMesh: existing navmesh faces: N
 NavMesh: importing prefab '<scene>_navmesh' (shift 0)...
@@ -152,10 +172,22 @@ NavMesh: <F> faces, <V> vertices, <E> edges (culled: <S> slope, <H> height)
 NavMesh: bin written: ...\<scene>_navmesh.bin
 NavMesh: faces imported into scene as '<scene>_navmesh' (static).
 NavMesh: import check: existing=<before> afterImport=<after> clearExisting=<bool> increased=<bool>
-NavMesh: import warning: the engine's prefab list is built at startup; if this prefab was just written, restart the editor and press Export again (or use the navmesh panel -> Import faces from prefabs).
+NavMesh: import warning: no faces appeared. Either this prefab name was not in the engine's index (it is built from the *.bin files that existed, in the modules that were loaded, when the modules loaded; nothing re-runs it - look for a 'FOUND-inactive' or 'FOUND-new' line above), or the imported bin was empty for this scene.
 NavMesh: timings: buildMs=<n> writeMs=<n> objMs=<n|0> clearMs=<n> importMs=<n> facesAfterMs=<n>
 NavMesh: done: totalMs=<n> bin=<n> bytes V=<v> E=<e> F=<f>
 ```
+
+The `prefab index:` block is the mirror of the engine's own index (see
+`NavMeshPrefabIndex.md`). Read it before anything else when an import misbehaves:
+
+- `loaded=True indexed=True` - the engine can and will resolve this name. If faces still do not appear, the
+  bin is empty for this scene.
+- `FOUND-inactive` - the bin is on disk but its module is not loaded in this session. The engine never
+  scanned it; the tool copies the bin into this module and skips the import (see *Freshly written prefab
+  workflow*).
+- `FOUND-new` - the bin was written by this session, so it is not in the index yet; restart the editor.
+- `FOUND-unchecked` - the loaded-module set could not be read (the engine was not up); nothing is vetoed.
+- `moduleActive=unknown` on the `folder=` line, or `loaded modules: UNKNOWN`, means the same thing.
 
 `import check` compares the face count before the run with the count after the import:
 `existing=<before>` is read before anything runs, `afterImport=<after>` after the import call. When clearing is
@@ -271,7 +303,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
 | `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the whole emitted mesh (terrain **and** structures), so it does not intersect either. 0 = as flush as the voxel lattice allows. |
 | `NavMeshPrefabName` | `""` | Defaults to `<scene name>_navmesh`. |
-| `NavMeshExportFolder` | `""` | Override for the output folder (must be a loaded module's `NavMeshPrefabs` for the import to find it). |
+| `NavMeshExportFolder` | `""` | Override for the output folder. It must be the `NavMeshPrefabs` of a **loaded** module (has a `SubModule.xml` **and** is enabled in the launcher) for the in-editor import to find it; the `prefab index:` block reports `loaded=` per module. When the resolved folder's module is not loaded, the bin is additionally copied into this module's `NavMeshPrefabs` (see *Freshly written prefab workflow*). |
 | `NavMeshClearExistingFaces` | `true` | Clears existing faces before import (only when faces exist). |
 | `NavMeshImportIntoScene` | `true` | Set false to only write the file. |
 | `NavMeshWriteObj` | `false` | Also writes a `.obj` next to the bin (includes the offset). |
@@ -1425,6 +1457,16 @@ effective walkable slope falls short of `NavMeshMaxSlopeDegrees`.
   written in the current session is not found on the first attempt. **Restart the editor**, then press
   **Import Only** (no rebuild) or **Export** again - verified behaviour: the second attempt after a restart
   imports the whole map in ~2-3 s. Alternatively: navmesh panel -> *Import faces from prefabs*.
+  The tool detects this itself (the `prefab index:` mirror) and logs `import SKIPPED` with the reason instead
+  of calling the importer, so this failure mode is reported, not silent.
+- **`import SKIPPED ... scene module not active`** (or a `FOUND-inactive` line in the `prefab index:` block):
+  the scene's module is not loaded in this editor session - not enabled in the launcher, or not a module at
+  all (folder without `SubModule.xml`; the engine keys modules by `<Id>`, which is also not always the folder
+  name - e.g. `Modules\MyMaps` has `Id="My Maps"`). The engine's index is built from the loaded modules only,
+  so the name can never resolve from there. The tool writes a copy into
+  `Modules\BetterBannerlordNavmeshing\NavMeshPrefabs` (it logs `fallback bin written: ...`); **restart the
+  editor once**, then **Import Only**. To make the *game* and the dedicated server pick the prefab up as well,
+  enable the scene's module in the launcher - the canonical bin is and stays in the scene's own module.
 - `fallback=True` in `grid ready`: the bulk per-node read failed validation (look for `bulk read failed:` /
   `NEITHER order matches` above it). The point-sampled grid is still correct, just slower.
 - **No log file**: check `NavMeshWriteLogFile` is `true`; the `log file:` path is printed at the top of the run

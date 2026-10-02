@@ -49,12 +49,20 @@ Write-Host ""
 #
 # The engine only ever looks for navmesh prefabs in a Modules\<Module>\NavMeshPrefabs
 # folder, and it builds its name -> module index once, while the modules load
-# (TaleWorlds.Native.dll rva 0x4EBCE0: it walks the loaded modules and registers
-# every *.bin stem found in an existing NavMeshPrefabs folder). A folder created
-# after that point is invisible for the rest of the session, which is what makes
-# a procedural generator log
-#   No navigation mesh prefab was found with name "<name>"!
-# (native rva 0x9795F0, reached via Scene.ImportNavigationMeshPrefab).
+# (TaleWorlds.Native.dll rva 0x4EBCE0: it walks the modules the engine LOADED -
+# the _MODULES_*A*B*_MODULES_ list, i.e. Utilities.GetModulesNames() - and
+# registers every *.bin stem found in an existing NavMeshPrefabs folder). Two
+# things follow, and this folder has to exist because of both:
+#
+#   * A folder created after that point is invisible for the rest of the session,
+#     which is what makes a procedural generator log
+#       No navigation mesh prefab was found with name "<name>"!
+#     (native rva 0x9795F0, reached via Scene.ImportNavigationMeshPrefab).
+#   * This module is the fallback home for scenes whose own module is NOT loaded
+#     in the editor (TerrainNavMeshGenerator.WriteAndImport writes the same bin
+#     here as well, then skips the import and says so). The copy only becomes
+#     resolvable from the NEXT editor start, because the index is built at
+#     start-up - so the folder must exist before start-up, not after.
 #
 # The folder is therefore created here, at deploy time, so it exists before the
 # engine ever starts. A .txt inside it is not a *.bin, so it registers nothing; it
@@ -68,7 +76,8 @@ Navmesh prefabs are read from this folder.
 
 The engine resolves a navmesh prefab name to a module by scanning
 Modules\<Module>\NavMeshPrefabs\*.bin once, while the modules are loading, and it
-keeps that list for the whole session. Two consequences:
+keeps that list for the whole session. It only scans the modules the game/editor
+actually loaded. Three consequences:
 
   * This folder must exist before the game/editor starts. If it is created later
     (for example by the first export that resolves to this module), every bin
@@ -76,8 +85,12 @@ keeps that list for the whole session. Two consequences:
     editor or reload modules.
   * A prefab name that did not exist when the index was built can never be
     resolved in that session, however many times its .bin is rewritten.
+  * A bin that sits in a module that is NOT loaded in this session can never be
+    resolved, in this session or any later one, until that module is enabled.
     build.ps1 creates this folder; TerrainNavMeshGenerator writes <prefab>.bin
-    into it and logs a "prefab index:" block saying whether the name resolves.
+    here as well in that case (and still keeps the canonical copy in the scene's
+    own module), then logs "import SKIPPED" and asks for one restart before
+    Import Only works.
 '@
     Set-Content -LiteralPath $navMeshPrefabsReadme -Value $navMeshPrefabsText -Encoding UTF8
 }

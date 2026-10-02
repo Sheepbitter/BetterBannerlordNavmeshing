@@ -283,20 +283,26 @@ namespace BetterBannerlordNavmeshing
                 string folder = TerrainNavMeshGenerator.ResolveFolder(scene, NavMeshExportFolder, log);
                 log("import only: prefab='" + prefabName + "' folder=" + folder);
 
-                // Same resolvability guard as the export half. Import Only exists
-                // for the "export once, restart the editor, import" loop, so the
-                // bin is normally there; when it is not, calling the importer would
-                // only make the engine log 'No navigation mesh prefab was found with
-                // name "..."!' and add nothing.
-                string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
-                bool folderExisted = System.IO.Directory.Exists(folder);
-                bool binExisted = System.IO.File.Exists(binPath);
-                log("prefab index: folderExistedBefore=" + folderExisted
-                    + " binExistedBefore=" + binExisted);
-                NavMeshPrefabIndex.DescribeLookup(log, prefabName, folder);
+                // Same resolvability guard as the export half, from the same
+                // mirror. Import Only exists for the "export once, restart the
+                // editor, import" loop, so the bin is normally there; when the name
+                // is not a key in the engine's index - most often because the
+                // scene's module is not loaded in this session, and the copy the
+                // export wrote into a loaded module only became a key at the last
+                // start-up - calling the importer would only make the engine log
+                // 'No navigation mesh prefab was found with name "..."!' and add
+                // nothing.
+                NavMeshPrefabIndex.Analysis analysis = NavMeshPrefabIndex.Analyze(prefabName, folder);
+                log("prefab index: folderExistedBefore=" + analysis.FolderExistedBefore
+                    + " binExistedBefore=" + analysis.CanonicalBinExistedBefore
+                    + " module=" + (analysis.CanonicalModuleId ?? "?")
+                    + " moduleId='" + (analysis.CanonicalSubModuleId ?? "") + "'"
+                    + " moduleActive=" + (analysis.CanonicalModuleActiveKnown
+                        ? analysis.CanonicalModuleActive.ToString()
+                        : "unknown"));
+                NavMeshPrefabIndex.DescribeLookup(log, analysis);
 
-                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(
-                    log, prefabName, folder, folderExisted, binExisted);
+                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(log, analysis);
                 if (unresolvable != null)
                 {
                     log("import SKIPPED (the engine cannot resolve this prefab name in this"
@@ -362,9 +368,9 @@ namespace BetterBannerlordNavmeshing
             if (!increased)
             {
                 log("import warning: no faces appeared. Either this prefab name was not in the engine's"
-                    + " index (it is built from the *.bin files that existed when the modules were loaded,"
-                    + " and nothing re-runs it), or the imported bin was empty for this scene. See the"
-                    + " 'prefab index:' lines above for where the engine looked.");
+                    + " index (it is built from the *.bin files that existed, in the modules that were"
+                    + " loaded, when the modules loaded; nothing re-runs it - look for a 'FOUND-inactive'"
+                    + " or 'FOUND-new' line above), or the imported bin was empty for this scene.");
             }
         }
 
@@ -779,6 +785,9 @@ namespace BetterBannerlordNavmeshing
                     + result.CulledByHeight + " height)");
                 log("bin written: " + result.BinPath);
 
+                if (!string.IsNullOrEmpty(result.FallbackBinPath))
+                    log("fallback bin written: " + result.FallbackBinPath);
+
                 if (!string.IsNullOrEmpty(result.ObjPath))
                     log("OBJ written: " + result.ObjPath);
 
@@ -1052,6 +1061,9 @@ namespace BetterBannerlordNavmeshing
                     + result.EdgeCount + " edges (culled: " + result.CulledBySlope + " slope, "
                     + result.CulledByHeight + " height)");
                 log("bin written: " + result.BinPath);
+
+                if (!string.IsNullOrEmpty(result.FallbackBinPath))
+                    log("fallback bin written: " + result.FallbackBinPath);
 
                 if (!string.IsNullOrEmpty(result.ObjPath))
                     log("OBJ written: " + result.ObjPath);

@@ -942,6 +942,13 @@ namespace BetterBannerlordNavmeshing
         public sealed class ExportResult
         {
             public string BinPath;
+
+            // Non-null when the scene's own module is not loaded in this session,
+            // in which case the canonical BinPath can never be resolved by the
+            // engine and the same bytes were also written to a LOADED module's
+            // NavMeshPrefabs so the name works from the next editor start.
+            public string FallbackBinPath;
+
             public string ObjPath;          // null unless an OBJ was written
             public string PrefabName;
             public int VertexCount;
@@ -1039,22 +1046,32 @@ namespace BetterBannerlordNavmeshing
             string prefabName = ResolvePrefabName(scene, prefabNameOverride, log);
             string folder = ResolveFolder(scene, folderOverride, log);
 
-            // Snapshot the two facts that decide whether the engine can resolve
-            // this name at all, BEFORE anything is created on disk:
-            //   - did the NavMeshPrefabs folder already exist? The native index
-            //     only ever looks at modules that HAVE one;
-            //   - did <name>.bin already exist? If it did, the name was in the
-            //     index when it was built and rewriting the file keeps it there.
-            bool folderExisted = Directory.Exists(folder);
-            string binPath = System.IO.Path.Combine(folder, prefabName + ".bin");
-            bool binExistedBefore = File.Exists(binPath);
+            // Snapshot everything that decides whether the engine can resolve this
+            // name at all, BEFORE anything is created on disk. The native index
+            // (rva 0x4EBCE0) walks the modules the engine LOADED and, for each
+            // module that has a NavMeshPrefabs folder, registers every *.bin stem
+            // it finds at that moment - so a name is a key only if a loaded module
+            // already had the bin when the index was built. The mirror answers
+            // exactly that, and it also picks the folder for a fallback copy when
+            // the scene's own module is not loaded (see NavMeshPrefabIndex).
+            NavMeshPrefabIndex.Analysis analysis = NavMeshPrefabIndex.Analyze(prefabName, folder);
+
+            string binPath = analysis.CanonicalBinPath;
+            bool folderExisted = analysis.FolderExistedBefore;
+            bool binExistedBefore = analysis.CanonicalBinExistedBefore;
 
             if (log != null)
                 log("prefab index: folder=" + folder
                     + " folderExistedBefore=" + folderExisted
-                    + " binExistedBefore=" + binExistedBefore);
+                    + " binExistedBefore=" + binExistedBefore
+                    + " module=" + (analysis.CanonicalModuleId ?? "?")
+                    + " moduleId='" + (analysis.CanonicalSubModuleId ?? "") + "'"
+                    + " moduleActive="
+                    + (analysis.CanonicalModuleActiveKnown
+                        ? analysis.CanonicalModuleActive.ToString()
+                        : "unknown"));
 
-            NavMeshPrefabIndex.DescribeLookup(log, prefabName, folder);
+            NavMeshPrefabIndex.DescribeLookup(log, analysis);
 
             Directory.CreateDirectory(folder);
 
@@ -1064,6 +1081,44 @@ namespace BetterBannerlordNavmeshing
             File.WriteAllBytes(binPath, mesh.Bin);
             writeWatch.Stop();
             writeMs = writeWatch.ElapsedMilliseconds;
+
+            // The engine's index only ever saw the modules the editor loaded. When
+            // the scene's own module is not one of them, a prefab written there can
+            // never be looked up - not by the game either, and not by the dedicated
+            // server, which load the scene's module only if it is enabled there. So
+            // the canonical copy stays exactly where it is (that is what a correct
+            // install reads), and the SAME bytes are also written into a loaded
+            // module's NavMeshPrefabs so the name can be imported in the editor
+            // from the next start onwards.
+            string fallbackBinPath = null;
+            if (!string.IsNullOrEmpty(analysis.FallbackBinPath))
+            {
+                try
+                {
+                    Directory.CreateDirectory(analysis.FallbackFolder);
+                    fallbackBinPath = analysis.FallbackBinPath;
+                    if (log != null)
+                        log("writing fallback bin: " + fallbackBinPath
+                            + " (the scene's own module is not loaded, so only a copy in a loaded module"
+                            + " can be imported in this editor)");
+                    File.WriteAllBytes(fallbackBinPath, mesh.Bin);
+                }
+                catch (Exception ex)
+                {
+                    fallbackBinPath = null;
+                    if (log != null)
+                        log("fallback bin write failed (the canonical bin is unaffected): "
+                            + ex.Message);
+                }
+            }
+
+            // Both bins are now on disk. A bin that was already a key in the
+            // engine's index stays one; a bin that was not becomes known only to
+            // the next engine start, and is remembered as such for this session
+            // so a second Export in the same session does not pretend otherwise.
+            NavMeshPrefabIndex.MarkBinWritten(binPath, IsIndexed(analysis, binPath));
+            if (fallbackBinPath != null)
+                NavMeshPrefabIndex.MarkBinWritten(fallbackBinPath, IsIndexed(analysis, fallbackBinPath));
 
             string objPath = null;
             if (writeObj && mesh.ObjText != null)
@@ -1077,6 +1132,7 @@ namespace BetterBannerlordNavmeshing
 
             var result = new ExportResult();
             result.BinPath = binPath;
+            result.FallbackBinPath = fallbackBinPath;
             result.ObjPath = objPath;
             result.PrefabName = prefabName;
             result.VertexCount = mesh.VertexCount;
@@ -1089,21 +1145,22 @@ namespace BetterBannerlordNavmeshing
             if (importIntoScene)
             {
                 // The engine resolves a prefab name through an index it built while
-                // the modules were loading (rva 0x4EBCE0: it walks the loaded
-                // modules, and for each module with a NavMeshPrefabs folder
-                // registers every *.bin stem it finds). There is no managed API to
-                // refresh it and no filesystem fallback: load_nav_mesh_prefab
-                // (rva 0x9795F0) does a case-sensitive lookup and, on a miss, logs
-                // "file not found: <path>" followed by
+                // the modules were loading (rva 0x4EBCE0: it walks the modules the
+                // engine LOADED, and for each of those with a NavMeshPrefabs
+                // folder registers every *.bin stem it finds). There is no managed
+                // API to refresh it and no filesystem fallback:
+                // load_nav_mesh_prefab (rva 0x9795F0) does a case-sensitive lookup
+                // and, on a miss, logs
                 // 'No navigation mesh prefab was found with name "<name>"!'.
                 //
                 // So when we can prove the name was not in the index, calling the
                 // importer would only produce that engine error and import zero
-                // faces. Skip it and say exactly why instead. A bin that already
-                // existed keeps its name registered, so rewriting and re-importing
-                // in the same session still works.
-                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(
-                    log, prefabName, folder, folderExisted, binExistedBefore);
+                // faces. Skip it and say exactly why instead. A bin that a LOADED
+                // module already had keeps its name registered, so rewriting and
+                // re-importing in the same session still works; a bin in a module
+                // that is not loaded never becomes a key, which is what the
+                // fallback copy above works around.
+                string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(log, analysis);
 
                 if (unresolvable != null)
                 {
@@ -1114,6 +1171,12 @@ namespace BetterBannerlordNavmeshing
                             + " session): " + unresolvable);
                         log("import SKIPPED: the .bin at " + binPath + " is correct; it becomes usable"
                             + " once the engine's prefab index has been rebuilt.");
+                        if (fallbackBinPath != null)
+                        {
+                            log("import SKIPPED: the same bytes are at " + fallbackBinPath
+                                + "; that copy becomes resolvable after the restart (the engine indexes"
+                                + " prefabs once, while the modules load).");
+                        }
                     }
                 }
                 else
@@ -1225,6 +1288,24 @@ namespace BetterBannerlordNavmeshing
             result.FacesAfterMs = facesAfterMs;
 
             return result;
+        }
+
+        // "Is <binPath> already a key in the engine's index?" - the mirror's own
+        // verdict, taken from the snapshot Analyze() made before this run wrote
+        // anything. False for a bin that did not exist yet or that this session
+        // already wrote, which is exactly when the engine cannot know the name.
+        private static bool IsIndexed(NavMeshPrefabIndex.Analysis analysis, string binPath)
+        {
+            if (analysis == null || string.IsNullOrEmpty(binPath))
+                return false;
+
+            for (int i = 0; i < analysis.Candidates.Count; i++)
+            {
+                if (string.Equals(analysis.Candidates[i].BinPath, binPath, StringComparison.OrdinalIgnoreCase))
+                    return analysis.Candidates[i].Resolvable;
+            }
+
+            return false;
         }
 
         // prefabNameOverride wins; otherwise the scene name plus "_navmesh".

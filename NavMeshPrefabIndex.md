@@ -276,10 +276,102 @@ to look a module up by id, `iVar6 != -1` -> register it). So the index is
 2. A prefab **name** that was not in a `*.bin` stem at that moment can never be
    resolved in that session, however many times the `.bin` is rewritten.
 3. Rewriting an **existing** bin is fine - same name, same module, still a key.
+4. A bin that lives in a module the engine did **not load** is never a key - not
+   in this session, not in any later session, and no amount of restarting helps.
+   See §3.5.
 
 There is no managed API that re-runs it (`Reload`-shaped members in
 `TaleWorlds.Engine` are all `Preload*`/terrain-reload; `TaleWorlds.ModuleManager`
 exposes only `ModuleHelper` accessors).
+
+### 3.5 "Loaded module" is the `_MODULES_` list, and a module's id is not its folder name
+
+The loop bound is `(*(manager + 0x890) - *(manager + 0x888)) >> 5` - the engine's
+module array, 32-byte stride. What is in that array is the module **code** the
+launcher put on the command line, and the managed side can read the very same
+string, so the mirror does not have to guess:
+
+```csharp
+// TaleWorlds.Engine.Utilities            (editor TaleWorlds.Engine.dll)
+// Token: 0x06000D46 RID: 3398
+public static string[] GetModulesNames()
+{
+    return EngineApplicationInterface.IUtil.GetModulesCode().Split(new char[] { '*' });
+}
+
+// TaleWorlds.Engine.IUtil
+// Token: 0x06000599 RID: 1433
+[EngineMethod("get_modules_code", false, null, false)]
+string GetModulesCode();
+```
+
+`rgl_log*.txt` shows both halves of that in the same session:
+
+```
+[22:21:43.522] Loading xml file: $BASE/Modules/Bannerlord.ButterLib/SubModule.xml.     <- every folder on disk
+...
+[22:21:43.524] Loading xml file: $BASE/Modules/scifi_stuff/SubModule.xml.
+[22:21:43.524] Loading xml file: $BASE/Modules/StoryMode/SubModule.xml.
+[22:21:43.524] Loading xml file: $BASE/Modules/Native/SubModule.xml.                    <- the selected set,
+[22:21:43.524] Loading xml file: $BASE/Modules/SandBoxCore/SubModule.xml.                  in the code's order
+[22:21:43.524] Loading xml file: $BASE/Modules/SandBox/SubModule.xml.
+[22:21:43.524] Loading xml file: $BASE/Modules/CustomBattle/SubModule.xml.
+[22:21:43.524] Loading xml file: $BASE/Modules/StoryMode/SubModule.xml.
+[22:21:43.525] Loading xml file: $BASE/Modules/BetterBannerlordNavmeshing/SubModule.xml.
+[22:21:44.064] Command Args: /singleplayer _MODULES_*Native*SandBoxCore*Sandbox*CustomBattle*StoryMode*BetterBannerlordNavmeshing*_MODULES_
+```
+
+The first block is `ModuleHelper.GetPhysicalModules` (it walks every
+`Modules\*` that has a `SubModule.xml`); the second block is
+`ModuleHelper.InitializeModules(Utilities.GetModulesNames(), null)` filling
+`_loadedModules` - the same array, in the same order, and the same string the
+native module manager was built from:
+
+```csharp
+// TaleWorlds.ModuleManager.ModuleHelper
+public static void InitializeModules(string[] loadedModuleIds, string[] platformModulePaths = null) { ... }
+
+// TaleWorlds.MountAndBlade.Module
+private void OnInitialModuleScreenActivated(bool isFromSplashScreenVideo)
+{
+    ...
+    foreach (ModuleInfo moduleInfo in ModuleHelper.GetModules((ModuleInfo x) => !x.IsActive))
+        this.ActivateModule(moduleInfo.Id);
+    ...
+}
+
+// TaleWorlds.MountAndBlade.Module
+public void ActivateModule(string moduleId)          // -> ModuleHelper.OnModuleActivated -> ModuleInfo.IsActive = true
+```
+
+So in the editor **every** entry of `_loadedModules` ends up `IsActive`, i.e.
+`ModuleHelper.GetActiveModules()` is the engine's loaded set, and
+`Utilities.GetModulesNames()` is the same set as plain ids. `NavMeshPrefabIndex`
+reads the ids (a compile-time reference, no reflection) and maps them to folders
+with `ModuleHelper.GetActiveModules()` / `GetModuleFullPath()` by reflection.
+
+#### The id/folder-name trap
+
+`ModuleHelper._loadedModules` is keyed by `ModuleInfo.Id.ToLower()`, and `Id`
+comes from `SubModule.xml`'s `<Id value="..."/>` - which is **not** always the
+folder name. On this install:
+
+| folder | `<Id>` | `IsModuleActive(folderLeaf)` |
+|---|---|---|
+| `Native` | `Native` | correct by accident |
+| `SandBox` | **`Sandbox`** | correct (id is the same lowercased) |
+| `MyMaps` | **`My Maps`** | **wrong - `false` even while My Maps is loaded** |
+| `Full Invasion 3 mapping` | `FullInvasion3` | wrong |
+| `Full-Invasion-3` | `FullInvasion3 dev` | wrong |
+| `DedicatedCustomServerHelper` | *(no `SubModule.xml`)* | never loadable at all |
+
+The pre-fix mirror passed the folder leaf, which is why the reported run log said
+`module=MyMaps moduleActive=False` while the user's `MyMaps` exports import fine,
+and `module=DedicatedCustomServerHelper moduleActive=False` for a directory that
+is not a module. `NavMeshPrefabIndex` now reads `<Id>` from the candidate's own
+`SubModule.xml` (`ParseModuleId`) and matches on that (with the folder leaf and
+the folder path as secondary matches). A folder with no `SubModule.xml` is
+reported as "not even a module".
 
 ---
 
@@ -289,10 +381,20 @@ exposes only `ModuleHelper` accessors).
 |---|-------|----------------|
 | A | Our own `ImportNavigationMeshPrefab` called with a name the index has never seen (first export of a new scene, or the target module had no `NavMeshPrefabs` folder until this run) | **us** |
 | B | The derived prefab name is >= 128 characters, so the engine truncates it and can never match the file stem | **us** |
-| C | The bin sits in a module that was not in the loaded-module list when the index was built | partly us (folder resolution) |
+| C | The bin sits in a module that was **not loaded** when the index was built. The scene lives in a module that is not enabled in the editor (or in a folder that is not a module at all), so the engine never scanned it. No restart helps; the file is simply not a key. | partly us (fallback copy into a loaded module), and the user (enable the module) |
 | D | A mission object's `NavMeshPrefabName` (siege prop prefabs) names a prefab no loaded module provides | not us - prefab XML / module set |
 
 D cannot happen while merely editing a scene (it needs a `Mission`).
+
+C is the case the reported run hit: scene `CC_20_siege` lives in
+`Modules\DedicatedCustomServerHelper`, which has **no `SubModule.xml`** - it is
+not a module, so the editor cannot load it, so
+`NavMeshPrefabs\CC_20_siege_navmesh.bin` can never be a key. The old mirror
+scanned all module folders and only asked `IsModuleActive("DedicatedCustomServerHelper")`,
+which returned `false`; because the old skip rule only looked at
+"did the bin exist before this run", and it did (`binExistedBefore=True`), the
+doomed `ImportNavigationMeshPrefab` went ahead and the engine logged
+`No navigation mesh prefab was found with name "CC_20_siege_navmesh"!`.
 
 ---
 
@@ -308,34 +410,67 @@ whether an import call is worth making.
 * `DeriveBoundedName(sceneName, suffix)` - if `scene + "_navmesh"` exceeds 127
   characters it returns `scene[0..keep] + "~" + 8 hex digits` of an FNV-1a hash
   of the full original, always exactly <= 127, stable across runs and machines.
-* `FindCandidates(log, name)` - every `Modules/<M>/NavMeshPrefabs` visible from
-  the game install, with `FolderExists` / `BinExists` / `ModuleActive`. Game
-  roots come from `TerrainNavMeshGenerator.GetGameRootCandidates()` **and** from
-  the folders the loaded `TaleWorlds.*` assemblies came from
+* `QueryActiveModules(log)` - the engine's loaded-module set, as
+  `ActiveModules { Known, Source, Ids, Folders }`. Primary source is
+  `TaleWorlds.Engine.Utilities.GetModulesNames()` (the native `get_modules_code`,
+  a compile-time reference); ids are mapped to folders with
+  `ModuleHelper.GetActiveModules()` / `GetModuleFullPath()` by reflection. If
+  neither answers, `Known` is `false` and nothing is ever vetoed on account of it.
+* `ParseModuleId(subModuleXml)` / `ReadModuleIdFromSubModuleXml(moduleDir)` - the
+  module's real `<Id value="..."/>`, which is what `_loadedModules` is keyed by
+  and is **not** always the folder name (§3.5). `null` when the folder has no
+  `SubModule.xml`, i.e. is not a module at all.
+* `FindCandidates(log, name, active)` - every `Modules/<M>/NavMeshPrefabs`
+  visible from the game install, with `FolderExists` / `BinExistedBefore` /
+  `ModuleActive` / `ModuleActiveKnown` / `ModuleSubModuleId`. Game roots come
+  from `TerrainNavMeshGenerator.GetGameRootCandidates()` **and** from the folders
+  the loaded `TaleWorlds.*` assemblies came from
   (`.../bin/Win64_Shipping_wEditor/` -> its parent), so the scan works even if
-  our assembly is relocated. `ModuleActive` uses
-  `TaleWorlds.ModuleManager.ModuleHelper.IsModuleActive` by reflection and
-  degrades to `unknown`.
-* `DescribeLookup(log, name, folderUsed)` - the log block quoted below.
-* `ExplainUnresolvable(log, name, folder, folderExisted, binExistedBefore)` -
-  `null` when the import is worth attempting, otherwise a one-sentence reason.
+  our assembly is relocated. A candidate is active when its **id** is in the
+  engine's list (folder leaf and folder path accepted as secondary matches).
+* `Candidate.Resolvable` - the mirror's verdict, and the whole rule in one line:
+  a name is a key only if a **loaded** module had that bin **when the index was
+  built**. So `Resolvable == FolderExists && BinExistedBefore && !writtenThisSession
+  && (ModuleActive || !ModuleActiveKnown)`. An unknown loaded set is deliberately
+  *not* a veto, so a build where the engine cannot be asked behaves as it did
+  before this mirror existed.
+* `MarkBinWritten(binPath, alreadyIndexed)` / `IsPendingIndex(binPath)` - a
+  process-wide set of bins this session wrote that the engine's index cannot know
+  about. Without it, a *second* Export in the same session would see its own
+  previous write on disk and wrongly believe the name was already a key. The set
+  dies with the process, which is exactly the lifetime of one engine index.
+* `Analyze(name, folderUsed, active, candidates)` -> `Analysis` - the whole
+  snapshot, taken **before** anything is written: the candidates, the canonical
+  candidate, and `FallbackFolder` / `FallbackBinPath`.
+* `ChooseFallbackModuleId(canonicalModuleId, candidates)` - where a fallback copy
+  goes; see §5.2.
+* `DescribeLookup(log, analysis)` - the log block quoted below.
+* `ExplainUnresolvable(log, analysis)` - `null` when the import is worth
+  attempting, otherwise a one-sentence reason. Order: unusable name -> some
+  candidate is resolvable -> scene module not loaded -> the bin was written this
+  session -> the folder was created this run -> brand new name.
 
 ### 5.2 `TerrainNavMeshGenerator.WriteAndImport`
 
-Before anything touches disk it snapshots the two facts that decide
-resolvability, then writes the bin, then decides:
+Before anything touches disk it takes the mirror's snapshot, then writes, then
+decides:
 
 ```csharp
-bool folderExisted    = Directory.Exists(folder);
-string binPath        = Path.Combine(folder, prefabName + ".bin");
-bool binExistedBefore = File.Exists(binPath);
+NavMeshPrefabIndex.Analysis analysis = NavMeshPrefabIndex.Analyze(prefabName, folder);
+log("prefab index: folder=" + folder + " folderExistedBefore=" + ... + " binExistedBefore=" + ...
+    + " module=" + analysis.CanonicalModuleId + " moduleId='" + analysis.CanonicalSubModuleId
+    + "' moduleActive=" + ...);
+NavMeshPrefabIndex.DescribeLookup(log, analysis);
 Directory.CreateDirectory(folder);
-NavMeshPrefabIndex.DescribeLookup(log, prefabName, folder);
 ... File.WriteAllBytes(binPath, mesh.Bin) ...
 
+// Only when the scene's own module is NOT loaded:
+... File.WriteAllBytes(analysis.FallbackBinPath, mesh.Bin) ...
+NavMeshPrefabIndex.MarkBinWritten(binPath, IsIndexed(analysis, binPath));
+NavMeshPrefabIndex.MarkBinWritten(analysis.FallbackBinPath, IsIndexed(analysis, analysis.FallbackBinPath));
+
 if (importIntoScene) {
-    string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(
-        log, prefabName, folder, folderExisted, binExistedBefore);
+    string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(log, analysis);
     if (unresolvable != null) {
         result.ImportSkipReason = unresolvable;
         // no ClearNavMesh, no ImportNavigationMeshPrefab -> no engine message
@@ -345,42 +480,123 @@ if (importIntoScene) {
 }
 ```
 
-`binExistedBefore == true` is the necessary condition for the name being a key;
-when it is false the engine message is guaranteed, so the call is skipped and the
-reason is logged instead. The `.bin` is still written, so the work is never lost:
-after the index is rebuilt the very next run imports it.
+A bin the engine can resolve must have existed when the index was built **in a
+module the engine loaded**; when that cannot be shown the import is skipped and
+the reason is logged instead of letting the engine print its message. The `.bin`
+is still written, so the work is never lost.
 
-`ResolvePrefabName` now returns `DeriveBoundedName(sceneName, "_navmesh")` for the
+#### The fallback copy
+
+When the scene's own module is known-inactive, the same bytes are **also** written
+to `Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\<name>.bin`, and the
+canonical copy stays in the scene's module (that is the one a correct install -
+game, dedicated server - loads, and the one that should travel with the scene).
+
+That folder, and only that folder, because:
+
+* it is loaded whenever this code can run at all (the DLL only loads with the
+  module), so the name has a chance of resolving;
+* `build.ps1` creates it before the game ever starts, so its stems are indexed
+  from the first start - a folder created later is not;
+* writing into a base-game or third-party module is not acceptable, and
+  `ChooseFallbackModuleId` refuses every other candidate.
+
+If our own module is somehow not loaded there is no safe home, and the skip reason
+says `enable the scene's module in the launcher and restart the editor` instead
+of writing a second copy for nothing.
+
+**The one-restart consequence, stated honestly:** the engine builds its index
+while the modules load, i.e. at start-up. A file written during the session
+cannot be in that index, so the fallback copy is **never** counted as resolvable
+in the session that created it (`MarkBinWritten` remembers it for exactly that
+reason). The flow is therefore:
+
+```
+Export  ->  "scene module not active; wrote a copy to 'BetterBannerlordNavmeshing'
+            - restart the editor once, then Import Only"
+restart editor  ->  the copy is a key
+Import Only (or Export again)  ->  faces appear, and from then on in-session
+                                   imports of that name work normally
+```
+
+`ResolvePrefabName` returns `DeriveBoundedName(sceneName, "_navmesh")` for the
 derived default, which closes cause B. Names that already fit are unchanged, so
 **every already-exported bin stays valid**. An explicit `NavMeshPrefabName`
 override is still honoured verbatim (with a warning if it is unusable).
 
 ### 5.3 `SceneNavMeshExporter`
 
-* `ImportOnlyFromEditor` runs the same resolvability check before calling
-  `ImportNavigationMeshPrefab`.
-* Both "import skipped" sites now print `result.ImportSkipReason` when set.
-* `LogImportCheck`'s warning text was corrected: it used to claim the prefab list
-  is built at startup in general, which is wrong for a rewrite of an existing
-  prefab.
+* `ImportOnlyFromEditor` runs the same `Analyze` / `DescribeLookup` /
+  `ExplainUnresolvable` before calling `ImportNavigationMeshPrefab`, so it reaches
+  the same verdict as the export half.
+* Both "import skipped" sites print `result.ImportSkipReason` when set, and both
+  "bin written" sites print `result.FallbackBinPath` when one was made.
+* `LogImportCheck`'s warning text now names the two log tags that explain a miss
+  (`FOUND-inactive`, `FOUND-new`).
 
 ### 5.4 `build.ps1`
 
 Creates `Modules\BetterBannerlordNavmeshing\NavMeshPrefabs` (plus a `README.txt`
-explaining why it must pre-exist) at deploy time, so our module is in the index
-from the first editor start instead of from the first export. A `.txt` is not a
-`*.bin`, so it registers nothing.
+explaining why it must pre-exist and that it is also the fallback home) at deploy
+time, so our module is in the index from the first editor start instead of from
+the first export. A `.txt` is not a `*.bin`, so it registers nothing.
 
 ### 5.5 Sample log output
 
+**(a) Scene module not loaded - the reported `CC_20_siege` case.** The engine
+message is gone; the reason is in our log instead.
+
 ```
-prefab index: folder=D:\...\Modules\MyMaps\NavMeshPrefabs folderExistedBefore=True binExistedBefore=False
+prefab index: folder=D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs folderExistedBefore=True binExistedBefore=True module=DedicatedCustomServerHelper moduleId='' moduleActive=False
+prefab index: name='CC_20_siege_navmesh' length=19 ok
+prefab index: loaded modules: TaleWorlds.Engine.Utilities.GetModulesNames() (native get_modules_code, the same _MODULES_*...*_MODULES_ list the engine's module manager was built from)
+prefab index:   absent         D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin module=BetterBannerlordNavmeshing moduleId='BetterBannerlordNavmeshing' loaded=True indexed=False (no-bin)
+prefab index:   FOUND-inactive D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs\CC_20_siege_navmesh.bin module=DedicatedCustomServerHelper moduleId='' loaded=False indexed=False (module-not-loaded)  <- this run
+prefab index:   absent         D:\...\Modules\Native\NavMeshPrefabs\CC_20_siege_navmesh.bin module=Native moduleId='Native' loaded=True indexed=False (no-bin)
+prefab index: verdict: 0 of 1 existing copies of 'CC_20_siege_navmesh' are in the engine's index (7 module folder(s) scanned)
+prefab index: write folder: D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs (module 'DedicatedCustomServerHelper' is NOT loaded in this session, and it is not even a module (no SubModule.xml), so it never can be, and the engine's index can therefore never contain a prefab written here; a copy also goes to 'BetterBannerlordNavmeshing')
+prefab index: fallback copy: D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin (module 'BetterBannerlordNavmeshing' is loaded and build.ps1 creates its NavMeshPrefabs folder before the game starts, so the name becomes resolvable from the NEXT editor start; it cannot resolve in this session, whose index was already built)
+writing bin: D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs\CC_20_siege_navmesh.bin
+writing fallback bin: D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin (the scene's own module is not loaded, so only a copy in a loaded module can be imported in this editor)
+import SKIPPED (the engine cannot resolve this prefab name in this session): scene module not active (module 'DedicatedCustomServerHelper' is not loaded in this session, so the engine's prefab index will never contain 'CC_20_siege_navmesh'); wrote a copy to 'BetterBannerlordNavmeshing' - restart the editor once, then Import Only
+import SKIPPED: the .bin at D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs\CC_20_siege_navmesh.bin is correct; it becomes usable once the engine's prefab index has been rebuilt.
+import SKIPPED: the same bytes are at D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin; that copy becomes resolvable after the restart (the engine indexes prefabs once, while the modules load).
+bin written: D:\...\Modules\DedicatedCustomServerHelper\NavMeshPrefabs\CC_20_siege_navmesh.bin
+fallback bin written: D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin
+import skipped; import 'CC_20_siege_navmesh': scene module not active ...
+```
+
+**(b) After the restart, `Import Only`.** The copy is a key, so the import runs
+and faces appear.
+
+```
+prefab index: FOUND          D:\...\Modules\BetterBannerlordNavmeshing\NavMeshPrefabs\CC_20_siege_navmesh.bin module=BetterBannerlordNavmeshing moduleId='BetterBannerlordNavmeshing' loaded=True indexed=True
+prefab index: verdict: 1 of 1 existing copies of 'CC_20_siege_navmesh' are in the engine's index (7 module folder(s) scanned)
+importing prefab 'CC_20_siege_navmesh' (shift 0)...
+import call returned.
+faces after import: 1342
+```
+
+**(c) An active module - unchanged, still plain `FOUND`.** Note `moduleId='My
+Maps'`, which is what the old mirror got wrong.
+
+```
 prefab index: name='mp_tdm_Birtu_v2_navmesh' length=23 ok
-prefab index:   FOUND    D:\...\Modules\MyMaps\NavMeshPrefabs\mp_tdm_Birtu_v2_navmesh.bin module=MyMaps moduleActive=True  <- this run
-prefab index:   absent   D:\...\Modules\Native\NavMeshPrefabs\mp_tdm_Birtu_v2_navmesh.bin module=Native moduleActive=True
-import SKIPPED (the engine cannot resolve this prefab name in this session): no D:\...\mp_tdm_Birtu_v2_navmesh.bin existed before this run, ...
-import SKIPPED: the .bin at D:\...\mp_tdm_Birtu_v2_navmesh.bin is correct; it becomes usable once the engine's prefab index has been rebuilt.
+prefab index:   FOUND          D:\...\Modules\MyMaps\NavMeshPrefabs\mp_tdm_Birtu_v2_navmesh.bin module=MyMaps moduleId='My Maps' loaded=True indexed=True  <- this run
+prefab index: verdict: 1 of 1 existing copies of 'mp_tdm_Birtu_v2_navmesh' are in the engine's index (7 module folder(s) scanned)
+prefab index: write folder: D:\...\Modules\MyMaps\NavMeshPrefabs (module 'MyMaps', moduleId 'My Maps', is loaded in this session, so the engine indexes prefabs written here; no fallback copy is needed)
 ```
+
+### 5.6 Offline tests
+
+`NavMeshPrefabIndex`'s decisions are pure given its inputs, so they are tested
+without the engine: a fixture harness builds a throwaway `Modules\` tree (with
+`MyMaps`/`Id='My Maps'`, `SandBox`/`Id='Sandbox'`, `MapConverter` loaded or not, and
+a `DedicatedCustomServerHelper` with no `SubModule.xml`), then hands
+`Analyze(name, folder, active, candidates)` a hand-built candidate list and
+asserts the mirror, the folder choice, the fallback decision, the skip reasons and
+the log tags - 95 checks. It compiles the repo's `NavMeshPrefabIndex.cs`
+directly, so it cannot drift from the shipped code.
 
 ---
 
@@ -401,6 +617,22 @@ variants, not the client ones that happened to be pre-loaded):
 * `FindCallers(ImportNavigationMeshPrefabWithFrame)` / `(SaveNavMeshPrefabWithFrame)` -> none
 * `Find_Field_References(MissionObject.NavMeshPrefabName)` -> only `..ctor` (write) and the two
   `AttachDynamicNavmeshToEntity` overrides (read)
+* `TaleWorlds.Engine.Utilities.GetModulesNames` RID 3398 ->
+  `IUtil.GetModulesCode().Split('*')`; `IUtil.GetModulesCode` RID 1433,
+  `[EngineMethod("get_modules_code", false, null, false)]`
+* `TaleWorlds.ModuleManager.ModuleHelper`: `IsModuleActive` RID 22 ->
+  `GetModuleInfo(id)?.IsActive`; `GetModuleInfo` RID 17 ->
+  `_loadedModules[moduleId.ToLower()]`; `GetModuleFullPath` RID 16 ->
+  `_loadedModules[id.ToLower()].FolderPath + "/"`; `GetActiveModules` RID 28 ->
+  `GetModules(x => x.IsActive)`; `InitializeModules` RID 20 (fills `_loadedModules`
+  from the `_MODULES_` list, matching on `x.Id.ToLower()`);
+  `GetPhysicalModules` RID 42 (every `Modules\*` with a `SubModule.xml`)
+* `TaleWorlds.ModuleManager.ModuleInfo`: `IsActive` RID 58, `ActivateModule` RID 74
+* `TaleWorlds.MountAndBlade.Module`: `Initialize` (RID 10799) ->
+  `ModuleHelper.InitializeModules(Utilities.GetModulesNames(), null)`;
+  `OnInitialModuleScreenActivated` (RID 10819) -> `ActivateModule` for every
+  `!IsActive` module; `ActivateModule` (RID 10883) -> `ModuleHelper.OnModuleActivated`
+  (RID 19) -> `ModuleInfo.ActivateModule()`
 
 **Native** - Ghidra, against the editor native DLL loaded in the tool
 (image base `0x7ff8cfda0000`; `.text` `+0x1000..+0x2815FF`, `.rdata`
@@ -449,16 +681,40 @@ Key Ghidra addresses used above:
   have a matching `.bin` on disk.
 * `Modules/BetterBannerlordNavmeshing` had **no** `NavMeshPrefabs` folder, which is
   cause A waiting to happen; `build.ps1` now creates it.
+* `SubModule.xml` `<Id>` vs folder name, all 24 module folders of this install
+  (see the table in §3.5). `Modules/DedicatedCustomServerHelper` has **no**
+  `SubModule.xml` - only `NavMeshPrefabs` and `SceneObj` - so `CC_20_siege` lives
+  in a directory the engine cannot load at all.
+* `rgl_log*.txt` (`Command Args: /singleplayer _MODULES_*...*_MODULES_`, one file
+  per session) is the ground truth for which modules a given editor session had;
+  the failing session (`NavMesh_20261001_223040.log`, scene `CC_20_siege`) was
+  `rgl_log_18524.txt` -> `_MODULES_*Native*SandBoxCore*Sandbox*CustomBattle*
+  *StoryMode*BetterBannerlordNavmeshing*_MODULES_`.
 
 ---
 
 ## 7. Still needs the editor to confirm
 
-* That pressing Export on a never-before-exported scene now logs
-  `import SKIPPED` (instead of printing the engine message) and that the *next*
-  editor start, followed by Import Only, imports it.
+* **The reported case.** Export `CC_20_siege` once: the log must show
+  `FOUND-inactive` for the `DedicatedCustomServerHelper` copy, a
+  `prefab index: fallback copy:` line, `writing fallback bin:`, and
+  `import SKIPPED ... scene module not active ... restart the editor once, then
+  Import Only` - and the engine must **not** print
+  `No navigation mesh prefab was found with name "CC_20_siege_navmesh"!`. Then
+  restart the editor and press **Import Only**: `faces after import:` must be
+  greater than 0, and the copy must be tagged plain `FOUND` with
+  `indexed=True`.
+* That `prefab index: loaded modules:` names
+  `TaleWorlds.Engine.Utilities.GetModulesNames()` and that `MyMaps` now reports
+  `moduleId='My Maps' loaded=True` in a session that has *My Maps* enabled. (In
+  the failing session My Maps was **not** enabled, so `loaded=False` there is
+  correct.)
+* That pressing Export on a never-before-exported scene in a **loaded** module
+  still logs `import SKIPPED` (instead of printing the engine message) and that
+  the *next* editor start, followed by Import Only, imports it.
 * Whether any remaining occurrence the user sees comes from cause D (a mission
   object's `NavMeshPrefabName`) - that would show up while a mission runs, not
   while editing, and needs the full name from the message plus the log file.
-* `moduleActive` accuracy depends on `TaleWorlds.ModuleManager.ModuleHelper`
-  being initialised; it reports `unknown` outside a running game/editor.
+* `loaded=` accuracy depends on the engine being up; outside a running
+  game/editor `loaded modules:` says `UNKNOWN` and nothing is vetoed on account
+  of it.
