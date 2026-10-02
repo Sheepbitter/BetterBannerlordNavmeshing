@@ -76,19 +76,50 @@ value comes from the prefab XML, e.g.
 </script>
 ```
 
-So there are exactly **three** ways this module or the engine asks for a prefab by
-name:
+So there are exactly **three** candidates for "who asks for a prefab by name". Only
+the first two can produce the message, and only the first fires while a scene is
+merely open in the editor:
 
 | # | Caller | When |
 |---|--------|------|
 | 1 | `TerrainNavMeshGenerator.WriteAndImport` -> `ImportNavigationMeshPrefab(prefabName, 0)` | our Export / Import Only button |
 | 2 | `MissionObject.AttachDynamicNavmeshToEntity` | a **mission** starts or an entity with a non-empty `NavMeshPrefabName` is created (siege props, mangonels, ballistas, siege towers) |
-| 3 | the editor's own navmesh panel ("Import faces from prefabs", "Debugging Tools") | native Qt UI inside `TaleWorlds.Native.dll`; no managed caller exists |
+| 3 | the editor's own navmesh inspector ("Import/Export faces as navigation mesh prefab") | native Qt UI, `NavigationMeshInspector`; **cannot** produce the message - see below |
+
+**Case 3 was previously listed here as a possible source. It is not.** On the
+on-disk editor image the whole message literal (rva `0x14107E0`) has exactly
+**two** reference sites in `.text`, and both are inside the loader pair
+`[0x9795F0,0x979D72)` / `[0x979D80,0x97A49F)` (sites `0x979AC9`, `0x97A1F8`) -
+the bodies behind `IScene.LoadNavMeshPrefab` / `LoadNavMeshPrefabWithFrame`. No UI
+function references it, so no editor panel can print it. The panel cannot reach it
+indirectly either:
+
+* The inspector function `[0x8D9580,0x8DDE38)` (it references
+  `...\MB3QT\Inspector\NavigationMeshInspector.cpp`) holds `Nav. Mesh Prefab name: `,
+  `Import faces as navigation mesh prefab`, `Export faces as navigation mesh
+  prefab`, its own Qt `File not found`, and `Please select a module path for the
+  nav mesh prefab:` - but not the message, and not `file not found: %s` either
+  (that literal, rva `0x1410810`, also has exactly four reference sites, all in
+  the same loader pair).
+* The editor's own *export* helper `[0x97A4A0,0x97AD8E)` does assert that the index
+  exists and does log `file not found: %s`, but it never references the message
+  literal either.
+* Nothing in the read path can **insert**: the only function that references the
+  `NavMeshPrefabs` literal (rva `0x13C3CB8`) is the index builder of §3.4
+  (`[0x4EBCE0,0x4ECA2B)`, single site `0x4EBED8`). The read-side accessor is the
+  0x6A-byte getter at `0x4E7580`, which references nothing but the
+  `modules_of_nav_mesh_prefabs` assert pair.
+
+The two "prefab" buttons (`Export faces as prefab`, `Import faces from prefabs`,
+and the whole `Debugging Tools` menu) are in a **different** function,
+`[0x8DF6C0,0x8E26EE)`: that is the navmesh *tools/menu builder*, a table of menu
+labels for the inspector, and it never touches the prefab index at all. Pairing
+it with case 3 was the mistake this section used to make.
 
 Case 2 needs a running `Mission`, so it does not fire while a scene is merely open
 in the editor. **In the editor the message therefore comes from case 1 - our own
-`ImportNavigationMeshPrefab` call - or from case 3.** That makes case 1 the only
-one this module owns, and it is fully self-contained.
+`ImportNavigationMeshPrefab` call.** That makes case 1 the only source this module
+owns, and it is fully self-contained.
 
 ---
 
