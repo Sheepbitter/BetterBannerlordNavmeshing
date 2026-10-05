@@ -10,11 +10,29 @@ namespace BetterBannerlordNavmeshing
     // reorders it. This class only decides which of those lines are also worth
     // showing on screen, and how often.
     //
-    // Channel: in the editor, Console.WriteLine is invisible - it is neither
-    // shown in the editor console nor written to rgl_log (see NavMeshLog) - so
-    // the lines go out through TaleWorlds.Library.Debug.Print, which is the
-    // editor console's own channel. Console.WriteLine stays as the fallback for
-    // the unexpected case where Debug.Print is missing or throws.
+    // Channel: the editor's Console panel is NATIVE (a Qt widget in
+    // TaleWorlds.Native.dll: EditWindow finds the child named "consoleTextBrowser",
+    // QConsoleManager owns the tabs and takes its text through the Qt signal
+    // add_log_text_signal(rglVarString*, QColor, rglVarString*)). No managed type
+    // in TaleWorlds.* touches it, so a mod cannot address the panel directly; it
+    // can only reach the native sinks the panel is drawn from.
+    //
+    // The engine's own "No navigation mesh prefab was found with the name ..."
+    // reaches it, and so does MBDebug.PostWarningLine: both end up in the native
+    // GUI message sink rgl::post_*_line -> rglMessageManager::vfunc[3](text,
+    // colour), and (text, colour) is exactly the shape the console's Qt signal
+    // takes. That is the channel Print() uses first.
+    //
+    // TaleWorlds.Library.Debug.Print is a DIFFERENT channel (Debug.Print ->
+    // DebugManager -> MBDebug.Print -> engine write_line -> the *filtered* rgl
+    // logger: a level gate plus a `debugFilter & user|system_debug_filter` gate,
+    // then the log files and a line callback). It is the second choice now: it
+    // still feeds rgl_log and any Debug.OnPrint subscriber, but nothing in the
+    // editor is known to read it. Console.WriteLine stays the last resort.
+    //
+    // MBDebug.PostWarningLine is [Conditional("_RGL_KEEP_ASSERTS")], which the
+    // C# compiler evaluates in THIS assembly - without the symbol defined in the
+    // csproj the call is stripped and channel 1 silently disappears.
     //
     // In game the same helper also pushes the line to the player through
     // InformationManager.DisplayMessage, but hard-throttled: a player wants a
@@ -66,6 +84,7 @@ namespace BetterBannerlordNavmeshing
         private static bool _progressShown;
         private static int _playerProgressMessages;
         private static long _lastPlayerMs;
+        private static bool _consoleChannelBroken;
         private static bool _debugChannelBroken;
         private static bool _playerChannelBroken;
 
@@ -184,6 +203,19 @@ namespace BetterBannerlordNavmeshing
             Emit("FAILED: " + Flatten(reason), true);
         }
 
+        // A closing line that is NOT a failure: the run produced everything it
+        // promised (the .bin is written) and only the *import* step was deferred,
+        // because the engine resolves prefab names from an index it builds once
+        // per start-up and cannot see a freshly written name yet.
+        //
+        // Always printed, like Start/Finish/Fail, and never budgeted away by the
+        // progress throttle. It is deliberately worded as a skip, and it goes
+        // out as an ordinary line, so it must never be read as an error.
+        public static void Skip(string reason)
+        {
+            Emit("import skipped: " + Flatten(reason), true);
+        }
+
         // Editor tick hook: prints whatever the background build queued. A no-op
         // off the main thread and an empty-queue no-op.
         public static void Pump()
@@ -287,10 +319,31 @@ namespace BetterBannerlordNavmeshing
             }
         }
 
-        // Prints one line to the editor console (Debug.Print), falling back to
-        // Console.WriteLine only if that channel is unusable. Never throws.
+        // Prints one line to the editor console. Channels, best first:
+        //   1. TaleWorlds.Engine.MBDebug.PostWarningLine - the native GUI message
+        //      sink the editor's Qt Console panel is drawn from.
+        //   2. TaleWorlds.Library.Debug.Print - the filtered rgl log channel
+        //      (what V3.48 used on its own).
+        //   3. Console.WriteLine.
+        // Each channel that throws is remembered, so a missing engine binding
+        // costs one exception per session rather than one per line. Never throws.
         private static void Print(string line)
         {
+            try
+            {
+                if (!_consoleChannelBroken)
+                {
+                    TaleWorlds.Engine.MBDebug.PostWarningLine(line);
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                // post_warning_line is missing or refuses this thread: stop trying
+                // it for the rest of the session.
+                _consoleChannelBroken = true;
+            }
+
             try
             {
                 if (!_debugChannelBroken)

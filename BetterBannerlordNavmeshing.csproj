@@ -11,6 +11,16 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
 
+    <!-- TaleWorlds.Library/TaleWorlds.Engine guard their debug helpers with
+         [Conditional("_RGL_KEEP_ASSERTS")], and the C# compiler evaluates that in
+         the CALLING assembly. Without this symbol the compiler strips
+         TaleWorlds.Engine.MBDebug.PostWarningLine, which is the only managed
+         binding for the native post_warning_line sink - the sink the editor's Qt
+         Console panel is actually drawn from (see the channel note at the top of
+         NavMeshVisibleLog.cs). Defining it here only affects calls made from
+         THIS assembly; the engine's own assemblies are unaffected. -->
+    <DefineConstants>$(DefineConstants);_RGL_KEEP_ASSERTS</DefineConstants>
+
     <!-- Plain `dotnet build` targets the editor; client: -p:GameBinFolder=Win64_Shipping_Client -->
     <GameDir Condition="'$(GameDir)' == ''">D:\Secondary Steam\steamapps\common\Mount &amp; Blade II Bannerlord</GameDir>
     <GameBinFolder Condition="'$(GameBinFolder)' == ''">Win64_Shipping_wEditor</GameBinFolder>

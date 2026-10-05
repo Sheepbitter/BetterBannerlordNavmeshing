@@ -324,7 +324,7 @@ namespace BetterBannerlordNavmeshing
                     log("import SKIPPED (the engine cannot resolve this prefab name in this"
                         + " session): " + unresolvable);
                     log("done: importOnly=true prefab='" + prefabName + "' imported=false");
-                    NavMeshVisibleLog.Fail("import SKIPPED: " + Flat(unresolvable));
+                    NavMeshVisibleLog.Skip(unresolvable);
                     return;
                 }
 
@@ -847,6 +847,7 @@ namespace BetterBannerlordNavmeshing
                         ? " by request; import '" + result.PrefabName
                           + "' manually from the editor's navmesh prefab panel."
                         : "; import '" + result.PrefabName + "': " + result.ImportSkipReason));
+                    NavMeshVisibleLog.Skip(ImportSkipNotice(result));
                 }
 
                 log("done: totalMs=" + runWatch.ElapsedMilliseconds
@@ -1152,6 +1153,7 @@ namespace BetterBannerlordNavmeshing
                         ? "; import '" + result.PrefabName
                           + "' manually from the editor's navmesh prefab panel."
                         : "; import '" + result.PrefabName + "': " + result.ImportSkipReason));
+                    NavMeshVisibleLog.Skip(ImportSkipNotice(result));
                 }
 
                 log("done: totalMs=" + req.RunWatch.ElapsedMilliseconds
@@ -1307,6 +1309,22 @@ namespace BetterBannerlordNavmeshing
         private static string Secs(long ms)
         {
             return (ms / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
+        }
+
+        // Console wording for the "the .bin is written but the import did not
+        // happen" case. Deliberately parallel to - and derived from - the log
+        // FILE's own "import skipped ..." line a few lines above it, so the two
+        // never drift apart; the file line itself is untouched.
+        private static string ImportSkipNotice(TerrainNavMeshGenerator.ExportResult result)
+        {
+            if (result == null)
+                return "(no result)";
+
+            if (string.IsNullOrEmpty(result.ImportSkipReason))
+                return "import '" + result.PrefabName
+                    + "' manually from the editor's navmesh prefab panel.";
+
+            return "import '" + result.PrefabName + "': " + result.ImportSkipReason;
         }
 
         // Short tail for the DONE line: did the faces actually land in the scene?
