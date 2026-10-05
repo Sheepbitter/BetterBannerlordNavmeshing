@@ -152,6 +152,12 @@ namespace BetterBannerlordNavmeshing
         // stays synchronous. See the README ("Async build").
         public bool NavMeshAsyncBuild = true;
 
+        // Mirror the important run lines (start / stage / progress / finish-or-failure) to the
+        // editor console (Debug.Print) and, in game, to the player (InformationManager). The
+        // verbose per-session log FILE is unaffected - it stays exactly as detailed as it was.
+        // Without this, a 30 s - 5 min build is a silent wait. See NavMeshVisibleLog + README.
+        public bool NavMeshConsoleMessages = true;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -232,6 +238,10 @@ namespace BetterBannerlordNavmeshing
             base.OnEditorTick(dt);
             TrackEditorTick();
             CompleteAsyncBuildIfReady();
+
+            // Whatever the background build queued while it was running (progress lines
+            // are only safe to print from the thread that owns the editor UI).
+            NavMeshVisibleLog.Pump();
         }
 
         protected override void OnEditorVariableChanged(string variableName)
@@ -261,13 +271,18 @@ namespace BetterBannerlordNavmeshing
             {
                 NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
                 System.Action<string> log = NavMeshLog.Write;
+                NavMeshVisibleLog.BeginRun(NavMeshVisibleLog.Context.Editor, NavMeshConsoleMessages);
 
                 Scene scene = Scene;
                 if (scene == null)
                 {
                     log("ERROR: no scene.");
+                    NavMeshVisibleLog.Fail("no scene");
                     return;
                 }
+
+                NavMeshVisibleLog.Start(SafeName(scene),
+                    PreviewPrefabName(scene, NavMeshPrefabName), BuildTag + " / Import Only", false);
 
                 log("run: build=" + BuildTag + " trigger=editor-import-only scene=" + SafeName(scene)
                     + " machine=" + Environment.MachineName
@@ -276,6 +291,7 @@ namespace BetterBannerlordNavmeshing
                 log("settings: importOnly=True clearExisting=" + NavMeshClearExistingFaces
                     + " prefabName='" + (NavMeshPrefabName ?? "") + "'"
                     + " exportFolder='" + (NavMeshExportFolder ?? "") + "'"
+                    + " consoleMessages=" + NavMeshConsoleMessages
                     + " writeLogFile=" + NavMeshWriteLogFile
                     + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
 
@@ -308,6 +324,7 @@ namespace BetterBannerlordNavmeshing
                     log("import SKIPPED (the engine cannot resolve this prefab name in this"
                         + " session): " + unresolvable);
                     log("done: importOnly=true prefab='" + prefabName + "' imported=false");
+                    NavMeshVisibleLog.Fail("import SKIPPED: " + Flat(unresolvable));
                     return;
                 }
 
@@ -329,6 +346,7 @@ namespace BetterBannerlordNavmeshing
                 }
 
                 log("importing prefab '" + prefabName + "' (shift 0)...");
+                NavMeshVisibleLog.Stage("importing");
                 scene.ImportNavigationMeshPrefab(prefabName, 0);
                 log("import call returned.");
 
@@ -337,11 +355,17 @@ namespace BetterBannerlordNavmeshing
                 LogImportCheck(log, facesBeforeRun, facesAfterRun, NavMeshClearExistingFaces);
 
                 log("done: importOnly=true prefab='" + prefabName + "'");
+                NavMeshVisibleLog.Finish("imported '" + prefabName + "' (scene faces "
+                    + (facesBeforeRun < 0 ? "?" : facesBeforeRun.ToString(CultureInfo.InvariantCulture))
+                    + " -> "
+                    + (facesAfterRun < 0 ? "?" : facesAfterRun.ToString(CultureInfo.InvariantCulture))
+                    + "); the .bin at " + folder + " is unchanged");
             }
             catch (Exception ex)
             {
                 NavMeshLog.Write("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
                 NavMeshLog.Write("ERROR stack: " + Flat(ex.StackTrace));
+                NavMeshVisibleLog.Fail(ex.GetType().Name + ": " + Flat(ex.Message));
             }
         }
 
@@ -584,7 +608,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
-                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge);
+                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge,
+                NavMeshConsoleMessages);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -605,10 +630,13 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, true);
+                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, true,
+                true);
         }
 
-        // Full signature: useVoxelCore selects the v2 tiled voxel pipeline.
+        // Full signature: useVoxelCore selects the v2 tiled voxel pipeline, and
+        // consoleMessages mirrors the important run lines to the editor console /
+        // the player (NavMeshVisibleLog; the log FILE is unaffected).
         public static TerrainNavMeshGenerator.ExportResult RunPipeline(
             Scene scene,
             string trigger,
@@ -638,19 +666,32 @@ namespace BetterBannerlordNavmeshing
             bool voxelPruneIsolatedIslands,
             int voxelPruneMaxIslandFaces,
             bool voxelSteppedProps,
-            bool voxelQuadMerge)
+            bool voxelQuadMerge,
+            bool consoleMessages)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
             System.Action<string> log = NavMeshLog.Write;
+
+            // Editor triggers come from the component's buttons (and are the only ones
+            // that may run the async path); anything else is the in-game hotkey. Both
+            // are BLOCKING here - RunPipeline never hands work to a background thread -
+            // and the start line says so, instead of the user discovering it as a freeze.
+            NavMeshVisibleLog.BeginRun(IsEditorTrigger(trigger)
+                ? NavMeshVisibleLog.Context.Editor
+                : NavMeshVisibleLog.Context.InGame, consoleMessages);
 
             try
             {
                 if (scene == null)
                 {
                     log("ERROR: no scene.");
+                    NavMeshVisibleLog.Fail("no scene");
                     return null;
                 }
+
+                NavMeshVisibleLog.Start(SafeName(scene),
+                    PreviewPrefabName(scene, prefabNameOverride), BuildTag, false);
 
                 log("run: build=" + BuildTag + " trigger=" + trigger + " scene=" + SafeName(scene)
                     + " machine=" + Environment.MachineName
@@ -687,6 +728,7 @@ namespace BetterBannerlordNavmeshing
                     + " assetTrace=" + voxelAssetTrace
                     + " writeSoupObj=" + voxelWriteSoupObj
                     + " terrainHoleAudit=" + voxelTerrainHoleAudit
+                    + " consoleMessages=" + consoleMessages
                     + " writeLogFile=" + writeLogFile
                     + " logFolder='" + (logFolder ?? "") + "'");
 
@@ -700,6 +742,7 @@ namespace BetterBannerlordNavmeshing
                 log("grid ready: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m fallback=" + grid.UsedPointFallback
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
+                NavMeshVisibleLog.Stage("collecting assets");
 
                 TerrainNavMeshGenerator.ExportResult result;
                 long assetsMs = 0;
@@ -732,7 +775,7 @@ namespace BetterBannerlordNavmeshing
                     {
                         SceneCollisionGeometry.AssetTriangles assets =
                             SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
-                                voxelAssetTrace, voxelSteppedProps, log, voxelCellSizeMeters,
+                                voxelAssetTrace, voxelSteppedProps, RunLog(log), voxelCellSizeMeters,
                                 ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
@@ -749,16 +792,18 @@ namespace BetterBannerlordNavmeshing
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
                         assetVerts, assetTris, assetForceWalkable, assetLedgeExempt, grid.HoleMask,
-                        soupCapture, log, out voxelBuildMs);
+                        soupCapture, RunLog(log), out voxelBuildMs);
                     if (voxelMesh == null)
                     {
                         log("v2: mesh build aborted by the invariant gate; bin NOT written and import NOT attempted.");
                         log("done: totalMs=" + runWatch.ElapsedMilliseconds + " failed=true aborted=true");
+                        NavMeshVisibleLog.Fail("the invariant gate rejected the mesh; nothing was written"
+                            + " or imported (see the log for the offending counts)");
                         return null;
                     }
 
                     result = TerrainNavMeshGenerator.WriteAndImport(scene, voxelMesh, settings.WriteObj,
-                        prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, log,
+                        prefabNameOverride, folderOverride, clearExistingFaces, importIntoScene, RunLog(log),
                         voxelBuildMs);
                     WriteSoupObjs(result, soupCapture, log);
                 }
@@ -775,7 +820,7 @@ namespace BetterBannerlordNavmeshing
                         folderOverride,
                         clearExistingFaces,
                         importIntoScene,
-                        log);
+                        RunLog(log));
                 }
 
                 int facesAfterRun = SafeFaceCount(scene);
@@ -810,6 +855,12 @@ namespace BetterBannerlordNavmeshing
                     + " V=" + result.VertexCount
                     + " E=" + result.EdgeCount
                     + " F=" + result.FaceCount);
+
+                // Always the last console line of the run (blocking mode).
+                NavMeshVisibleLog.Finish("'" + result.PrefabName + "' V=" + result.VertexCount
+                    + " F=" + result.FaceCount + " E=" + result.EdgeCount
+                    + " in " + Secs(runWatch.ElapsedMilliseconds) + "s -> " + result.BinPath
+                    + ImportOutcome(result, facesBeforeRun, facesAfterRun));
                 return result;
             }
             catch (Exception ex)
@@ -817,6 +868,7 @@ namespace BetterBannerlordNavmeshing
                 log("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
                 log("ERROR stack: " + Flat(ex.StackTrace));
                 log("done: totalMs=" + runWatch.ElapsedMilliseconds + " failed=true");
+                NavMeshVisibleLog.Fail(ex.GetType().Name + ": " + Flat(ex.Message));
                 return null;
             }
         }
@@ -837,8 +889,13 @@ namespace BetterBannerlordNavmeshing
             if (_asyncBuild != null)
             {
                 log("v2: build already running - ignoring");
+                // Announced on the running build's console stream (no BeginRun here:
+                // resetting it would wipe the throttle state of the run in flight).
+                NavMeshVisibleLog.Stage("waiting for the running build");
                 return;
             }
+
+            NavMeshVisibleLog.BeginRun(NavMeshVisibleLog.Context.Editor, NavMeshConsoleMessages);
 
             try
             {
@@ -846,8 +903,12 @@ namespace BetterBannerlordNavmeshing
                 if (scene == null)
                 {
                     log("ERROR: no scene.");
+                    NavMeshVisibleLog.Fail("no scene");
                     return;
                 }
+
+                NavMeshVisibleLog.Start(SafeName(scene), PreviewPrefabName(scene, NavMeshPrefabName),
+                    BuildTag, true);
 
                 log("run: build=" + BuildTag + " trigger=editor-button-async scene=" + SafeName(scene)
                     + " machine=" + Environment.MachineName
@@ -884,6 +945,7 @@ namespace BetterBannerlordNavmeshing
                     + " writeSoupObj=" + NavMeshVoxelWriteSoupObj
                     + " terrainHoleAudit=" + NavMeshVoxelTerrainHoleAudit
                     + " asyncBuild=True"
+                    + " consoleMessages=" + NavMeshConsoleMessages
                     + " writeLogFile=" + NavMeshWriteLogFile
                     + " logFolder='" + (NavMeshLogFolder ?? "") + "'");
 
@@ -898,6 +960,7 @@ namespace BetterBannerlordNavmeshing
                 log("grid ready: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m fallback=" + grid.UsedPointFallback
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
+                NavMeshVisibleLog.Stage("collecting assets");
 
                 // Phase 3: asset collision geometry is read on the main thread (scene access) and
                 // carried as plain arrays to the background build.
@@ -911,7 +974,7 @@ namespace BetterBannerlordNavmeshing
                     var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
                     SceneCollisionGeometry.AssetTriangles assets =
                         SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
-                            NavMeshVoxelAssetTrace, NavMeshVoxelSteppedProps, log, NavMeshVoxelCellSize,
+                            NavMeshVoxelAssetTrace, NavMeshVoxelSteppedProps, RunLog(log), NavMeshVoxelCellSize,
                             ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
@@ -965,13 +1028,14 @@ namespace BetterBannerlordNavmeshing
                 req.FolderOverride = NavMeshExportFolder;
                 req.ClearExisting = NavMeshClearExistingFaces;
                 req.ImportIntoScene = NavMeshImportIntoScene;
-                req.Log = log;
+                req.Log = RunLog(log);
                 req.RunWatch = runWatch;
 
                 _asyncBuild = req;
                 BeginBuildTickSampling();
 
                 log("v2: async build started on a background thread; the editor stays responsive (progress lines follow).");
+                NavMeshVisibleLog.Stage("building tiles");
 
                 var worker = new System.Threading.Thread(RunAsyncBuild);
                 worker.IsBackground = true;
@@ -985,6 +1049,7 @@ namespace BetterBannerlordNavmeshing
                 log("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
                 log("ERROR stack: " + Flat(ex.StackTrace));
                 log("done: totalMs=" + runWatch.ElapsedMilliseconds + " failed=true");
+                NavMeshVisibleLog.Fail("dispatch failed: " + ex.GetType().Name + ": " + Flat(ex.Message));
             }
         }
 
@@ -1029,11 +1094,17 @@ namespace BetterBannerlordNavmeshing
                 log("v2: async build finished on the background thread.");
                 log("v2: perf: ticksDuringBuild=" + _buildTicks + " maxTickMs=" + F1(_buildMaxTickMs));
 
+                // Flush anything the worker queued, so the console lines stay in order
+                // (its last progress line must not appear after "writing bin").
+                NavMeshVisibleLog.Pump();
+
                 if (req.Error != null)
                 {
                     log("v2: ERROR (background build): " + req.Error.GetType().Name + ": " + Flat(req.Error.Message));
                     log("v2: ERROR stack (background build): " + Flat(req.Error.StackTrace));
                     log("done: totalMs=" + req.RunWatch.ElapsedMilliseconds + " failed=true");
+                    NavMeshVisibleLog.Fail("background build: " + req.Error.GetType().Name
+                        + ": " + Flat(req.Error.Message));
                     return;
                 }
 
@@ -1041,6 +1112,8 @@ namespace BetterBannerlordNavmeshing
                 {
                     log("v2: mesh build aborted by the invariant gate; bin NOT written and import NOT attempted.");
                     log("done: totalMs=" + req.RunWatch.ElapsedMilliseconds + " failed=true aborted=true");
+                    NavMeshVisibleLog.Fail("the invariant gate rejected the mesh; nothing was written"
+                        + " or imported (see the log for the offending counts)");
                     return;
                 }
 
@@ -1087,6 +1160,14 @@ namespace BetterBannerlordNavmeshing
                     + " E=" + result.EdgeCount
                     + " F=" + result.FaceCount);
 
+                // Always the last console line of the run, in BOTH modes: the async path
+                // must never leave the "is it still working?" question open.
+                NavMeshVisibleLog.Pump();
+                NavMeshVisibleLog.Finish("'" + result.PrefabName + "' V=" + result.VertexCount
+                    + " F=" + result.FaceCount + " E=" + result.EdgeCount
+                    + " in " + Secs(req.RunWatch.ElapsedMilliseconds) + "s -> " + result.BinPath
+                    + ImportOutcome(result, req.FacesBefore, facesAfterRun));
+
                 if (result.ImportAttempted)
                     BeginPostImportTickSampling();
             }
@@ -1096,6 +1177,7 @@ namespace BetterBannerlordNavmeshing
                 log("ERROR: " + ex.GetType().Name + ": " + Flat(ex.Message));
                 log("ERROR stack: " + Flat(ex.StackTrace));
                 log("done: totalMs=" + req.RunWatch.ElapsedMilliseconds + " failed=true");
+                NavMeshVisibleLog.Fail("finish failed: " + ex.GetType().Name + ": " + Flat(ex.Message));
             }
         }
 
@@ -1172,6 +1254,78 @@ namespace BetterBannerlordNavmeshing
             {
                 return -1;
             }
+        }
+
+        // Wraps the log file writer so the same run also feeds the console mirror.
+        // The FILE gets the original, untouched line first, so it stays exactly as
+        // verbose as it was; NavMeshVisibleLog only reads the line to decide whether
+        // it is worth showing.
+        private static System.Action<string> RunLog(System.Action<string> log)
+        {
+            if (log == null)
+                return null;
+
+            return delegate (string line)
+            {
+                log(line);
+                NavMeshVisibleLog.Mirror(line);
+            };
+        }
+
+        // The editor component's buttons pass "editor-button" / "editor-button-async";
+        // the in-game hotkey passes "mission-hotkey (~)". Only the former may use the
+        // async path, and only the latter should message the player.
+        private static bool IsEditorTrigger(string trigger)
+        {
+            return !string.IsNullOrEmpty(trigger)
+                && trigger.StartsWith("editor", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // A non-throwing preview of the prefab name for the START console line. The
+        // real name is resolved (and validated) later by ResolvePrefabName, which may
+        // throw - that must not stop the run before it has said anything.
+        private static string PreviewPrefabName(Scene scene, string overrideName)
+        {
+            if (!string.IsNullOrEmpty(overrideName))
+                return overrideName;
+
+            string sceneName = SafeName(scene);
+            if (sceneName == "?")
+                return "?";
+
+            try
+            {
+                return NavMeshPrefabIndex.DeriveBoundedName(sceneName, "_navmesh");
+            }
+            catch (Exception)
+            {
+                return sceneName + "_navmesh";
+            }
+        }
+
+        // One decimal of seconds from a millisecond span, for the console lines.
+        private static string Secs(long ms)
+        {
+            return (ms / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
+        }
+
+        // Short tail for the DONE line: did the faces actually land in the scene?
+        private static string ImportOutcome(TerrainNavMeshGenerator.ExportResult result,
+            int facesBeforeRun, int facesAfterRun)
+        {
+            if (result == null)
+                return "";
+
+            if (!result.ImportAttempted)
+                return " (not imported into the scene)";
+
+            if (facesAfterRun < 0)
+                return " (imported; face count unavailable)";
+
+            if (facesBeforeRun >= 0 && facesAfterRun == facesBeforeRun)
+                return " (imported, but the scene face count did not change - see the log)";
+
+            return " (imported)";
         }
 
         private static string SafeName(Scene scene)

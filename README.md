@@ -298,6 +298,7 @@ Controls (Scene NavMesh Exporter fields):
 |---|---|---|
 | `NavMeshWriteLogFile` | `true` | Write the session log file (every line is also mirrored to the console). |
 | `NavMeshLogFolder` | `""` | Log folder override. Empty = the default path above. |
+| `NavMeshConsoleMessages` | `true` | The log file above stays exactly as verbose as it always was; this additionally mirrors a throttled selection of it to the editor console / the player (see *Console progress*). |
 
 The log contains the scene and machine name, timings, all sampler validation lines, the mesher stats and the
 import result - safe to attach to a bug report.
@@ -393,6 +394,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
+| `NavMeshConsoleMessages` | `true` | Mirror the important run lines (start / stage / progress / finish-or-failure) to the editor console, and in game to the player. The log file is unaffected. See *Console progress*. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
@@ -468,6 +470,58 @@ NavMesh: v2: perf: postImportTickMs min=<a> avg=<b> max=<c> over 30 ticks  <- vi
 
 Determinism is untouched: the progress counter/logging is observational only, and the harness
 (`RESULT: DETERMINISM PASS`) is unchanged.
+
+### Console progress (`NavMeshConsoleMessages`, on by default)
+
+A v2 build is 3 s - 5 min of work, and until the prefab appears (or an error does) the editor gave no
+sign of life at all: the log file was the only witness, and `Console.WriteLine` is invisible there. The
+important run lines are therefore mirrored to the **editor console** through `TaleWorlds.Library.Debug.Print`
+(the console's own channel; `Console.WriteLine` stays as the fallback), and in game to the player through
+`InformationManager.DisplayMessage` - all of it from one helper (`NavMeshVisibleLog`) and gated by
+`NavMeshConsoleMessages`. **The verbose log FILE is unchanged**: every line still goes there, in the same
+order, with the same text; the console only ever gets a throttled selection of it.
+
+**Async (`NavMeshAsyncBuild = true`, default) - the editor stays responsive:**
+
+```
+NavMesh: building 'mp_tdm_Birtu' -> 'mp_tdm_Birtu_navmesh' (background - the editor stays responsive; progress below) [Build 3 (adaptive navmesh)]
+NavMesh: stage 1: collecting assets ...
+NavMesh: stage 1: collecting assets 45% (+2.6s)
+NavMesh: stage 2: building tiles ...
+NavMesh: stage 2: building tiles 30% (+2.5s)
+NavMesh: stage 2: building tiles 60% (+2.5s)
+NavMesh: stage 3: merging/stitching ...
+NavMesh: stage 4: pruning ...
+NavMesh: stage 5: cleanup ...
+NavMesh: stage 6: writing bin ...
+NavMesh: stage 7: importing ...
+NavMesh: DONE: 'mp_tdm_Birtu_navmesh' V=28213 F=44505 E=73455 in 61.4s -> D:\...\NavMeshPrefabs\mp_tdm_Birtu_navmesh.bin (imported)
+```
+
+**Blocking (`NavMeshAsyncBuild = false`, or the v1 mesher - `NavMeshUseVoxelCore = false`):**
+
+```
+NavMesh: building 'mp_tdm_Birtu' -> 'mp_tdm_Birtu_navmesh' (blocking - the editor will freeze until it finishes) [Build 3 (adaptive navmesh)]
+...
+NavMesh: DONE: 'mp_tdm_Birtu_navmesh' V=28213 F=44505 E=73455 in 61.4s -> ...\mp_tdm_Birtu_navmesh.bin (imported)
+```
+
+The freeze is therefore **announced**, not mysterious: the difference between the two lines is the only
+thing that changes about the architecture. In game the blocking hotkey says
+`(blocking - the game will freeze until it finishes)`.
+
+- **Start** - one line: scene, prefab, build tag and mode, before anything is read.
+- **Progress** - at most one line per stage per ~2.5 s, only when the percentage moved, and at most 4 per
+  stage. The stages are `collecting assets -> building tiles -> merging/stitching -> pruning -> cleanup ->
+  writing bin -> importing`; they are derived from the run's own log lines, so no mesher code changed.
+- **Finish** - always the last line of the run, in **both** modes: `DONE:` with V/F/E, the elapsed time and
+  the written path, or `FAILED:` with the reason (background exception, invariant-gate abort, dispatch or
+  write/import error). The async path cannot leave a stale "still running" impression.
+- **In game** - the same lines reach the player through `InformationManager`, but hard-throttled: at most one
+  message per 20 s and 2 progress messages per run (start and finish always get through). A missing or
+  throwing `InformationManager` is a no-op, not an error.
+- Off-thread lines (the async worker's progress) are queued and printed from the editor tick
+  (`OnEditorTick`), so the console is only ever touched from the thread that owns the UI.
 
 ### Detail mesh (on by default)
 
