@@ -679,6 +679,60 @@ The no-argument batch mode (all the regression tests) is unchanged. The round tr
 harness `Test 20` writes a snapshot from a scenario with the real writer, loads it back through the same
 helpers, and asserts the soup and the mesh are **identical face for face** to the in-process build.
 
+### Vertical reach: how far can geometry *above* a surface reach?
+
+Asked directly after a mis-diagnosis blamed an "overhang" 21.5 m above a cave spot: **can anything up there
+influence the floor down here?** Audited end to end. The answer is **no, and the guarantee is 1.8 m**, not
+"most of the time 1.8 m".
+
+Every rule that lets a span influence the span beneath it, and the vertical distance it actually reads:
+
+| rule | call site | reads | bound |
+|---|---|---|---|
+| clearance | `BuildTile` -> `FilterWalkableLowHeightSpans` | `span.next.smin` only - the *immediately* next span in the same column | `walkableHeight` = **1.8 m** (9 vox) |
+| ledge trim | `BuildTile` -> `FilterLedgeSpans` | own column: `span.next.smin`; a neighbour span is admitted only when `min(ceiling,nCeiling) - max(floor,nFloor) >= walkableHeight`, i.e. it must overlap our own clearance band | **1.8 m** (see the two properties below for the one `smin` that is read unbounded) |
+| stepped restore | `RestoreSteppedSpans` | `sp.next.smin - sp.smax < walkableHeight`; the near/far split is `up.smax - sp.smax <= walkableClimb` | 1.8 m / 0.6 m |
+| connector clearance exemption | `ClearConnectorCeilings` | `up.smin - conn.smax < walkableHeight`, connector cells only | 1.8 m |
+| per-tile stitch clearance | `StitchGapClear` | `minY - 1vox .. maxY + walkableHeight` | 1.8 m above the higher end |
+| merge-stitch clearance | `GapEnvelopeSolid` | `soupFloor + 0.6*ch .. soupFloor + walkableHeight*ch` | 1.8 m above the lower end |
+| gap fill | `FillNarrowGaps` / `TryGapFloor` | the *lowest* walkable span per column; flanks within `GapFillCells`; `abs(dy) <= walkableClimb` | 0.5 m across, **0.6 m** up |
+| low-hanging obstacles | `FilterLowHangingWalkableObstacles` | spans within `walkableClimb` | 0.6 m |
+| erosion | `ErodeWalkableArea` | horizontal only (`walkableRadius`) | n/a (no vertical term) |
+
+One rule in the whole pipeline *does* read a span's `smin` at unbounded distance, and it is worth naming so
+the guarantee is not overclaimed: the ledge trim's "is the neighbour column empty at my level?" test reads
+`neighborSpan.smin` - the **bottom of the neighbour's lowest span** - at whatever height that is
+(`RcFilters.cs:154`). If the neighbour cell holds nothing within `walkableHeight` of our floor, the trim nulls
+our span as a ledge. That is DotRecast's intended "there is a wall beside you" behaviour and it is **capped in
+the only way that matters**: the decision fires on `min(ceiling, neighborCeiling) - floor >= walkableHeight`,
+so it turns on *how far the neighbour's lowest geometry sits above our floor*, and the effective reach is
+exactly `walkableHeight`. Clamping that read to `floor + walkableHeight` was checked against all three cases
+(neighbour empty -> `RC_SPAN_MAX_HEIGHT`; neighbour bottom inside the band; neighbour bottom above the band)
+and is **behaviour-identical**, so the clamp is left as documentation rather than churn in vendored code.
+
+Two further properties make the ledge trim safe for arbitrarily distant overhangs, and they are worth stating
+because they are not obvious from reading it:
+
+- A neighbour span is only *considered* when it vertically overlaps our own clearance band, so a span far
+  above is normally skipped outright.
+- When it is not skipped (our column has no ceiling, so our `ceiling` is `RC_SPAN_MAX_HEIGHT`), the far-above
+  span can only contribute a **positive** `neighborFloorDifference`. `lowestNeighborFloorDifference` is a
+  `min()` that is only ever driven **negative** by a span *below* us, and the second delete rule
+  (`highest - lowest traversable > walkableClimb`) only reads floors within `walkableClimb`. So an overhang
+  cannot null the floor under it no matter how far above it sits.
+
+**Measurement at the disputed spot (CC_20, `x 1113.05, z 965.89`, floor at engine H=98.5):** a
+`--vprobe` of a 2.2 x 2.2 m box around it returns 57 asset vertices and the **highest is `rock_set` at
+H=97.770**; `rock_cliff_b` tops out at 95.528 and `terrain_green_rock_big_c` at 93.532. There is **no geometry
+at all between 98 m and 143.9 m in that column** (`--probe` reports `soupZ=[86.737..143.94]`, and the
+143.94 m vertex is 45 m away in XZ, not overhead). The built mesh has exactly **one** face at that XZ,
+`h=98.50`, in the main island (226 082 faces) - the spot is covered and connected, not starved. So the
+"overhang" never existed there; whatever removed the cave floor is something else, and per the standing
+instruction that is parked.
+
+The same log line already prints the bound on every run, so a regression would be visible without re-deriving
+it: `v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 ...`.
+
 ### Narrow features & connectivity
 
 Doorways, walkways and thin stair treads fail when **erosion + quantization eat the whole feature**:

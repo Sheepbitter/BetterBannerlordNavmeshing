@@ -2568,7 +2568,28 @@ namespace BetterBannerlordNavmeshing
                     r.GapEmptyColumns = gapEmpty;
                 }
                 if (s.UseLedgeFilter)
+                {
+                    // Vertical reach of "geometry ABOVE a surface". Audited end to end: every rule that
+                    // lets a span influence the span under it is bounded by walkableHeight (9 voxels =
+                    // 1.8 m at cs=0.25/ch=0.2) or tighter. Nothing reads the column above at unbounded
+                    // distance, so a surface and geometry 21 m over it cannot interact. Per rule:
+                    //   clearance (FilterWalkableLowHeightSpans, below) - reads span.next.smin only:
+                    //       1.8 m.
+                    //   this ledge trim - own column reads span.next.smin (1.8 m); a neighbour span is
+                    //       admitted only when min(ceiling,nCeiling) - max(floor,nFloor) >= walkableHeight,
+                    //       i.e. it must overlap our own clearance band (1.8 m). A span arbitrarily far
+                    //       above can therefore only ever contribute a POSITIVE floor difference, and
+                    //       lowestNeighborFloorDifference is a min() that is only ever driven negative by a
+                    //       span BELOW us, so an overhang cannot null the floor under it.
+                    //   stepped restore + connector clearance exemption - 1.8 m (see RestoreSteppedSpans /
+                    //       ClearConnectorCeilings).
+                    //   per-tile stitch clearance - minY-1 .. maxY+walkableHeight (1.8 m).
+                    //   merge-stitch clearance - soupFloor+0.6*ch .. soupFloor+walkableHeight*ch (1.8 m).
+                    //   gap fill - flanks within GapFillCells (2 cells) and |dy| <= walkableClimb (0.6 m).
+                    //   low-hanging-obstacle filter - walkableClimb (0.6 m).
+                    //   erosion - horizontal (walkableRadius) only.
                     RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
+                }
                 if (steppedSpans != null)
                 {
                     // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
