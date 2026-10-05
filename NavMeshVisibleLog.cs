@@ -62,6 +62,12 @@ namespace BetterBannerlordNavmeshing
         // (a build that logs progress without a recognised heading).
         private const string UnknownStage = "building";
 
+        // Every line carries this; StatusText hands out the same wording without it.
+        private const string Prefix = "NavMesh: ";
+
+        // Resting value of the editor script-panel status row between runs.
+        public const string IdleStatus = "idle";
+
         // Player budget: at most one progress message every 20 s, at most 2 per run
         // (plus the start and the finish, which always get through - those are the
         // lines that answer "is it still working?").
@@ -87,6 +93,13 @@ namespace BetterBannerlordNavmeshing
         private static bool _consoleChannelBroken;
         private static bool _debugChannelBroken;
         private static bool _playerChannelBroken;
+
+        // The one-line build status shown in the editor's script-variables panel
+        // (SceneNavMeshExporter.NavMeshBuildStatus). It is written from the SAME
+        // Emit/Pump path that produces the visible lines, so the panel row and the
+        // console wording cannot drift apart. Written under Sync; read via
+        // StatusText, which locks.
+        private static string _statusText = IdleStatus;
 
         // Master switch, fed from the NavMeshConsoleMessages setting at the start
         // of every run. Off means this class prints nothing at all.
@@ -114,7 +127,18 @@ namespace BetterBannerlordNavmeshing
                 _progressShown = false;
                 _playerProgressMessages = 0;
                 _lastPlayerMs = 0;
+                _statusText = IdleStatus;
             }
+        }
+
+        // The current one-line build status, without the "NavMesh: " prefix. This
+        // is what the editor script-panel row shows. It follows the visible-log
+        // line that was produced last, at the same throttled cadence, and it is
+        // advanced even when NavMeshConsoleMessages is off - the panel is the
+        // delivery mechanism now, so it must not depend on a console toggle.
+        public static string StatusText
+        {
+            get { lock (Sync) { return _statusText; } }
         }
 
         // One line for the button press, so a build that takes minutes is never
@@ -144,7 +168,7 @@ namespace BetterBannerlordNavmeshing
             string text;
             lock (Sync)
             {
-                if (!_enabled || string.Equals(stage, _stage, StringComparison.Ordinal))
+                if (string.Equals(stage, _stage, StringComparison.Ordinal))
                     return;
 
                 _stage = stage;
@@ -152,6 +176,11 @@ namespace BetterBannerlordNavmeshing
                 _stageProgressLines = 0;
                 _lastPercent = -1;
                 text = Heading() + stage + " ...";
+                // The panel status advances whether or not the console is enabled;
+                // only the printing below is gated.
+                _statusText = text;
+                if (!_enabled)
+                    return;
             }
 
             Emit(text, false);
@@ -165,8 +194,6 @@ namespace BetterBannerlordNavmeshing
             string text;
             lock (Sync)
             {
-                if (!_enabled)
-                    return;
                 if (percent == _lastPercent)
                     return;
                 if (_stageProgressLines >= MaxProgressLinesPerStage)
@@ -185,6 +212,11 @@ namespace BetterBannerlordNavmeshing
                     + (string.IsNullOrEmpty(note) ? "" : " " + note)
                     + " (+" + (sinceMs / 1000.0).ToString("0.0",
                         System.Globalization.CultureInfo.InvariantCulture) + "s)";
+                // As in Stage(): the panel status advances on the same throttled
+                // cadence regardless of the console toggle; only printing is gated.
+                _statusText = text;
+                if (!_enabled)
+                    return;
             }
 
             Emit(text, false);
@@ -233,6 +265,15 @@ namespace BetterBannerlordNavmeshing
 
             for (int i = 0; i < items.Length; i++)
                 Print(items[i]);
+
+            // Whatever the queue just put on screen is now also the panel status.
+            string last = items[items.Length - 1];
+            if (last.StartsWith(Prefix, StringComparison.Ordinal))
+                last = last.Substring(Prefix.Length);
+            lock (Sync)
+            {
+                _statusText = last;
+            }
         }
 
         // Classifies one of the pipeline's own log lines into a console stage or a
@@ -296,7 +337,7 @@ namespace BetterBannerlordNavmeshing
 
         private static void Emit(string text, bool force)
         {
-            string line = "NavMesh: " + text;
+            string line = Prefix + text;
             lock (Sync)
             {
                 if (!_enabled)
@@ -305,13 +346,18 @@ namespace BetterBannerlordNavmeshing
                 if (force || OnMainThread())
                 {
                     Print(line);
+                    // The status IS the visible line, minus the prefix: one
+                    // derivation, so the panel row and the console cannot drift.
+                    _statusText = text;
                     if (_context == Context.InGame && !_playerChannelBroken)
                         ShowPlayer(text, force);
                 }
                 else
                 {
                     // Off the main thread: queue it, and collapse consecutive queued
-                    // progress lines of the same stage into the newest one.
+                    // progress lines of the same stage into the newest one. The
+                    // status moves when Pump() actually prints them, which keeps
+                    // the panel showing the same line the console just showed.
                     if (Pending.Count > 0 && IsProgressText(Pending[Pending.Count - 1]))
                         Pending.RemoveAt(Pending.Count - 1);
                     Pending.Add(line);

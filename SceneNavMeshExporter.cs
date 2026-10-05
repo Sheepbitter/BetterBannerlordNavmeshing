@@ -170,6 +170,23 @@ namespace BetterBannerlordNavmeshing
         // Without this, a 30 s - 5 min build is a silent wait. See NavMeshVisibleLog + README.
         public bool NavMeshConsoleMessages = true;
 
+        // LIVE build status, shown as its own row in the editor's script-variables
+        // panel for this entity - the panel that already carries the Export NavMesh
+        // button and the settings above. It is what answers "what stage is it at?"
+        // during a multi-minute build; the editor's own Console panels cannot be
+        // written to from a mod (see NavMeshVisibleLog for the whole story).
+        //
+        // A public instance field is all that is needed: ScriptComponentBehavior
+        // .CollectEditableFields() gives every public non-static field a widget, so
+        // no [EditableScriptComponentVariable] is required. The value is owned here
+        // (it is a saved script variable, so it survives a scene reload); the editor
+        // tick additionally asks the engine to repaint the row.
+        //
+        // Driven by NavMeshVisibleLog.StatusText, i.e. by the same line the visible
+        // log produces - the wording is shared, never duplicated. Advances whatever
+        // NavMeshConsoleMessages is set to.
+        public string NavMeshBuildStatus = NavMeshVisibleLog.IdleStatus;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -192,6 +209,10 @@ namespace BetterBannerlordNavmeshing
         private double _postImportMinMs;
         private double _postImportMaxMs;
         private double _postImportSumMs;
+
+        // Last status text already pushed to the script panel, so the tick only
+        // touches the engine when the line actually changed.
+        private string _pushedStatus = "";
 
         // Carries one async v2 build from the dispatch on the main thread to the worker and back.
         // Plain data only: the worker never touches Scene/game objects (only the terrain height
@@ -254,6 +275,48 @@ namespace BetterBannerlordNavmeshing
             // Whatever the background build queued while it was running (progress lines
             // are only safe to print from the thread that owns the editor UI).
             NavMeshVisibleLog.Pump();
+
+            // Then mirror the line that just went out into this component's own
+            // script-panel row.
+            PushBuildStatusToPanel();
+        }
+
+        // Mirrors NavMeshVisibleLog.StatusText into NavMeshBuildStatus and asks the
+        // engine to repaint that row. Main thread only (this is called from
+        // OnEditorTick); never throws.
+        //
+        // SetVariableEditorWidgetValue is the engine's own "update this variable's
+        // editor widget" call (TaleWorlds.Engine.IScriptComponent, engine method
+        // set_variable_editor_widget_value; RglSftString == 0). It is best-effort
+        // by design: if the editor does not act on it the row still holds the right
+        // text and is correct whenever the panel is rebuilt or reselected, and the
+        // authoritative value is the managed field either way.
+        private void PushBuildStatusToPanel()
+        {
+            string status = NavMeshVisibleLog.StatusText;
+            if (string.Equals(status, _pushedStatus, StringComparison.Ordinal))
+                return;
+
+            _pushedStatus = status;
+            NavMeshBuildStatus = status;
+
+            try
+            {
+                ManagedScriptComponent component = ScriptComponent;
+                if (component == null)
+                    return;
+
+                component.SetVariableEditorWidgetValue(
+                    nameof(NavMeshBuildStatus), RglScriptFieldType.RglSftString, 0.0);
+            }
+            catch (Exception)
+            {
+                // The engine logs "Field name %s can not be found for script component %s."
+                // and does nothing when the name is unknown, and an older engine may not
+                // have the method at all. Never let this break the editor tick: the row
+                // still carries NavMeshBuildStatus.
+                _pushedStatus = NavMeshBuildStatus;
+            }
         }
 
         protected override void OnEditorVariableChanged(string variableName)
