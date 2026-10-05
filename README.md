@@ -1653,6 +1653,111 @@ agent can walk up them. Set `NavMeshVoxelAgentClimbMeters` explicitly to cap tha
 `NavMeshVoxelCellSize` (halving `cs` halves the required climb). A `v2: WARNING ...` line is logged when the
 effective walkable slope falls short of `NavMeshMaxSlopeDegrees`.
 
+### Steep-and-tall faces (the contour-spike "wall")
+
+A face that is both **steeper than the walkable cap** and **taller than two agent climbs** is not a surface an
+agent can be on, yet the engine draws it and the navmesh links it - a bot handed a path onto it runs off. The
+user hit this on the CC_20 staircase: *"the part of the navmesh on the stairs that's causing a problem seems to
+all originate from sharing a point ... it is that one single point that's causing the issue."*
+
+**What it actually is.** One hub vertex, eight faces. Measured on CC_20 (`--census 1120.5,1077,5`,
+`--vmesh 1120.5,1078.5,0.45`):
+
+```
+v77745 at (1120.500, 115.700, 1078.500) ring=13
+    f133046 slope=87.1deg y=[115.70..119.50] A3d=2.745 fp=0.141
+    f133047 slope=87.4deg y=[115.70..122.30] A3d=6.168 fp=0.281
+    f133053 slope=81.6deg y=[115.70..124.10] A3d=6.649 fp=0.975
+    f133055 slope=63.9deg y=[115.70..118.90] A3d=0.664 fp=0.292
+    f133056 slope=69.6deg y=[115.70..124.10] A3d=1.504 fp=0.525
+    f133061 slope=61.1deg y=[115.70..118.90] A3d=4.533 fp=2.188
+    f239538 slope=84.5deg y=[115.70..121.50] A3d=6.862 fp=0.656
+    f239539 slope=84.5deg y=[115.70..124.10] A3d=6.862 fp=0.656
+```
+
+Eight near-vertical triangles, 61.1-87.4 deg, own height ranges **3.2-8.4 m**, all on that one vertex,
+leaping straight from the foot of the flight to treads 4-8 m up while the flight's own treads and risers run
+past them at 39-55 deg.
+
+The hub's height is the giveaway. `115.700 - 0.5 (the uniform lift) = 115.20`, and `115.20` is exactly the
+`ch`-quantised span top of the plate shared by two props that occupy the same voxel column
+(`--vprobe 1119.5,1077.5,1121.5,1079.5,114,117.5`):
+
+| prop | flags | evidence |
+|---|---|---|
+| `bd_wood_heap_b` | `0x00000000` | top face `H=114.724` -> `ch` 0.2 quantised `114.7` -> `+0.5` lift = **115.2** |
+| `stairs_bo` | `0x00000800` (HasSteps) | lowest tread `H=114.716`, same quantised height |
+| `european_castle_ladder` | `0x00000000` | the same column, `H=[107.42..123.57]` - a staircase with **no flags at all** |
+
+So the unflagged ladder and its flagged `stairs_bo` twin share a column with a wood heap whose top plate sits
+at the height of the bottom tread; the region's contour wraps that vertical stack and the poly mesh wraps a
+vertical step. That is a **Recast contour spike**, and it is born before any of our passes - it survives
+`--detail off` (not the detail mesh), `--cleanup off` (not the sliver cleanup) and dropping
+`RC_CONTOUR_TESS_WALL_EDGES` (not wall-edge tessellation - that experiment also cost 5 islands and was
+rejected). V3.46's footprint gate cannot see it: a steep-but-not-exactly-vertical face has a strictly
+**positive** XZ footprint, so `inverted=0` and `vertical=0` while the jump ships.
+
+**The rule.** A face is dropped when
+
+1. `slope > NavMeshMaxSlopeDegrees + SteepFaceMarginDegrees` (default **+10 deg**, so 60 deg at the shipped 50), **and**
+2. its **own height range** exceeds `2*agentClimb + cellHeight` (**1.4 m** at climb 0.6 / ch 0.2).
+
+Both tests are needed. Slope alone is provably wrong: on the suite's own connectivity lab the single face that
+connects *"c) staircase 1.0 m wide, 6 x 0.4 m"* from its ground to its top platform is at **71.5 deg**, and a
+pure 60 deg cut removes exactly that face and breaks the scenario. Its own height range is **1.20 m** against
+3.2-8.4 m for the fan - and that is the physical difference: an agent moves between navmesh faces only where
+they are within `walkableClimb` of each other, so a face taller than about two climbs has no point from which
+it can be entered or left. A short steep face (a kerb, a single riser, the lab's stair) is left alone.
+
+**The restore is MINIMAL, and that is the whole point.** Dropping these faces unconditionally (as the reverted
+V3.47 did) fixes the staircase but costs CC_20 **two islands (15 -> 13)** and was reverted: one high-altitude
+island (centroid `y 479-702 m`) really is only linked by a face over the cap. The island count is a hard
+acceptance criterion - the engine creates one island per component - so the pass drops every marked face and
+then **restores only the minimum set needed to hold the island count**, per split component, greedily picking
+the face that touches the most fragments. A redundant spike is never picked (some other face in the same
+component rejoins the fragments just as well); a sole-link connector is (it is the only one touching both
+sides). Contour-spike faces - a marked face sharing a vertex with two or more other marked faces - are
+deprioritised below every plain candidate, so the restore never picks a fan while any ordinary face can bridge
+the same fragments.
+
+Restoring *everything* in a split component (the overlap repair's coarser rule) was measured and is too blunt:
+it reverted **1141 of 1205** marks and the "wall" survived untouched.
+
+The pass runs **before the prune**, so any fragment a component that cannot be made whole leaves behind is
+judged by the island cap rather than shipped. One exemption: a cell covered by a **forced-walkable** triangle
+(a synthesized ramp or offset ladder connector) is the only cell allowed to carry a face above the cap - a
+ladder chain legitimately runs steeper, and that is what makes a ladder traversable. A face counts as a ramp's
+if its centroid cell **or any of its three vertex cells** is forced (Recast merges a ramp's span with the
+surrounding columns, so the seam face lies one span outside the ramp's own footprint).
+
+**Measured, CC_20 (V3.48 -> V3.49):**
+
+| | V3.48 | V3.49 |
+|---|---|---|
+| islands | 15 | **15** |
+| faces | 241727 | 241628 (-0.04%; inside the decimator's own run-to-run noise) |
+| steep(>55 deg) faces at the staircase | 11 | **6** |
+| steep area there | 39.108 m^2 | **13.657 m^2** |
+| worst slope there | 87.39 deg | **72.08 deg** |
+| the 81-87 deg leapfrog faces | 4 | **0** |
+| pass cost | - | +429 ms on a 29 s build |
+
+Suite verdicts byte-identical to the accepted baseline (all PASS except the documented LADDER-CAP failure).
+**Honest residual:** three faces at 61-72 deg survive at the staircase because the measurement says they are
+currently the only links - restoring nothing would break that piece of surface, and the pass prefers an honest
+61 deg connector over an 87 deg wall. Whether the user's bots walk the flight is their re-import to judge.
+
+Log line (warn-only, so a regression shows up as a number rather than shipping silently):
+
+```
+NavMesh: v2: steep faces: dropped 72 of 1205 marked face(s) > 60deg (maxSlope 50deg + 10deg margin) AND taller than 1.4m, worst=89.187deg, 1959 kept as short (<= 1.4m tall), first at (354.074,98.633,8.537), 116 of them in a fan at one hub, 1133 restored as the minimum needed to keep the island count in 429ms (before the prune, so any fragment it leaves is judged by the island cap)
+```
+
+and, on the gate line, `steep>60deg=<n> tallSteep=<m>` next to `inverted`/`vertical` (which *do* block).
+`tallSteep` is the vertical-jump class: **non-zero means a jump survived.** Set
+`TiledNavMeshSettings.SteepFaceMarginDegrees = 100` to disable the pass (the harness does this for its A/B
+baseline); `20` is a conservative setting that only removes unmistakable walls (>= 70 deg).
+
 ## First-run questions this milestone must answer
 
 1. **Index order**: which of `node[ix*verts+iy]` / `node[iy*verts+ix]` the engine's `GetTerrainHeightData`

@@ -34,6 +34,12 @@ namespace BetterBannerlordNavmeshing
         public static bool CaptureDetailDebug;
         public static RcPolyMeshDetail DebugDetailMesh;
 
+        // Harness-only A/B switch for the steep-face repair's connectivity guard. Never set in production;
+        // true (the default) restores only the minimum set of steep faces needed to keep the island count,
+        // false reproduces the reverted V3.47 behaviour (unconditional drop) so the two can be measured
+        // against each other on a real scene.
+        public static bool SteepFaceConnectivityGuard = true;
+
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -104,6 +110,12 @@ namespace BetterBannerlordNavmeshing
 
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
+
+            // STEEP-FACE REPAIR (slope margin above MaxSlopeDegrees). Slope alone is not the discriminator
+            // (see RepairSteepFaces); this is the margin and SteepFaceMinHeightMeters supplies the height
+            // test.   < 0 = use SteepFaceMarginDegreesDefault.   10 = default (60 deg at the shipped 50).
+            //   20+ = conservative: only the unmistakable walls (>= 70 deg) go.   100+ = disabled.
+            public float SteepFaceMarginDegrees = SteepFaceMarginDegreesDefault;
 
             // Contour edge length cap (voxels).
             public int MaxEdgeLenVoxels = 12;
@@ -178,6 +190,11 @@ namespace BetterBannerlordNavmeshing
             public int ConnectorClearedCeilings; // real spans the clearance exemption unlinked above a connector
             public int ConnectorErosionExempt;  // connector spans erosion nulled that the erosion exemption restored
             public List<float> SteppedRestoredCellXz;  // world XZ of cells whose span the exemption restored
+            public List<float> ForcedRampCellXz;    // world XZ of cells covered by a FORCED-walkable
+                                                    // triangle (a synthesized ramp or offset connector).
+                                                    // Per-face provenance for the steep-face repair: those
+                                                    // cells are the only ones allowed to carry a face
+                                                    // steeper than the walkable cap.
         }
 
         public sealed class VoxelMeshResult
@@ -241,6 +258,14 @@ namespace BetterBannerlordNavmeshing
         public int SelfOverlapPairs;    // two vertex-disjoint faces of one level laid across each other
         public int OverlappingFacesAny; // the same count including edge-sharing pairs (measured, not gated)
         public int BadQuadWalks;        // an emitted quad that is not a simple walk with the right winding
+        // Faces steeper than MaxSlopeDegrees + SteepFaceMarginDegrees that survived the steep-face repair.
+        // Reported, not blocking: the repair needs the forced-ramp provenance (empty when no stepped prop
+        // synthesized anything), a synthesized ladder chain is legitimately this steep, and a
+        // connectivity-restored steep face is deliberately still there.
+        public int SteepFaces;
+        // ... of which the ones ALSO taller than SteepFaceMinHeightMeters: the vertical-jump class. This is
+        // the actionable signal - non-zero means a jump survived the repair.
+        public int SteepTallFaces;
         // Wall clock of the two V3.46 face-quality scans (overlap + quad walk), so the cost of the
         // guard is visible in the run log next to the build it protects.
         public int FaceQualityMs;
@@ -806,6 +831,33 @@ namespace BetterBannerlordNavmeshing
                     + " (cap=" + s.StitchMaxGapCells + " cells)");
             }
 
+            // Per-face provenance for the steep-face repair: the cells covered by a FORCED-walkable triangle
+            // (a synthesized ramp or an offset symbolic connector). Those are the only cells allowed to
+            // carry a face steeper than the walkable cap - a ladder chain legitimately runs steeper than the
+            // cap and must not be cut. Collected BEFORE the per-tile structures are released below, and
+            // before the steep repair + prune that consume it.
+            HashSet<long> forcedRampCells = null;
+            {
+                float fcs = s.VoxelCellSizeMeters;
+                for (int i = 0; i < results.Length; i++)
+                {
+                    List<float> forcedXz = results[i] != null ? results[i].ForcedRampCellXz : null;
+                    if (forcedXz == null) continue;
+                    if (forcedRampCells == null) forcedRampCells = new HashSet<long>(LongKeyComparer.Instance);
+                    for (int k = 0; k + 1 < forcedXz.Count; k += 2)
+                        forcedRampCells.Add(CellKey(forcedXz[k], forcedXz[k + 1], fcs));
+                }
+            }
+
+            // STEEP-FACE REPAIR, and it must run BEFORE the prune so any fragment a component that cannot be
+            // made whole leaves behind is judged by the island cap rather than shipped. Unlike the reverted
+            // V3.47 the drops are minimally connectivity-restored (see RepairSteepFaces): the rule is
+            // unchanged, but only the faces actually needed to hold the island count are put back - which is
+            // what stops the pass from costing CC_20 two islands AND what lets it clear the staircase.
+            RepairSteepFaces(merged, forcedRampCells, s.VoxelCellSizeMeters,
+                s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
+                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), log);
+
             // Prune small isolated islands (sealed-void lids / stray fragments) before the gate, so an
             // unreachable fragment never reaches the engine. Never touches the big networks.
             if (s.PruneIsolatedIslands && s.PruneMaxIslandFaces > 0 && merged.Tris.Count >= 3)
@@ -943,7 +995,9 @@ namespace BetterBannerlordNavmeshing
             result.QuadPairs = quadPairs;
 
             // --- topology + invariants (gate) ---
-            ComputeInvariants(result, result.Tris, result.FaceCount, quadPairs);
+            ComputeInvariants(result, result.Tris, result.FaceCount, quadPairs,
+                SteepFaceThresholdDegrees(s.MaxSlopeDegrees, s.SteepFaceMarginDegrees),
+                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters));
 
             Log(log, "v2: weld verts=" + tileVertexSum + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
@@ -955,6 +1009,9 @@ namespace BetterBannerlordNavmeshing
                 + " inverted=" + result.InvertedFaces + " vertical=" + result.VerticalFaces
                 + " selfOverlap=" + result.SelfOverlapPairs + "/" + result.OverlappingFacesAny
                 + " badQuadWalks=" + result.BadQuadWalks
+                + " steep>" + F(SteepFaceThresholdDegrees(s.MaxSlopeDegrees, s.SteepFaceMarginDegrees)) + "deg="
+                + result.SteepFaces + " tallSteep=" + result.SteepTallFaces
+                + " (warn; tallSteep is the vertical-jump class - non-zero means a jump survived)"
                 + " faceQualityMs=" + result.FaceQualityMs
                 + " -> " + (result.InvariantsPassed ? "PASS" : "FAIL"));
             if (!result.InvariantsPassed)
@@ -1938,15 +1995,18 @@ namespace BetterBannerlordNavmeshing
         // cell, so the clearance pass can find the connector's own span among a column's layers.
         private static bool[] MarkSteppedCells(RcHeightfield hf, float[] vertsXyz, int[] subTris,
             List<int> tileList, bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles, float cellSize,
-            out bool[] connectorCells, out float[] connectorTop, out int connectorMarked)
+            out bool[] connectorCells, out float[] connectorTop, out int connectorMarked,
+            out bool[] forcedCells)
         {
             int w = hf.width, h = hf.height;
             var marked = new bool[w * h];
             var conn = new bool[w * h];
+            var fcell = new bool[w * h];
             var ctop = new float[w * h];
             for (int ci = 0; ci < ctop.Length; ci++) ctop[ci] = float.MinValue;
             connectorCells = conn;
             connectorTop = ctop;
+            forcedCells = fcell;
             connectorMarked = 0;
             float minX = hf.bmin.X, minZ = hf.bmin.Z;
             float half = 0.5f * cellSize;
@@ -1983,6 +2043,12 @@ namespace BetterBannerlordNavmeshing
                             || PointInTriXZ(px - half, pz + half, ax, az, bx, bz, cx, cz)
                             || PointInTriXZ(px + half, pz + half, ax, az, bx, bz, cx, cz);
                         if (!hit) continue;
+                        // A FORCED-walkable triangle (a synthesized ramp or an offset connector) makes this
+                        // cell one that is ALLOWED to carry a surface steeper than the walkable cap. Recorded
+                        // separately from `marked` because that mask drives the ledge-trim exemption and is
+                        // only consulted when that filter runs, while this provenance is needed by the
+                        // final-mesh steep-face repair whatever the ledge filter does.
+                        if (forced) fcell[ci] = true;
                         if (!marked[ci])
                         {
                             marked[ci] = true;
@@ -2444,32 +2510,50 @@ namespace BetterBannerlordNavmeshing
                 List<RcSpan>[] steppedSpans = null;
                 bool[] connectorCells = null;
                 float[] connectorTop = null;
-                if ((forcedInTile > 0 || exemptInTile > 0) && s.UseLedgeFilter)
+                if (forcedInTile > 0 || exemptInTile > 0)
                 {
                     bool[] steppedCells;
+                    bool[] forcedCells;
                     int connectorMarked;
                     steppedCells = MarkSteppedCells(hf, vertsXyz, subTris, tileList,
                         forceWalkableTriangles, ledgeExemptTriangles, s.VoxelCellSizeMeters,
-                        out connectorCells, out connectorTop, out connectorMarked);
-                    r.ConnectorForcedInTile = connectorForTile;
-                    r.ConnectorMarkedCells = connectorMarked;
-                    int marked = 0;
-                    for (int ci = 0; ci < steppedCells.Length; ci++)
-                        if (steppedCells[ci]) marked++;
-                    if (marked > 0)
+                        out connectorCells, out connectorTop, out connectorMarked, out forcedCells);
+                    // Forced-cell provenance for the final-mesh steep-face repair (see ForcedRampCellXz).
+                    // Recorded whatever the ledge filter does, so the repair never removes a synthesized
+                    // ramp face just because the trim was switched off.
+                    int forcedMarked = 0;
+                    var forcedXz = new List<float>();
+                    for (int ci = 0; ci < forcedCells.Length; ci++)
                     {
-                        steppedSpans = new List<RcSpan>[steppedCells.Length];
+                        if (!forcedCells[ci]) continue;
+                        forcedMarked++;
+                        int cxi = ci % hf.width, czi = ci / hf.width;
+                        forcedXz.Add(hf.bmin.X + (cxi + 0.5f) * s.VoxelCellSizeMeters);
+                        forcedXz.Add(hf.bmin.Z + (czi + 0.5f) * s.VoxelCellSizeMeters);
+                    }
+                    if (forcedMarked > 0) r.ForcedRampCellXz = forcedXz;
+                    if (s.UseLedgeFilter)
+                    {
+                        r.ConnectorForcedInTile = connectorForTile;
+                        r.ConnectorMarkedCells = connectorMarked;
+                        int marked = 0;
                         for (int ci = 0; ci < steppedCells.Length; ci++)
+                            if (steppedCells[ci]) marked++;
+                        if (marked > 0)
                         {
-                            if (!steppedCells[ci]) continue;
-                            for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+                            steppedSpans = new List<RcSpan>[steppedCells.Length];
+                            for (int ci = 0; ci < steppedCells.Length; ci++)
                             {
-                                if (sp.area == RcRecast.RC_NULL_AREA) continue;
-                                if (steppedSpans[ci] == null) steppedSpans[ci] = new List<RcSpan>();
-                                steppedSpans[ci].Add(sp);
+                                if (!steppedCells[ci]) continue;
+                                for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+                                {
+                                    if (sp.area == RcRecast.RC_NULL_AREA) continue;
+                                    if (steppedSpans[ci] == null) steppedSpans[ci] = new List<RcSpan>();
+                                    steppedSpans[ci].Add(sp);
+                                }
                             }
+                            r.SteppedMarkedCells = marked;
                         }
-                        r.SteppedMarkedCells = marked;
                     }
                 }
                 if (s.GapFillCells > 0)
@@ -3368,9 +3452,24 @@ namespace BetterBannerlordNavmeshing
                 for (int k = 0; k + 1 < quadPairs.Length; k += 2)
                 {
                     int f0 = quadPairs[k], f1 = quadPairs[k + 1];
-                    if (f0 < 0 || f1 < 0 || f0 >= faceCount0 || f1 >= faceCount0) continue;
+                    // A pair that cannot be carried over must be MARKED (-1), not merely skipped: the trim
+                    // below recognises a dead pair by quadPairs[k] < 0. Leaving the original face index in
+                    // place makes the trim copy it as if it were live and overrun the trimmed array.
+                    // V3.46 shipped with that hole - it never fired because until now no face drop had ever
+                    // cost a quad pair.
+                    if (f0 < 0 || f1 < 0 || f0 >= faceCount0 || f1 >= faceCount0)
+                    {
+                        if (f0 >= 0 && f1 >= 0) lostQuads++;
+                        quadPairs[k] = -1;
+                        continue;
+                    }
                     int n0 = map[f0], n1 = map[f1];
-                    if (n0 < 0 || n1 < 0 || n0 == n1) { lostQuads++; continue; }
+                    if (n0 < 0 || n1 < 0 || n0 == n1)
+                    {
+                        lostQuads++;
+                        quadPairs[k] = -1;
+                        continue;
+                    }
                     quadPairs[k] = n0;
                     quadPairs[k + 1] = n1;
                     keptQuads++;
@@ -3382,6 +3481,7 @@ namespace BetterBannerlordNavmeshing
                     for (int k = 0; k + 1 < quadPairs.Length; k += 2)
                     {
                         if (quadPairs[k] < 0) continue;
+                        if (w + 1 >= trimmed.Length) break;   // belt and braces: never overrun
                         trimmed[w++] = quadPairs[k];
                         trimmed[w++] = quadPairs[k + 1];
                     }
@@ -3424,6 +3524,395 @@ namespace BetterBannerlordNavmeshing
             log = inverted + " inverted + " + vertical + " vertical, first at ("
                 + F(firstX) + "," + F(firstY) + "," + F(firstZ) + ")";
             return removedCount;
+        }
+
+        // A face steeper than the walkable cap AND taller than an agent can step across is not a surface.
+        // The engine draws it, the navmesh links it, and a bot handed it paths onto it and falls off - the
+        // "vertical navmesh jump" the user reported on the CC_20 staircase ("The part of the navmesh on the
+        // stairs that's causing a problem seems to all originate from sharing a point ... it is that one
+        // single point that's causing the issue"), and the screenshot's "wall".
+        //
+        // MEASURED at that spot: a fan of EIGHT faces at 61.1-87.4 deg with footprints 0.14-2.19 m2, 3D areas
+        // 0.66-6.86 m2 and OWN HEIGHT RANGES 3.2-8.4 m, ALL EIGHT sharing the single vertex
+        // (1120.500, 115.700, 1078.500). That vertex is the contour vertex of the voxel column whose walkable
+        // span top is the plate shared by `bd_wood_heap_b` (top face at engine H=114.724 -> ch-quantised
+        // 114.7 -> +0.5 lift = 115.2, exactly the hub's pre-lift height) and `stairs_bo`'s lowest tread
+        // (H=114.716). The flagged twin `stairs_bo` (0x800 = HasSteps) and the unflagged
+        // `european_castle_ladder` (0x00000000) occupy the SAME column, so the region's contour wraps the
+        // vertical stack and the fan leaps from the foot straight to treads 3-8 m up.
+        //
+        // It is a Recast CONTOUR SPIKE, born before any of our passes: it survives --detail off (so it is not
+        // the detail mesh), --cleanup off (so it is not the sliver cleanup), and dropping
+        // RC_CONTOUR_TESS_WALL_EDGES (so it is not wall-edge tessellation - that experiment also cost 5
+        // islands and was rejected). V3.46's footprint gate cannot see it: a steep-but-not-exactly-vertical
+        // face has a strictly POSITIVE footprint, so inverted=0 and vertical=0 while the jump ships.
+        //
+        // WHY BOTH TESTS, and not slope alone. Slope alone is NOT the discriminator - measured, on the
+        // suite's own connectivity lab, the single face that connects "c) staircase 1.0 m wide, 6 x 0.4 m"
+        // from its ground to its top platform is at 71.5 deg, and a pure 60 deg cut removes exactly that
+        // face and breaks the scenario. Its OWN HEIGHT RANGE is 1.20 m, against 3.2-8.4 m for the fan.
+        // That is the physical difference: an agent moves between navmesh faces only where they are
+        // within walkableClimb of each other, so a face taller than about two climbs has no point from
+        // which it can be entered or left, and the engine's agent movement cannot use it however the
+        // navmesh links it. A short steep face (a kerb, a single riser, the lab's stair) is left alone.
+        //
+        // WHY THE RESTORE IS MINIMAL (this is the difference from the reverted V3.47). V3.47 used the same
+        // two tests but dropped UNCONDITIONALLY, arguing "an unwalkable face is not a route". That fixes
+        // the staircase (measured: steep >55 deg faces 11 -> 4, steep area 39.108 -> 3.450 m2, worst
+        // 87.39 -> 69.35 deg, foot 113.90 and top 124.30 still one component) but it cost CC_20 two islands
+        // (15 -> 13) and was reverted: one high-altitude island (centroid y 479-702 m) really is only linked
+        // by a face over the cap. The island count is a hard acceptance criterion, so this pass restores
+        // only the MINIMUM set of marked faces needed to keep the island count (RestoreSplitComponents) -
+        // enough to keep that island, not so much as to keep the redundant spike. The coarse alternative
+        // (KeepConnectivitySafe's all-or-nothing-per-component rule) was measured and is too blunt: it
+        // reverted 1141 of 1205 marks and the "wall" survived untouched.
+        //
+        // The pass runs BEFORE the prune, so the fragments a component that cannot be made whole leaves
+        // behind are judged by the island cap rather than shipped.
+        //
+        // The one exemption: a cell covered by a FORCED-walkable triangle. A synthesized ramp or offset
+        // connector is deliberately steeper than the walkable cap (a ladder chain runs steeper than the cap)
+        // and is the mechanism that makes a ladder traversable, so its cells are the ONLY ones allowed to
+        // carry a face above it.
+        public const float SteepFaceMarginDegreesDefault = 10f;
+
+        // The face's own height range has to exceed this to count as a jump. Two agent climbs plus one
+        // cell height (1.4 m at climb 0.6 / ch 0.2), which clears the lab stair's 1.20 m connector with
+        // room to spare and still cuts the 3.2 m+ faces at the reported spot.
+        public static float SteepFaceMinHeightMeters(float agentClimbMeters, float cellHeightMeters)
+        {
+            return 2f * agentClimbMeters + cellHeightMeters;
+        }
+
+        public static float SteepFaceThresholdDegrees(float maxSlopeDegrees, float marginDegrees)
+        {
+            if (marginDegrees < 0f) marginDegrees = SteepFaceMarginDegreesDefault;
+            float t = maxSlopeDegrees + marginDegrees;
+            if (t > 89.9f) t = 89.9f;
+            return t;
+        }
+
+        // Its own pass, so it can run BEFORE the prune (see the call site in Build). The quad pairs do not
+        // exist yet at that point, which is fine: a face this steep is never a quad (the quad merge only
+        // combines near-coplanar, thin faces).
+        private static int RepairSteepFaces(MergeOutput o, HashSet<long> forcedRampCells, float cellSize,
+            float maxSlopeDegrees, float marginDegrees, float minHeightMeters, Action<string> log)
+        {
+            int faceCount = o.Tris.Count / 3;
+            if (faceCount == 0) return 0;
+            if (SteepFaceThresholdDegrees(maxSlopeDegrees, marginDegrees) >= 89.9f) return 0;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var drop = new bool[faceCount];
+            var steepDrop = new bool[faceCount];
+            var spike = new bool[faceCount];
+            string detail;
+            int marked = MarkSteepFaces(o, drop, spike, forcedRampCells, cellSize, maxSlopeDegrees,
+                marginDegrees, minHeightMeters, out detail);
+            if (marked == 0) return 0;
+            // Every steep drop is RESTORABLE: unlike a bad FACING (a face with no ground footprint, which is
+            // malformed whatever it costs), this class is a plausible surface that is merely too steep to
+            // walk, so the island count gets a vote - but only for the faces it actually needs.
+            for (int f = 0; f < faceCount; f++) steepDrop[f] = drop[f];
+            int restored = SteepFaceConnectivityGuard
+                ? RestoreSplitComponents(o, drop, steepDrop, spike)
+                : 0;
+            int removed = marked - restored;
+            if (removed == 0)
+            {
+                Log(log, "v2: steep faces: marked " + marked + " face(s) " + detail
+                    + " - all " + marked + " restored to keep the island count, none dropped, in "
+                    + watch.ElapsedMilliseconds + "ms");
+                return 0;
+            }
+            CompactFaces(o, drop);
+            Log(log, "v2: steep faces: dropped " + removed + " of " + marked + " marked face(s) " + detail
+                + (restored > 0 ? ", " + restored + " restored as the minimum needed to keep the island count"
+                    : "")
+                + " in " + watch.ElapsedMilliseconds + "ms (before the prune, so any fragment it leaves"
+                + " is judged by the island cap)");
+            return removed;
+        }
+
+        private static int MarkSteepFaces(MergeOutput o, bool[] drop, bool[] spike, HashSet<long> forcedRampCells,
+            float cellSize, float maxSlopeDegrees, float marginDegrees, float minHeightMeters, out string log)
+        {
+            int faceCount = o.Tris.Count / 3;
+            double thrRad = SteepFaceThresholdDegrees(maxSlopeDegrees, marginDegrees) * Math.PI / 180.0;
+            double sinThr = Math.Sin(thrRad);
+            int removed = 0, forcedKept = 0, shortKept = 0;
+            float firstX = 0f, firstY = 0f, firstZ = 0f, worstDeg = 0f;
+            bool haveFirst = false;
+            for (int i = 0; i < faceCount; i++)
+            {
+                int a = o.Tris[i * 3], b = o.Tris[i * 3 + 1], c = o.Tris[i * 3 + 2];
+                double ux = o.X[b] - o.X[a], uy = o.Y[b] - o.Y[a], uz = o.Z[b] - o.Z[a];
+                double wx = o.X[c] - o.X[a], wy = o.Y[c] - o.Y[a], wz = o.Z[c] - o.Z[a];
+                double nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                if (len < 1e-12) continue;                 // degenerate: MarkBadFacings owns it
+                // sin(slope) is the horizontal share of the normal: sin(slope) > sin(threshold) <=> the face
+                // is steeper than the threshold, with no acos and no sign handling to get wrong.
+                double horiz = Math.Sqrt(nx * nx + nz * nz) / len;
+                if (horiz <= sinThr) continue;
+                // ... AND tall: the face's own height range must exceed what an agent could step across. A
+                // short steep face is a kerb or a single riser and is legitimate; see the header.
+                float yLo = Math.Min(o.Y[a], Math.Min(o.Y[b], o.Y[c]));
+                float yHi = Math.Max(o.Y[a], Math.Max(o.Y[b], o.Y[c]));
+                if (yHi - yLo <= minHeightMeters) { shortKept++; continue; }
+                // Forced-ramp cells are exempt (see header). A face belongs to the ramp if its CENTROID cell
+                // or ANY of its three VERTEX cells is a forced cell: Recast merges a ramp's span with the
+                // surrounding columns, and the face at that seam lies one span outside the ramp's own
+                // footprint - measured on the suite's Test 23 (b) (ladder, floor to floor), where a
+                // centroid-only test cut the single face that joins the ramp to the floor.
+                if (forcedRampCells != null && forcedRampCells.Count > 0)
+                {
+                    float cx = (o.X[a] + o.X[b] + o.X[c]) / 3f;
+                    float cz = (o.Z[a] + o.Z[b] + o.Z[c]) / 3f;
+                    if (forcedRampCells.Contains(CellKey(cx, cz, cellSize))
+                        || forcedRampCells.Contains(CellKey(o.X[a], o.Z[a], cellSize))
+                        || forcedRampCells.Contains(CellKey(o.X[b], o.Z[b], cellSize))
+                        || forcedRampCells.Contains(CellKey(o.X[c], o.Z[c], cellSize))) {
+                        forcedKept++;
+                        continue;
+                    }
+                }
+                drop[i] = true;
+                removed++;
+                double deg = Math.Asin(horiz > 1.0 ? 1.0 : horiz) * 180.0 / Math.PI;
+                if (deg > worstDeg) worstDeg = (float)deg;
+                if (!haveFirst)
+                {
+                    haveFirst = true;
+                    firstX = (o.X[a] + o.X[b] + o.X[c]) / 3f;
+                    firstY = (o.Y[a] + o.Y[b] + o.Y[c]) / 3f;
+                    firstZ = (o.Z[a] + o.Z[b] + o.Z[c]) / 3f;
+                }
+            }
+            log = "> " + F(SteepFaceThresholdDegrees(maxSlopeDegrees, marginDegrees)) + "deg"
+                + (maxSlopeDegrees > 0f ? " (maxSlope " + F(maxSlopeDegrees) + "deg + "
+                    + F(marginDegrees) + "deg margin)" : "")
+                + " AND taller than " + F(minHeightMeters) + "m"
+                + ", worst=" + F(worstDeg) + "deg"
+                + (forcedKept > 0 ? ", " + forcedKept + " kept on forced-ramp cells" : "")
+                + (shortKept > 0 ? ", " + shortKept + " kept as short (<= " + F(minHeightMeters) + "m tall)" : "")
+                + ", first at (" + F(firstX) + "," + F(firstY) + "," + F(firstZ) + ")";
+
+            // CONTOUR-SPIKE SIGNATURE: a marked face that shares a vertex with at least two OTHER marked
+            // faces is part of a fan at one hub, which is exactly the shape Recast's contour produces when a
+            // boundary vertex takes its height from a span metres below its neighbours (the reported
+            // staircase: eight marked faces on the single vertex (1120.500, 115.700, 1078.500)). A fan is not
+            // a route - the levels it spans are joined by the flight itself - so the connectivity restore
+            // below never picks one while any other candidate bridges the same fragments. A lone steep face
+            // (the lab's stair riser, a real ledge) is not a fan and keeps its normal priority.
+            var hubCount = new Dictionary<int, int>();
+            for (int i = 0; i < faceCount; i++)
+            {
+                if (!drop[i]) continue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int v = o.Tris[i * 3 + k];
+                    int n;
+                    hubCount[v] = hubCount.TryGetValue(v, out n) ? n + 1 : 1;
+                }
+            }
+            int fans = 0;
+            for (int i = 0; i < faceCount; i++)
+            {
+                if (!drop[i]) continue;
+                if (hubCount[o.Tris[i * 3]] >= 3 || hubCount[o.Tris[i * 3 + 1]] >= 3
+                    || hubCount[o.Tris[i * 3 + 2]] >= 3) { spike[i] = true; fans++; }
+            }
+            log += ", " + fans + " of them in a fan at one hub";
+            return removed;
+        }
+
+        // MINIMAL connectivity restoration for the steep-face repair - the reason this pass can fix the
+        // reported staircase WITHOUT costing an island.
+        //
+        // KeepConnectivitySafe (the overlap repair's guard) is all-or-nothing PER COMPONENT: if dropping the
+        // marked faces splits any component, EVERY marked face in it is put back. Applied to the steep class
+        // that is far too coarse, and measurably so on CC_20: the class is 1205 faces spread over many
+        // components, so one genuinely load-bearing steep connector anywhere puts every other component's
+        // steep faces back too - including the eight-face contour-spike fan at the reported staircase, whose
+        // levels are ALSO joined by a real 42-69 deg chain. Measured: with the coarse guard 1141 of 1205
+        // marks were reverted and the "wall" survived; unguarded, the staircase was fixed but CC_20 lost 2
+        // islands (15 -> 13).
+        //
+        // This restores the MINIMUM. For every original component the drop split, put back only the marked
+        // faces needed to make it whole, greedily choosing the face that touches the most fragments (ties
+        // broken by the total fragment size it would rejoin, then by face index, so the choice is
+        // deterministic). A redundant spike is never picked, because another face in the same component
+        // rejoins the fragments just as well; a sole-link connector IS picked, because it is the only one
+        // touching both sides. A component that cannot be made whole (nothing left touches two fragments)
+        // is left split and the prune judges the fragments - which is what the pass ordering is for.
+        //
+        // Cost: two union-find passes over the face graph (the same pair KeepConnectivitySafe already pays)
+        // plus one vertex->face map and a per-component greedy.
+        private static int RestoreSplitComponents(MergeOutput o, bool[] drop, bool[] restorable, bool[] spike)
+        {
+            int nf = o.Tris.Count / 3;
+            int pending = 0;
+            for (int f = 0; f < nf; f++) if (drop[f] && restorable[f]) pending++;
+            if (pending == 0) return 0;
+
+            int[] comp0 = FaceComponentsOf(o.Tris, nf);
+
+            // Tentative drop -> the surviving face list, plus the old->new face map and its reverse.
+            var kept = new List<int>(o.Tris.Count);
+            var map = new int[nf];
+            for (int f = 0; f < nf; f++)
+            {
+                if (drop[f] && restorable[f]) { map[f] = -1; continue; }
+                map[f] = kept.Count / 3;
+                kept.Add(o.Tris[f * 3]);
+                kept.Add(o.Tris[f * 3 + 1]);
+                kept.Add(o.Tris[f * 3 + 2]);
+            }
+            int nf2 = kept.Count / 3;
+            if (nf2 == 0) return 0;
+            int[] comp1 = FaceComponentsOf(kept, nf2);
+            var origOf = new int[nf2];
+            for (int f = 0; f < nf; f++) if (map[f] >= 0) origOf[map[f]] = f;
+
+            // vertex -> surviving faces, so a dropped face can be scored by the fragments it would rejoin.
+            var vFaces = new Dictionary<int, List<int>>();
+            for (int f = 0; f < nf2; f++)
+                for (int k = 0; k < 3; k++)
+                {
+                    int v = kept[f * 3 + k];
+                    List<int> lst;
+                    if (!vFaces.TryGetValue(v, out lst)) { lst = new List<int>(4); vFaces[v] = lst; }
+                    lst.Add(f);
+                }
+
+            var fragOf = new int[nf2];
+            var fragSize = new Dictionary<int, int>();
+            for (int f = 0; f < nf2; f++)
+            {
+                int fr = comp1[f];
+                fragOf[f] = fr;
+                int sz;
+                fragSize[fr] = fragSize.TryGetValue(fr, out sz) ? sz + 1 : 1;
+            }
+
+            // How many distinct fragments does each ORIGINAL component own? Counted with a hashed
+            // (component, fragment) key: a per-component List.Contains would be O(fragments) per face,
+            // i.e. O(F^2) on a component the size of the castle.
+            var seenPair = new HashSet<long>();
+            var fragCount = new Dictionary<int, int>();
+            var splitFaces = new Dictionary<int, List<int>>();
+            var candsOfComp = new Dictionary<int, List<int>>();
+            for (int f = 0; f < nf2; f++)
+            {
+                int c = FaceFind(comp0, origOf[f]);
+                if (!seenPair.Add(((long)c << 32) ^ (uint)fragOf[f]))
+                {
+                    // Second face of an already-counted fragment: remember it only once we know the
+                    // component splits (checked below, on the first face's count).
+                    continue;
+                }
+                int n;
+                fragCount[c] = fragCount.TryGetValue(c, out n) ? n + 1 : 1;
+            }
+            // Marked faces per component, and the surviving faces of the components that split. One pass,
+            // and only the components the drop actually fragmented are materialised.
+            for (int f = 0; f < nf; f++)
+            {
+                if (!drop[f] || !restorable[f]) continue;
+                int c = FaceFind(comp0, f);
+                int n;
+                if (!fragCount.TryGetValue(c, out n) || n <= 1) continue;
+                List<int> lst;
+                if (!candsOfComp.TryGetValue(c, out lst)) { lst = new List<int>(); candsOfComp[c] = lst; }
+                lst.Add(f);
+            }
+            foreach (int c in candsOfComp.Keys)
+                splitFaces[c] = new List<int>();
+            for (int f = 0; f < nf2; f++)
+            {
+                int c = FaceFind(comp0, origOf[f]);
+                List<int> lst;
+                if (!splitFaces.TryGetValue(c, out lst)) continue;
+                lst.Add(f);
+            }
+
+            int restored = 0;
+            foreach (KeyValuePair<int, List<int>> kv in candsOfComp)
+            {
+                // The fragment list for this component, built only now and only for split components.
+                var fragSeen = new HashSet<int>();
+                var frags = new List<int>();
+                List<int> mine = splitFaces[kv.Key];
+                for (int i = 0; i < mine.Count; i++)
+                    if (fragSeen.Add(fragOf[mine[i]])) frags.Add(fragOf[mine[i]]);
+                if (frags.Count <= 1) continue;
+                List<int> cands = kv.Value;
+
+                // Union-find over this component's fragment ids.
+                var fragRoot = new Dictionary<int, int>();
+                for (int i = 0; i < frags.Count; i++) fragRoot[frags[i]] = frags[i];
+                Func<int, int> find = delegate (int x)
+                {
+                    int r = x;
+                    while (fragRoot[r] != r) r = fragRoot[r];
+                    while (fragRoot[x] != r) { int nx = fragRoot[x]; fragRoot[x] = r; x = nx; }
+                    return r;
+                };
+                int remaining = frags.Count;
+
+                while (remaining > 1)
+                {
+                    int best = -1, bestTouch = 0, bestSize = 0;
+                    bool bestSpike = true;      // a non-fan face always outranks a fan face
+                    for (int i = 0; i < cands.Count; i++)
+                    {
+                        int f = cands[i];
+                        if (!drop[f]) continue;                  // already restored
+                        // Distinct fragment roots this face touches, and the total size it would rejoin.
+                        int touched = 0, size = 0, rootSeen = -1;
+                        int first = -1;
+                        bool twoSides = false;
+                        for (int k = 0; k < 3 && !twoSides; k++)
+                        {
+                            List<int> lst;
+                            if (!vFaces.TryGetValue(o.Tris[f * 3 + k], out lst)) continue;
+                            for (int q = 0; q < lst.Count; q++)
+                            {
+                                int fr = fragOf[lst[q]];
+                                int r = find(fr);
+                                if (r != rootSeen) { touched++; size += fragSize[fr]; rootSeen = r; }
+                                if (first < 0) first = r; else if (r != first) { twoSides = true; }
+                            }
+                        }
+                        if (!twoSides) continue;                 // touches one fragment only: cannot bridge
+                        bool isSpike = spike != null && spike[f];
+                        bool better = isSpike != bestSpike
+                            ? !isSpike                              // never pick a fan while a plain face can
+                            : (touched > bestTouch || (touched == bestTouch && size > bestSize));
+                        if (best < 0 || better)
+                        {
+                            best = f; bestTouch = touched; bestSize = size; bestSpike = isSpike;
+                        }
+                    }
+                    if (best < 0) break;                         // nothing left that bridges
+                    int seen = -1;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        List<int> lst;
+                        if (!vFaces.TryGetValue(o.Tris[best * 3 + k], out lst)) continue;
+                        for (int q = 0; q < lst.Count; q++)
+                        {
+                            int r = find(fragOf[lst[q]]);
+                            if (r == seen) continue;
+                            if (seen >= 0) { fragRoot[seen] = r; remaining--; }
+                            seen = r;
+                        }
+                    }
+                    drop[best] = false;
+                    restored++;
+                }
+            }
+            return restored;
         }
 
         // Marks (does not remove) the redundant face of every same-level overlap - the face whose ground
@@ -3710,16 +4199,26 @@ namespace BetterBannerlordNavmeshing
         //                   centroid: two surfaces laid across each other, the crisscrossing X.
         //   BadQuadWalks - an emitted 4-vertex face that is not a simple walk with the winding and the XZ
         //                   convexity of the two triangles it replaces (a bowtie would be the X).
+        //   SteepFaces / SteepTallFaces - faces past the walkable cap, and the subset that is also taller
+        //                   than two agent climbs (the "vertical jump" class). Reported, NOT blocking: the
+        //                   steep repair needs the forced-ramp provenance (empty when no stepped prop
+        //                   synthesized anything), a synthesized ladder chain is legitimately this steep,
+        //                   and a connectivity-restored steep face is deliberately still there. The count
+        //                   sits on the invariants line next to inverted/vertical, which do block, so a
+        //                   regression in the repair shows up as a number instead of shipping silently.
         // The first three are removed by the repairs above; the fourth is guaranteed by MergeQuads. All
-        // four are re-measured here, so a regression anywhere between them fails the gate instead of
+        // are re-measured here, so a regression anywhere between them fails the gate instead of
         // reaching the engine.
-        private static void ComputeInvariants(VoxelMeshResult result, int[] tris, int faceCount, int[] quadPairs)
+        private static void ComputeInvariants(VoxelMeshResult result, int[] tris, int faceCount, int[] quadPairs,
+            float steepThresholdDegrees, float steepMinHeightMeters)
         {
             result.InvertedFaces = 0;
             result.VerticalFaces = 0;
             result.SelfOverlapPairs = 0;
             result.BadQuadWalks = 0;
             result.OverlappingFacesAny = 0;
+            result.SteepFaces = 0;
+            result.SteepTallFaces = 0;
             result.FaceQualityMs = 0;
             if (tris == null || faceCount == 0)
             {
@@ -3792,6 +4291,35 @@ namespace BetterBannerlordNavmeshing
                 result.OverlappingFacesAny = totalOverlaps;
             }
             int badQuads = CheckQuadWalks(result, quadPairs);
+            // The steep-face class (see the header). Reported, not part of the verdict.
+            int steepFaces = 0, steepTallFaces = 0;
+            if (result.VertsXyz != null && steepThresholdDegrees > 0f)
+            {
+                double sinThr = Math.Sin(steepThresholdDegrees * Math.PI / 180.0);
+                for (int f = 0; f < faceCount; f++)
+                {
+                    int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
+                    if (a == b || b == c || a == c) continue;
+                    double ux = result.VertsXyz[b * 3] - result.VertsXyz[a * 3];
+                    double uy = result.VertsXyz[b * 3 + 1] - result.VertsXyz[a * 3 + 1];
+                    double uz = result.VertsXyz[b * 3 + 2] - result.VertsXyz[a * 3 + 2];
+                    double wx = result.VertsXyz[c * 3] - result.VertsXyz[a * 3];
+                    double wy = result.VertsXyz[c * 3 + 1] - result.VertsXyz[a * 3 + 1];
+                    double wz = result.VertsXyz[c * 3 + 2] - result.VertsXyz[a * 3 + 2];
+                    double nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+                    double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                    if (len < 1e-12) continue;
+                    double horiz = Math.Sqrt(nx * nx + nz * nz) / len;
+                    if (horiz <= sinThr) continue;
+                    steepFaces++;
+                    float yLo = Math.Min(result.VertsXyz[a * 3 + 1],
+                        Math.Min(result.VertsXyz[b * 3 + 1], result.VertsXyz[c * 3 + 1]));
+                    float yHi = Math.Max(result.VertsXyz[a * 3 + 1],
+                        Math.Max(result.VertsXyz[b * 3 + 1], result.VertsXyz[c * 3 + 1]));
+                    if (yHi - yLo > steepMinHeightMeters) steepTallFaces++;
+                }
+            }
+            result.SteepTallFaces = steepTallFaces;
             result.FaceQualityMs = (int)qualityWatch.ElapsedMilliseconds;
 
             result.EdgeCount = edgeMult.Count;
@@ -3804,6 +4332,7 @@ namespace BetterBannerlordNavmeshing
             result.VerticalFaces = vertical;
             result.SelfOverlapPairs = selfOverlaps;
             result.BadQuadWalks = badQuads;
+            result.SteepFaces = steepFaces;
             // SelfOverlapPairs is deliberately NOT part of the verdict, and that is a measured decision, not
             // an oversight: clearing it costs real coverage. The repair drops the redundant face of every
             // vertex-disjoint overlapping pair whose removal keeps the island count - and on CC_20 every
