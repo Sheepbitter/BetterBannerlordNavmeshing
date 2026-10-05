@@ -390,7 +390,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **inserts** a midpoint into long thin faces (first, so the later passes clean its children), **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, slides ratio needles, and finishes with a Delaunay-style flip polish. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
 | `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
-| `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. `false` = the pre-pass output. See *Gate / door plate blend*. |
+| `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. Then a second stage, **the seam**, bridges a genuine void next to a blended plate - two triangles reusing the four existing vertices so the engine gets an edge portal - only where the gap is 0.1-1.5 m, the step is inside the climb, the strip is no steeper than `NavMeshMaxSlopeDegrees` and its own footprint is empty; 71 / 80 / 110 voids closed on CC_20 / Birtu / Basamu with the island counts unchanged and the suite byte-identical. `false` = the pre-pass output byte for byte. See *Gate / door plate blend*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -1282,22 +1282,88 @@ back where they were.
 | `--connect` foot -> through -> far-side pairs across the gate | 3 of 5 (2 had no face within 2 m) | **5 of 5 CONNECTED** |
 | islands / `selfOverlap` | 15 / `1/118` | **15 / `1/118`** |
 
-**Bars (unchanged where they were acceptance criteria).** CC_20 **islands 15**, both assert points on island 0,
-`SNAPSHOT: PASS`; Birtu **islands 5**, `ladders total=2` (`civilian_ladder_5m`, `civilian_ladder_6m`) with all
-four ladder probe points `isl=1`; Basamu **islands 1**; `maxEdgeMult=2`, `inverted=0`, `vertical=0`,
-`selfOverlap` and `--scan OVERLAPpairs` **identical to the setting-off build on all three maps** (88/10/85 pairs);
-suite verdicts byte-identical to the stored baseline (every test PASS, the documented `detailFaces>=fanFaces
-False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS) and **no plate is blended anywhere in the suite**. Cost:
-22 ms on Birtu, 112 ms on CC_20, 196 ms on Basamu. `NavMeshVoxelGatePlateBlend=false` restores the old output
-byte for byte.
+#### V3.53: the seam - a void next to the plate is not a slope problem
 
-**Honest residual.** The rotation pivots on the plate's own centroid, so the median offset is what balances the
-ends and a *single* outlier neighbour inside the ring still biases the gradient (the gate's residual is 0.495 m
-against a 0.6 m climb - inside, but with 0.1 m of headroom, and the SE exit keeps a 57.5 deg riser because that
-face is the only thing holding the plate's corner to the wall base). A gate dropped on a *steep ramp prop* rather
-than on open slope is the case this does not yet prove: the ring then samples the prop's own ramp as well as the
-ground, and the `proudMax` ceiling can refuse the plate outright. That is worth its own round with the user's own
-gate-on-a-ramp screenshot. The user's re-import is the acceptance test either way.
+The user's next report was *"The slope is fixed at the gate. It looks great, but it didn't connect still."* The
+measurement says that is a **different defect**, and it is not the plate's slope.
+
+**What the engine needs, and what the harness had been measuring.** `FaceComponents` counts edge adjacency and
+`--probe` only asks whether a column is covered; the engine does neither. It re-voxelizes the imported faces and
+links two polys when their XZ columns **touch** and their floors differ by at most its climb. A surface can
+therefore be edge-connected around a loop and still be uncrossable where the user walks. `--walk "x,z;x,z;..."` now
+does that test literally - minimum **footprint** distance between the two triangles (vertex-to-triangle both ways,
+which is what "adjacent columns" means), height difference over the whole contact region, breadth-first over faces
+- and prints the route with every step's `dy` and footprint gap. `--pinch` and `--soup` were added alongside it:
+`--pinch` finds vertices whose incident faces share no edge (a point touch), `--soup` dumps the merged soup's
+triangles in a box with their slopes, which is the only way to ask "is there walkable collision in that hole".
+
+**The void.** Probing along `z = 991` through the gate in 0.5 m steps (`--probe`) - and **identically** with
+`NavMeshVoxelGatePlateBlend` **off**, so this is not the blend's doing:
+
+```
+x=1128 86.24 | 1129 86.24 | 1130 86.15 | 1131 85.77 | 1132 85.53 | 1133 ---- | 1133.5 ---- | 1134 85.03 | 1135 ---- | 1135.5 84.90 | 1136 84.97
+```
+
+Two bare columns right at the plate's east end, plus a larger 4 x 3 m patch south-east of the passage
+(`x 1131..1135`, `z 992..994`) on 12-18 deg terrain. `--pinch` finds **zero** pinch vertices within 30 m - the
+surface is properly edge-connected - so this is coverage, not topology.
+
+**Why the gap fill misses it.** `FillNarrowGaps` runs at `TiledNavMeshBuilder.cs:3077`, **before**
+`FilterLedgeSpans` (3103) and `FilterWalkableLowHeightSpans` (3148). The gate threshold beam's own underside sits
+0.3-0.9 m above the terrain in the doorway (`--soup 1132,991,1137,996,82,88` shows the beam's vertical faces at
+x 1132.3-1133.4 spanning 84.75-85.59 lifted, over terrain at 83.84-84.72), so those terrain columns still hold a
+walkable span when the gap fill looks at them and are denied clearance a few lines later. Nothing re-fills them
+afterwards, and the resulting band is also wider than the 2-cell (0.5 m) gap-fill cap. `--ledge off` and
+`--climb 1.0` each restore 6 of the 13 probed columns, but only at the 92.3 m battlement - never on the ground -
+which is the proof that neither the ledge filter nor the climb is the operative rule here.
+
+**What ships: `ClosePlateSeams`.** For every plate the blend has just rotated, each of its **mesh-boundary** edges
+(edge multiplicity exactly 1) is offered the nearest foreign **boundary** edge across a gap, and the pair is
+bridged by two triangles that **reuse the four existing vertices**: `(a,b,v)` and `(a,v,u)`, so both boundary edges
+become interior and the engine gets a real **edge portal**, not a corner touch. Every guard below was added because
+its absence was measured, not guessed:
+
+| guard | what happened without it |
+|---|---|
+| `0.1 m <= gap <= 1.5 m` | a touching pair is already connected; past 1.5 m it is a missing prop, not a seam |
+| height step over the whole contact `<= climb` (0.6 m), bounded by the closest pair **plus** each edge's own height variation | measuring only the closest pair lets a steep foreign edge through - and the closest pair of two edge-sharing triangles is always a shared vertex where both surfaces agree, i.e. `dy = 0.000` |
+| `gap * tan(MaxSlopeDegrees) >= step` | otherwise the "seam" is a riser, which is what an agent meets at a void |
+| no vertex shared between the two edges; strip area `>= 0.08 m^2`; segments must not cross | degenerate strips, and strips whose two triangles overlap |
+| `(a,v)` unused; `(a,u)` and `(b,v)` not already shared by two faces | the two triangles add `(a,v)` **twice**, so an existing shared edge there goes four-way: **measured on Birtu, `maxEdgeMult=4`, invariants FAIL, the module refuses to import** |
+| **the strip's own footprint must be empty** | the nearest boundary edge is not always across a void - it can be round the side of a step, and the strip then lands on real geometry. **Measured: 23 of CC_20's 24 `selfOverlap` pairs, and once the cleanup deleted the face holding a component together, CC_20 15 -> 16 islands and Basamu 1 -> 2.** Four sample points (both triangle centroids, both diagonal midpoints) must each be uncovered by any face within `climb + ch` of the strip's own height |
+| each edge consumed once; `GatePlateSeamMaxCount` (1024) cap | two plates bridging the same void twice |
+| whole-mesh recount afterwards, refuse the whole batch if any edge is over-shared | the guards are index-space arithmetic and a mistake costs the entire import |
+
+**Why reusing the vertices is not a detail.** A first version added exact copies of the four vertices and let the
+final weld merge them back. They did merge - through the **sliver cleanup**, which welds *by position* - but onto a
+**nearby** vertex, so the strip's edges became edges the multiplicity bookkeeping had never seen, and Birtu failed
+its invariants. Reusing the originals keeps every added edge in the index space the guards were written in, adds no
+vertex, and keeps the pass's "0 vertices added" claim true.
+
+Measured: **CC_20 71 voids, Birtu 80, Basamu 110** bridged (widest 1.5 m, worst step 0.6 m = the climb);
+`maxEdgeMult=2`, `inverted=0`, `vertical=0`, `badQuadWalks=0`, invariants **PASS** on all three; **islands CC_20 15,
+Birtu 5, Basamu 1**, all unchanged; `selfOverlap` CC_20 **1** (unchanged) and Birtu **0**. `--dumpnear
+1130.5,990.9,9` before/after shows the new triangles inside the former bare band.
+
+**Bars.** Suite verdicts **110/110 byte-identical** to the stored baseline (every test PASS, the documented
+`detailFaces>=fanFaces False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS); no plate is blended and no seam is
+emitted anywhere in the suite, so the suite is untouched by construction. Birtu `ladders total=2`
+(`civilian_ladder_5m` at 302.60/314.95, `civilian_ladder_6m` at 300.08/279.32), both probe points on island 1.
+`NavMeshVoxelGatePlateBlend=false` emits no `gate plates:` and no `gate plate seams:` line at all, i.e. the
+pre-pass output byte for byte. Both variants build 0 warnings / 0 errors, deployed.
+
+**Honest residual - the important one.** The seam does **not** close the specific void immediately east of the
+CC_20 gate's plate, and that is the spot the user circled. Its west side is the plate's **degree-1** east tip: a
+single vertex with no boundary edge facing the gap, so an edge-to-edge seam has nothing to weld to there, and the
+far side is bounded by *interior* terrain edges. `--walk` still reports the gate `WALKABLE` end to end (foot ->
+through -> far side, every step `dy=0.000`, widest footprint gap `0.000`) with the blend both on and off, because
+the mesh crosses the passage at `z ~ 989` where it is continuous - so the passage line the user walks *is*
+connected, and `(1133, 991)` stays bare in both builds. Closing it needs the plate's **footprint to grow** across
+the beam's own collision edge (the beam's colliders reach x = 1133.465 while the plate's built faces stop at
+x = 1133.0, because erosion eats one cell and the contour simplifier another), and that is a coverage change, not
+a seam - it needs its own design that can prove the island count the way the guards above do. Basamu's 11 new
+`selfOverlap` pairs (from 0) are the same class: strips that clear all four sample points and still graze a
+neighbour. Both are follow-ups, not something this round can claim.
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 

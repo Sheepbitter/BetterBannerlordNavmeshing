@@ -44,6 +44,10 @@ namespace BetterBannerlordNavmeshing
         // was rejected). Never set in production; off means the run log only carries the summary counters.
         public static bool GatePlateTrace;
 
+        // Harness-only: cap on the seams ClosePlateSeams may emit. 0 disables the seam stage while leaving the
+        // plate blend itself running, which is how the two halves of the pass are told apart on a real scene.
+        public static int GatePlateSeamCap = GatePlateSeamMaxCount;
+
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -2072,6 +2076,16 @@ namespace BetterBannerlordNavmeshing
                     report.Length = 0;
                 }
             }
+
+            // --- 6. SEAM. The rotation fixes the plate's SLOPE; it cannot fix the void between the plate's
+            //     own boundary and the ground it has to join (see GatePlateSeamMinGapMeters for the measured
+            //     0.75 m / 0.50 m case and why FillNarrowGaps misses it). Emit the missing strip, welded edge to
+            //     edge so the engine gets a real EDGE portal rather than a corner touch.
+            int seamTris = ClosePlateSeams(o, plans, isPlate, climb, maxSlopeDegrees,
+                forcedRampCells, cs, ch, log, grid, gcell,
+                out int seamCount, out float seamWidest, out float seamWorstStep);
+            if (seamCount > 0 && seamTris == 0) seamCount = 0;   // the self-check refused the whole batch
+
             Log(log, "v2: gate plates: examined=" + candidates + " blended=" + plans.Count
                 + " (" + blendedFaces + " faces rotated in place onto " + plans.Count
                 + " fitted plane(s); " + (o.X.Count - verts0)
@@ -2081,7 +2095,390 @@ namespace BetterBannerlordNavmeshing
                 + rejBetter + "] in " + watch.ElapsedMilliseconds + "ms (climb=" + F(climb)
                 + "m proudMax=" + F(GatePlateProudMaxMeters) + "m flatDeg=" + F(GatePlateFlatDegrees)
                 + " ring=" + F(ring) + "m)");
+            if (seamCount > 0)
+            {
+                Log(log, "v2: gate plate seams: " + seamCount + " void(s) bridged, " + seamTris
+                    + " triangles welded edge-to-edge (widest=" + F(seamWidest) + "m, worst step="
+                    + F(seamWorstStep) + "m, cap " + F(GatePlateSeamMaxGapMeters)
+                    + "m, only between already-connected faces so no island can move)");
+            }
             return blendedFaces;
+        }
+
+        // Bridges a plate boundary edge to the nearest foreign boundary edge across a real void, as two
+        // triangles welded edge-to-edge. Only pairs of faces that already share a component are bridged, so the
+        // island count cannot change; the strip is shallow by construction and its cells go into
+        // forcedRampCells so the steep-face repair and the cleanup leave it alone.
+        private static int ClosePlateSeams(MergeOutput o, List<PlatePlan> plans, bool[] isPlate, float climb,
+            float maxSlopeDegrees, HashSet<long> forcedRampCells, float cs, float ch, Action<string> log,
+            Dictionary<long, List<int>> grid, float gcell,
+            out int seamCount, out float widest, out float worstStep)
+        {
+            seamCount = 0; widest = 0f; worstStep = 0f;
+            int faceCount = o.Tris.Count / 3;
+            if (faceCount < 3 || plans.Count == 0) return 0;
+
+            // edge multiplicity over the WHOLE mesh: a multiplicity of 1 is a mesh boundary edge, and that is
+            // the only kind of edge a seam may hang off (welding to an interior edge would overlap a face).
+            var emult = new Dictionary<long, int>(LongKeyComparer.Instance);
+            var eface = new Dictionary<long, int>(LongKeyComparer.Instance);
+            for (int f = 0; f < faceCount; f++)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = o.Tris[f * 3 + k], i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                    long key = StitchEdgeKey(i0, i1);
+                    int n;
+                    emult.TryGetValue(key, out n);
+                    emult[key] = n + 1;
+                    eface[key] = f;
+                }
+            }
+
+            // one component per face, so a seam is only ever emitted inside a component
+            var comp = new int[faceCount];
+            for (int i = 0; i < faceCount; i++) comp[i] = i;
+            for (int f = 0; f < faceCount; f++)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = o.Tris[f * 3 + k], i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                    long key = StitchEdgeKey(i0, i1);
+                    int n;
+                    emult.TryGetValue(key, out n);
+                    if (n != 2) continue;
+                    int other;
+                    if (!eface.TryGetValue(key, out other) || other == f) continue;
+                    int ra = FaceFind(comp, f), rb = FaceFind(comp, other);
+                    if (ra != rb) comp[ra] = rb;
+                }
+            }
+
+            // grid the foreign BOUNDARY edges so the nearest-edge query is local
+            float ecell = Math.Max(GatePlateSeamMaxGapMeters, Math.Max(4f * cs, 1f));
+            var egrid = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
+            var edgeV = new List<int>();
+            for (int f = 0; f < faceCount; f++)
+            {
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = o.Tris[f * 3 + k], i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                    long key = StitchEdgeKey(i0, i1);
+                    int n;
+                    emult.TryGetValue(key, out n);
+                    if (n != 1) continue;
+                    if (isPlate[f]) continue;
+                    int id = edgeV.Count / 2;
+                    edgeV.Add(i0); edgeV.Add(i1);
+                    float mx = (o.X[i0] + o.X[i1]) * 0.5f, mz = (o.Z[i0] + o.Z[i1]) * 0.5f;
+                    long gk = unchecked(((long)(int)Math.Floor(mx / ecell) << 32)
+                        | (uint)(int)Math.Floor(mz / ecell));
+                    List<int> lst;
+                    if (!egrid.TryGetValue(gk, out lst)) { lst = new List<int>(); egrid[gk] = lst; }
+                    lst.Add(id);
+                }
+            }
+
+            var usedEdge = new HashSet<long>();
+            int added = 0;
+            float maxSlopeTan = (float)Math.Tan(maxSlopeDegrees * Math.PI / 180.0);
+            if (maxSlopeTan < 1e-3f) maxSlopeTan = 1e-3f;
+            for (int pi = 0; pi < plans.Count && seamCount < GatePlateSeamCap; pi++)
+            {
+                PlatePlan p = plans[pi];
+                for (int fi = 0; fi < p.Faces.Length; fi++)
+                {
+                    if (seamCount >= GatePlateSeamCap) break;
+                    int f = p.Faces[fi];
+                    if (f >= faceCount) continue;
+                    for (int k = 0; k < 3 && seamCount < GatePlateSeamCap; k++)
+                    {
+                        int a = o.Tris[f * 3 + k], b = o.Tris[f * 3 + ((k + 1) % 3)];
+                        long keyA = StitchEdgeKey(a, b);
+                        int nA;
+                        emult.TryGetValue(keyA, out nA);
+                        if (nA != 1 || usedEdge.Contains(keyA)) continue;
+
+                        // nearest foreign boundary edge, searched outward from this edge's own cells
+                        float ex0 = o.X[a], ez0 = o.Z[a], ex1 = o.X[b], ez1 = o.Z[b];
+                        float bestGap = float.MaxValue, bestStep = float.MaxValue;
+                        int bestU = -1, bestV = -1;
+                        float pminx = Math.Min(ex0, ex1) - GatePlateSeamMaxGapMeters;
+                        float pmaxx = Math.Max(ex0, ex1) + GatePlateSeamMaxGapMeters;
+                        float pminz = Math.Min(ez0, ez1) - GatePlateSeamMaxGapMeters;
+                        float pmaxz = Math.Max(ez0, ez1) + GatePlateSeamMaxGapMeters;
+                        int gx0 = (int)Math.Floor(pminx / ecell), gx1 = (int)Math.Floor(pmaxx / ecell);
+                        int gz0 = (int)Math.Floor(pminz / ecell), gz1 = (int)Math.Floor(pmaxz / ecell);
+                        for (int gxi = gx0; gxi <= gx1; gxi++)
+                            for (int gzi = gz0; gzi <= gz1; gzi++)
+                            {
+                                long gk = unchecked(((long)gxi << 32) | (uint)gzi);
+                                List<int> lst;
+                                if (!egrid.TryGetValue(gk, out lst)) continue;
+                                for (int li = 0; li < lst.Count; li++)
+                                {
+                                    int id = lst[li];
+                                    int u = edgeV[id * 2], v = edgeV[id * 2 + 1];
+                                    long keyB = StitchEdgeKey(u, v);
+                                    if (usedEdge.Contains(keyB)) continue;
+                                    float gap, step;
+                                    if (!SeamCandidate(o, ex0, o.Y[a], ez0, ex1, o.Y[b], ez1,
+                                        o.X[u], o.Y[u], o.Z[u], o.X[v], o.Y[v], o.Z[v],
+                                        out gap, out step)) continue;
+                                    if (gap > GatePlateSeamMaxGapMeters) continue;
+                                    if (gap < GatePlateSeamMinGapMeters) continue;
+                                    if (step > climb) continue;
+                                    if (gap * maxSlopeTan < step) continue;         // would be a riser
+                                    if (u == a || u == b || v == a || v == b) continue;
+                                    // the strip's three NEW edges must not already be shared: the two triangles
+                                    // contribute (a,u) and (b,v) once each and the diagonal (a,v) TWICE, so an
+                                    // existing shared edge there would go to three or four ways and turn the
+                                    // mesh non-manifold - which the invariants refuse to import. Measured: it
+                                    // did, on Birtu (maxEdgeMult=4), before these two guards.
+                                    if (EdgeMultOf(emult, StitchEdgeKey(a, v)) != 0) continue;
+                                    if (EdgeMultOf(emult, StitchEdgeKey(a, u)) >= 2) continue;
+                                    if (EdgeMultOf(emult, StitchEdgeKey(b, v)) >= 2) continue;
+                                    // and the strip's own footprint must be EMPTY: the nearest boundary edge is
+                                    // not always across a void, it can be round the side of a step, in which case
+                                    // the strip lands on top of real geometry. That is what produced 23 of CC_20's
+                                    // 24 self-overlaps, and the cleanup then deleted the face that was holding a
+                                    // component together (CC_20 15 -> 16 islands, Basamu 1 -> 2). A seam is only
+                                    // a seam if there is nothing under it.
+                                    if (!StripIsClear(o, a, b, u, v, grid, gcell, faceCount, climb, ch)) continue;
+                                    if (gap > bestGap) continue;
+                                    bestGap = gap; bestStep = step; bestU = u; bestV = v;
+                                }
+                            }
+                        if (bestU < 0) continue;
+
+                        // a crossing pair would emit two overlapping triangles; the overlap invariants would
+                        // (rightly) reject them, so a crossed candidate is simply not a seam
+                        if (!StripIsSimple(o, a, b, bestU, bestV)) continue;
+
+                        // emit the strip: (a,b) is the plate's boundary edge and (bestU,bestV) the foreign one,
+                        // so both become interior and the engine sees an EDGE portal, not a corner touch.
+                        // The strip REUSES the four existing vertices. A first version added exact copies and
+                        // let the weld merge them back, and that broke Birtu (maxEdgeMult=4, invariant FAIL):
+                        // the sliver cleanup welds BY POSITION and merged a copy onto a NEARBY vertex, so the
+                        // strip's edges became edges the multiplicity guards above had never seen. Reusing the
+                        // originals keeps every edge the strip adds in the index space the guards were written
+                        // in, and adds no vertex at all.
+                        if (StripArea(o, a, b, bestV, bestU) < GatePlateSeamMinAreaM2) continue;
+                        AddTriUp(o, a, b, bestV);
+                        AddTriUp(o, a, bestV, bestU);
+                        usedEdge.Add(keyA);
+                        usedEdge.Add(StitchEdgeKey(bestU, bestV));
+                        if (forcedRampCells != null)
+                        {
+                            float mx = (ex0 + ex1 + o.X[bestU] + o.X[bestV]) * 0.25f;
+                            float mz = (ez0 + ez1 + o.Z[bestU] + o.Z[bestV]) * 0.25f;
+                            forcedRampCells.Add(CellKey(mx, mz, cs));
+                        }
+                        added += 2;
+                        seamCount++;
+                        if (bestGap > widest) widest = bestGap;
+                        if (bestStep > worstStep) worstStep = bestStep;
+                        if (GatePlateTrace && log != null)
+                        {
+                            log("    seam (" + F(ex0) + "," + F(o.Y[a]) + "," + F(ez0) + ")-("
+                                + F(ex1) + "," + F(o.Y[b]) + "," + F(ez1) + ") -> (" + F(o.X[bestU]) + ","
+                                + F(o.Y[bestU]) + "," + F(o.Z[bestU]) + ")-(" + F(o.X[bestV]) + ","
+                                + F(o.Y[bestV]) + "," + F(o.Z[bestV]) + ") gap=" + F(bestGap) + "m step="
+                                + F(bestStep) + "m");
+                        }
+                        // the strip's own edges are now on the mesh, so a later seam must not reuse them
+                        emult[keyA] = 2;
+                        emult[StitchEdgeKey(bestU, bestV)] = 2;
+                        emult[StitchEdgeKey(a, bestU)] = 1;
+                        emult[StitchEdgeKey(b, bestV)] = 1;
+                        emult[StitchEdgeKey(a, bestV)] = 2;
+                    }
+                }
+            }
+            // Self-check: recount the whole mesh and refuse to have made it non-manifold. The guards above are
+            // index-space arithmetic and a mistake in them would cost the whole import (the gate refuses a mesh
+            // whose maxEdgeMult > 2), so the cost of proving it here - one linear pass - is worth paying.
+            if (added > 0)
+            {
+                var recount = new Dictionary<long, int>(LongKeyComparer.Instance);
+                int nf2 = o.Tris.Count / 3;
+                for (int f = 0; f < nf2; f++)
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int i0 = o.Tris[f * 3 + k], i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                        long key = StitchEdgeKey(i0, i1);
+                        int n;
+                        recount.TryGetValue(key, out n);
+                        recount[key] = n + 1;
+                    }
+                int worst = 0;
+                foreach (KeyValuePair<long, int> kv in recount)
+                    if (kv.Value > worst) worst = kv.Value;
+                if (worst > 2)
+                {
+                    Log(log, "v2: gate plate seams: REFUSED " + added + " triangle(s) - the recount found an edge "
+                        + "shared by " + worst + " faces, so the mesh would not import");
+                    return 0;
+                }
+            }
+            return added;
+        }
+
+        // a candidate seam: the XZ gap between two segments and the worst height step over their contact
+        private static bool SeamCandidate(MergeOutput o, float ax, float ay, float az, float bx, float by,
+            float bz, float cx, float cy, float cz, float dx, float dy, float dz, out float gap, out float step)
+        {
+            gap = SegSegGap(ax, az, bx, bz, cx, cz, dx, dz);
+            // the step an agent actually meets is the height difference across the whole contact, so it is
+            // bounded by the difference at the closest pair PLUS each edge's own height variation; taking
+            // only the closest pair's difference would let a steep foreign edge through.
+            float g1 = SegSegGapY(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, out float dNear);
+            step = dNear;
+            float v1 = Math.Abs(ay - by), v2 = Math.Abs(cy - dy);
+            if (v1 > step) step = v1;
+            if (v2 > step) step = v2;
+            return g1 >= 0f;
+        }
+
+        private static int EdgeMultOf(Dictionary<long, int> emult, long key)
+        {
+            int n;
+            return emult.TryGetValue(key, out n) ? n : 0;
+        }
+
+        // True when nothing in the mesh lies UNDER the strip: the four sample points (both triangle centroids
+        // and both diagonal midpoints) must each be uncovered by any face whose surface is within one climb plus
+        // one cell height of the strip's own height there. This is the difference between bridging a void and
+        // laying a ramp over something that is already there.
+        private static bool StripIsClear(MergeOutput o, int a, int b, int u, int v,
+            Dictionary<long, List<int>> grid, float gcell, int faceCount, float climb, float ch)
+        {
+            float band = climb + ch;
+            if (!StripPointClear(o, a, b, v, grid, gcell, faceCount, band)) return false;
+            if (!StripPointClear(o, a, v, u, grid, gcell, faceCount, band)) return false;
+            float mx = (o.X[a] + o.X[v]) * 0.5f, mz = (o.Z[a] + o.Z[v]) * 0.5f;
+            float my = (o.Y[a] + o.Y[v]) * 0.5f;
+            if (!StripSampleClear(o, mx, my, mz, grid, gcell, faceCount, band)) return false;
+            mx = (o.X[b] + o.X[u]) * 0.5f; mz = (o.Z[b] + o.Z[u]) * 0.5f;
+            my = (o.Y[b] + o.Y[u]) * 0.5f;
+            return StripSampleClear(o, mx, my, mz, grid, gcell, faceCount, band);
+        }
+
+        private static bool StripPointClear(MergeOutput o, int a, int b, int v,
+            Dictionary<long, List<int>> grid, float gcell, int faceCount, float band)
+        {
+            float x = (o.X[a] + o.X[b] + o.X[v]) / 3f;
+            float y = (o.Y[a] + o.Y[b] + o.Y[v]) / 3f;
+            float z = (o.Z[a] + o.Z[b] + o.Z[v]) / 3f;
+            return StripSampleClear(o, x, y, z, grid, gcell, faceCount, band);
+        }
+
+        private static bool StripSampleClear(MergeOutput o, float px, float py, float pz,
+            Dictionary<long, List<int>> grid, float gcell, int faceCount, float band)
+        {
+            int gx = (int)Math.Floor(px / gcell), gz = (int)Math.Floor(pz / gcell);
+            for (int i = gx - 1; i <= gx + 1; i++)
+                for (int j = gz - 1; j <= gz + 1; j++)
+                {
+                    List<int> lst;
+                    if (!grid.TryGetValue(unchecked(((long)i << 32) | (uint)j), out lst)) continue;
+                    for (int k = 0; k < lst.Count; k++)
+                    {
+                        int f = lst[k];
+                        if (f >= faceCount) continue;
+                        int p0 = o.Tris[f * 3], p1 = o.Tris[f * 3 + 1], p2 = o.Tris[f * 3 + 2];
+                        double ax = o.X[p0], az = o.Z[p0];
+                        double bx = o.X[p1], bz = o.Z[p1];
+                        double cx = o.X[p2], cz = o.Z[p2];
+                        double den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+                        if (Math.Abs(den) < 1e-12) continue;
+                        double wa = ((bz - cz) * (px - cx) + (cx - bx) * (pz - cz)) / den;
+                        double wb = ((cz - az) * (px - cx) + (ax - cx) * (pz - cz)) / den;
+                        double wc = 1.0 - wa - wb;
+                        if (wa < -1e-3 || wb < -1e-3 || wc < -1e-3) continue;
+                        double hy = wa * o.Y[p0] + wb * o.Y[p1] + wc * o.Y[p2];
+                        if (Math.Abs(hy - py) <= band) return false;
+                    }
+                }
+            return true;
+        }
+
+        // closest XZ distance between two 2D segments
+        private static float SegSegGap(float ax, float az, float bx, float bz, float cx, float cz,
+            float dx, float dz)
+        {
+            SegSegClosest(ax, az, bx, bz, cx, cz, dx, dz, out float s, out float t);
+            float px = ax + s * (bx - ax), pz = az + s * (bz - az);
+            float qx = cx + t * (dx - cx), qz = cz + t * (dz - cz);
+            float ex = px - qx, ez = pz - qz;
+            return (float)Math.Sqrt(ex * ex + ez * ez);
+        }
+
+        // the same contact point, with the height difference between the two segments there
+        private static float SegSegGapY(float ax, float ay, float az, float bx, float by, float bz,
+            float cx, float cy, float cz, float dx, float dy, float dz, out float diff)
+        {
+            SegSegClosest(ax, az, bx, bz, cx, cz, dx, dz, out float s, out float t);
+            diff = (cy + t * (dy - cy)) - (ay + s * (by - ay));
+            return diff;
+        }
+
+        // standard 2D segment/segment closest-point parameters (Ericson, Real-Time Collision Detection)
+        private static void SegSegClosest(float ax, float az, float bx, float bz, float cx, float cz,
+            float dx, float dz, out float s, out float t)
+        {
+            float pax = ax, paz = az, pbx = bx, pbz = bz, pcx = cx, pcz = cz, pdx = dx, pdz = dz;
+            float d1x = pbx - pax, d1z = pbz - paz;
+            float d2x = pdx - pcx, d2z = pdz - pcz;
+            float rx = pax - pcx, rz = paz - pcz;
+            float a = d1x * d1x + d1z * d1z;
+            float e = d2x * d2x + d2z * d2z;
+            float f = d2x * rx + d2z * rz;
+            const float eps = 1e-12f;
+            if (a <= eps && e <= eps) { s = 0f; t = 0f; return; }
+            if (a <= eps) { s = 0f; t = Clamp01(f / e); return; }
+            float c = d1x * rx + d1z * rz;
+            if (e <= eps) { t = 0f; s = Clamp01(-c / a); return; }
+            float b = d1x * d2x + d1z * d2z;
+            float denom = a * e - b * b;
+            s = denom != 0f ? Clamp01((b * f - c * e) / denom) : 0f;
+            t = (b * s + f) / e;
+            if (t < 0f) { t = 0f; s = Clamp01(-c / a); }
+            else if (t > 1f) { t = 1f; s = Clamp01((b - c) / a); }
+        }
+
+        private static float Clamp01(float v)
+        {
+            return v < 0f ? 0f : (v > 1f ? 1f : v);
+        }
+
+        private static bool StripIsSimple(MergeOutput o, int a, int b, int u, int v)
+        {
+            // the strip is simple when the two segments do not cross; a crossing would emit two triangles
+            // that overlap, which the overlap invariants would (correctly) reject
+            float rx = o.X[b] - o.X[a], rz = o.Z[b] - o.Z[a];
+            float sx = o.X[v] - o.X[u], sz = o.Z[v] - o.Z[u];
+            float den = rx * sz - rz * sx;
+            if (Math.Abs(den) < 1e-9f) return true;                 // parallel
+            float t = ((o.X[u] - o.X[a]) * sz - (o.Z[u] - o.Z[a]) * sx) / den;
+            float w = ((o.X[u] - o.X[a]) * rz - (o.Z[u] - o.Z[a]) * rx) / den;
+            return !(t > 0f && t < 1f && w > 0f && w < 1f);
+        }
+
+        private static float StripArea(MergeOutput o, int a, int b, int c, int d)
+        {
+            return 0.5f * Math.Abs((o.X[b] - o.X[a]) * (o.Z[c] - o.Z[a]) - (o.Z[b] - o.Z[a]) * (o.X[c] - o.X[a]))
+                + 0.5f * Math.Abs((o.X[c] - o.X[a]) * (o.Z[d] - o.Z[a]) - (o.Z[c] - o.Z[a]) * (o.X[d] - o.X[a]));
+        }
+
+        // always up-facing: the seam is a floor, and its winding must not depend on which side it was found
+        private static void AddTriUp(MergeOutput o, int i0, int i1, int i2)
+        {
+            double ux = o.X[i1] - o.X[i0], uz = o.Z[i1] - o.Z[i0];
+            double wx = o.X[i2] - o.X[i0], wz = o.Z[i2] - o.Z[i0];
+            double ny = uz * wx - ux * wz;
+            if (ny < 0.0) { int tmp = i1; i1 = i2; i2 = tmp; }
+            o.Tris.Add(i0); o.Tris.Add(i1); o.Tris.Add(i2);
         }
 
         // Harness-only per-candidate explain line (GatePlateTrace): never set in production.
@@ -4139,6 +4536,33 @@ namespace BetterBannerlordNavmeshing
         // sxx*szz, i.e. |correlation| < 0.9995. A near-collinear sample cloud makes the gradient (and the
         // intercept solved around the plate centroid) explode while still "explaining" the band.
         public const double GatePlateMinCorrelation1 = 1e-3;
+
+        // SEAM WIDTH. Tilting a plate fixes its slope, but it cannot fix the columns BETWEEN the plate and
+        // the ground it has to join: at the reported gate the plate's own collision reaches x=1133.465 and
+        // the terrain mesh resumes at x=1133.75, yet the plate's built faces stop at x=1133.0 -
+        // ErodeWalkableArea eats one cell and the contour simplifier another, so a 0.75 m void with a 0.50 m
+        // step is left in the middle of the passage the user walks. A void that wide is not a gap an agent
+        // can cross (Recast links adjacent columns, and 0.75 m is three columns at cs=0.25), and it is exactly
+        // what reads on screen as "the navmesh stops here". FillNarrowGaps cannot fill it either: it runs
+        // BEFORE FilterWalkableLowHeightSpans, so the columns are not empty yet - they still carry the
+        // terrain span that the gate threshold beam's own underside then denies clearance to. Measured on
+        // CC_20: the void is byte-identical with the blend on and off.
+        //
+        // So the seam is emitted here, as the missing strip between the plate's own boundary edge and the
+        // nearest foreign boundary edge, and only where the bridge is genuinely climbable:
+        //   - a real gap: wider than GatePlateSeamMinGapMeters (touching surfaces are already connected), and
+        //     not wider than GatePlateSeamMaxGapMeters (past that it is a missing prop, not a seam);
+        //   - every endpoint pair across the gap within the agent climb;
+        //   - the resulting strip no steeper than MaxSlopeDegrees, or the agent meets a riser instead;
+        //   - both edges unused so two plates cannot bridge the same void twice.
+        // The island-safety lesson from the rejected connector experiment is applied directly: a seam is only
+        // emitted BETWEEN ALREADY-CONNECTED faces (a single-component pair), so it cannot merge islands, and
+        // it is registered in forcedRampCells so neither the steep-face repair nor the sliver cleanup can
+        // remove the strip and leave the component split.
+        public const float GatePlateSeamMinGapMeters = 0.1f;
+        public const float GatePlateSeamMaxGapMeters = 1.5f;
+        public const float GatePlateSeamMinAreaM2 = 0.08f;
+        public const int GatePlateSeamMaxCount = 1024;
 
         // The face's own height range has to exceed this to count as a jump. Two agent climbs plus one
         // cell height (1.4 m at climb 0.6 / ch 0.2), which clears the lab stair's 1.20 m connector with
