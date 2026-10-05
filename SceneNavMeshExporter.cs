@@ -86,6 +86,18 @@ namespace BetterBannerlordNavmeshing
         // dislikes n-gon faces.
         public bool NavMeshVoxelQuadMerge = true;
 
+        // Gate / door PLATE BLEND (v2 voxel core, default ON). A prop that carries a rigid, dead-flat
+        // floor slab - a castle gate's floor colliders are the reported case - projects into the voxel
+        // grid as a perfectly horizontal plate that ignores the ground it is dropped onto. On sloping
+        // terrain one end of that plate then ends up more than an agent climb above its neighbour and
+        // stops stitching (measured on CC_20: the plate at y=86.30 across a passage whose terrain falls
+        // 87.1 -> 82.8 m, so the far end met faces 1.2 m below it). With this on, such a plate is
+        // ROTATED - by at most NavMeshMaxSlopeDegrees, and by at most its own rise budget - onto a plane
+        // least-squares fitted to the built mesh around it, so both ends meet the surroundings inside the
+        // agent climb. Only the plate's own vertices move, so no face is added or removed and no edge is
+        // touched. See TiledNavMeshBuilder.BlendGatePlates and the README.
+        public bool NavMeshVoxelGatePlateBlend = true;
+
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
         public string NavMeshSnapshotAssertPoints = "";
@@ -523,6 +535,7 @@ namespace BetterBannerlordNavmeshing
                     + " prune=" + (NavMeshVoxelPruneIsolatedIslands
                         ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
+                    + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
                     + " quadMerge=" + NavMeshVoxelQuadMerge
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
@@ -936,6 +949,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelStitchMaxGapCells=" + NavMeshVoxelStitchMaxGapCells
                     + " voxelPrune=" + (NavMeshVoxelPruneIsolatedIslands ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
+                    + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
@@ -1006,6 +1020,7 @@ namespace BetterBannerlordNavmeshing
                 voxel.PruneMaxIslandFaces = NavMeshVoxelPruneMaxIslandFaces;
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
                 voxel.QuadMerge = NavMeshVoxelQuadMerge;
+                voxel.GatePlateBlend = NavMeshVoxelGatePlateBlend;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;
