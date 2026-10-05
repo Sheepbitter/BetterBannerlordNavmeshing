@@ -40,6 +40,10 @@ namespace BetterBannerlordNavmeshing
         // against each other on a real scene.
         public static bool SteepFaceConnectivityGuard = true;
 
+        // Harness-only: log one explain line per gate/door plate candidate (why it was blended or why it
+        // was rejected). Never set in production; off means the run log only carries the summary counters.
+        public static bool GatePlateTrace;
+
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -116,6 +120,16 @@ namespace BetterBannerlordNavmeshing
             // test.   < 0 = use SteepFaceMarginDegreesDefault.   10 = default (60 deg at the shipped 50).
             //   20+ = conservative: only the unmistakable walls (>= 70 deg) go.   100+ = disabled.
             public float SteepFaceMarginDegrees = SteepFaceMarginDegreesDefault;
+
+            // GATE/DOOR PLATE BLEND (default on). A prop that carries a rigid, dead-flat floor slab
+            // (a castle gate's floor colliders are the reported case) projects into the voxel grid as a
+            // perfectly horizontal plate that ignores the ground it is dropped onto. On sloping terrain one
+            // end of the plate then ends up more than an agent climb above its neighbour and the plate
+            // stops stitching. When this is on, such a plate is RE-GENERATED: the neighbouring built mesh
+            // around the plate's own footprint is least-squares fitted, the tilt is clamped to
+            // MaxSlopeDegrees (and to the plate's own rise budget), and the plate is re-emitted on that
+            // plane, so both ends meet the surrounding navmesh inside the climb. See BlendGatePlates.
+            public bool GatePlateBlend = true;
 
             // Contour edge length cap (voxels).
             public int MaxEdgeLenVoxels = 12;
@@ -231,6 +245,8 @@ namespace BetterBannerlordNavmeshing
             public int ConnectorMarkedCells;    // cells covered by the connector marker, all tiles
             public int ConnectorClearedCeilings; // real spans unlinked above a restored connector, all tiles
             public int ConnectorErosionExempt;  // connector spans erosion nulled that the erosion exemption restored
+            // Faces re-emitted on a fitted plane by the gate/door plate blend (NavMeshVoxelGatePlateBlend).
+            public int GatePlateFaces;
 
             public long TilesMs;
             public long MergeMs;
@@ -818,24 +834,12 @@ namespace BetterBannerlordNavmeshing
             if (nonManifoldRepaired > 0)
                 Log(log, "v2: repaired mesh: removed " + nonManifoldRepaired + " non-manifold faces");
 
-            // Cross-tile stitch (before pruning): reconnect near-miss pieces that the per-tile stitch
-            // could not reach (different tiles, or beyond its cap). A stitch is refused when the input
-            // soup has solid geometry spanning the gap envelope (wall, closed door, low ceiling).
-            if (s.StitchMaxGapCells > 0)
-            {
-                int msPairs, msAdded, msRefused;
-                MergeStitch(merged, vertsXyz, tris, inputTris, s.VoxelCellSizeMeters, s.CellHeightMeters,
-                    s.HeightOffsetMeters, bminY, walkableHeight, walkableClimb, s.StitchMaxGapCells,
-                    out msPairs, out msAdded, out msRefused);
-                Log(log, "v2: merge-stitch: pairs=" + msPairs + " added=" + msAdded + " refused=" + msRefused
-                    + " (cap=" + s.StitchMaxGapCells + " cells)");
-            }
-
-            // Per-face provenance for the steep-face repair: the cells covered by a FORCED-walkable triangle
-            // (a synthesized ramp or an offset symbolic connector). Those are the only cells allowed to
-            // carry a face steeper than the walkable cap - a ladder chain legitimately runs steeper than the
-            // cap and must not be cut. Collected BEFORE the per-tile structures are released below, and
-            // before the steep repair + prune that consume it.
+            // Per-face provenance for the steep-face repair AND the gate-plate blend: the cells covered by a
+            // FORCED-walkable triangle (a synthesized ramp or an offset symbolic connector). Those are the only
+            // cells allowed to carry a face steeper than the walkable cap - a ladder chain legitimately runs
+            // steeper than the cap and must not be cut - and they are NOT "surroundings" for the plate fit.
+            // Collected BEFORE the per-tile structures are released below, and before the blend, the steep
+            // repair and the prune that consume it.
             HashSet<long> forcedRampCells = null;
             {
                 float fcs = s.VoxelCellSizeMeters;
@@ -847,6 +851,29 @@ namespace BetterBannerlordNavmeshing
                     for (int k = 0; k + 1 < forcedXz.Count; k += 2)
                         forcedRampCells.Add(CellKey(forcedXz[k], forcedXz[k + 1], fcs));
                 }
+            }
+
+            // GATE/DOOR PLATE BLEND. Before the cross-tile stitch and the prune, on the merged mesh: a
+            // prop's rigid flat floor slab is re-emitted on a plane fitted to the built mesh around it, so
+            // it stops floating proud of sloping ground. See BlendGatePlates.
+            int gatePlateFaces = 0;
+            if (s.GatePlateBlend && merged.Tris.Count >= 3)
+            {
+                gatePlateFaces = BlendGatePlates(merged, s.VoxelCellSizeMeters, s.CellHeightMeters,
+                    s.AgentMaxClimbMeters, s.MaxSlopeDegrees, forcedRampCells, log);
+            }
+
+            // Cross-tile stitch (before pruning): reconnect near-miss pieces that the per-tile stitch
+            // could not reach (different tiles, or beyond its cap). A stitch is refused when the input
+            // soup has solid geometry spanning the gap envelope (wall, closed door, low ceiling).
+            if (s.StitchMaxGapCells > 0)
+            {
+                int msPairs, msAdded, msRefused;
+                MergeStitch(merged, vertsXyz, tris, inputTris, s.VoxelCellSizeMeters, s.CellHeightMeters,
+                    s.HeightOffsetMeters, bminY, walkableHeight, walkableClimb, s.StitchMaxGapCells,
+                    out msPairs, out msAdded, out msRefused);
+                Log(log, "v2: merge-stitch: pairs=" + msPairs + " added=" + msAdded + " refused=" + msRefused
+                    + " (cap=" + s.StitchMaxGapCells + " cells)");
             }
 
             // STEEP-FACE REPAIR, and it must run BEFORE the prune so any fragment a component that cannot be
@@ -976,6 +1003,7 @@ namespace BetterBannerlordNavmeshing
             result.ConnectorMarkedCells = aggConnectorMarkedCells;
             result.ConnectorClearedCeilings = aggConnectorClearedCeilings;
             result.ConnectorErosionExempt = aggConnectorErosionExempt;
+            result.GatePlateFaces = gatePlateFaces;
             result.TilesMs = tilesWatch.ElapsedMilliseconds;
             result.MergeMs = mergeWatch.ElapsedMilliseconds;
             result.TileMsMin = tileMsMin;
@@ -1002,6 +1030,11 @@ namespace BetterBannerlordNavmeshing
             Log(log, "v2: weld verts=" + tileVertexSum + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
                 + " degenerate=" + merged.Degenerate + " (weldMerged=" + result.WeldMergedVertices + ")");
+            if (gatePlateFaces > 0)
+                Log(log, "v2: gate plate faces re-emitted: " + gatePlateFaces
+                    + " (GatePlateBlend=" + s.GatePlateBlend + ", tilt capped at MaxSlopeDegrees="
+                    + F(s.MaxSlopeDegrees) + " and at 2*climb/halfSpan=" + F(s.AgentMaxClimbMeters)
+                    + "m, offset clamped to [-climb,0])");
             Log(log, "v2: invariants: faces=" + result.FaceCount + " edges=" + result.EdgeCount
                 + " boundary=" + result.BoundaryEdges + " maxEdgeMult=" + result.MaxEdgeMultiplicity
                 + " dupFaces=" + result.DuplicateFaces + " selfLoops=" + result.SelfLoops
@@ -1591,6 +1624,485 @@ namespace BetterBannerlordNavmeshing
             double dy = o.Y[i] - o.Y[j];
             double dz = o.Z[i] - o.Z[j];
             return dx * dx + dy * dy + dz * dz;
+        }
+
+        // ==================================================================
+        // GATE / DOOR PLATE BLEND  (NavMeshVoxelGatePlateBlend, default on)
+        // ==================================================================
+        //
+        // WHAT IT IS. A prop that carries a rigid, dead-flat FLOOR SLAB projects into the voxel grid as a
+        // perfectly horizontal plate, because the grid's span tops are ch-quantised and the slab is level.
+        // That is right in the abstract - the navmesh IS a projection of the collision - but it ignores the
+        // ground the slab is dropped onto: drop a castle gate's floor colliders on sloping terrain and the
+        // plate ends up a metre above the low side of the passage, more than one agent climb, so that end
+        // stops stitching. The reported case (CC_20, european_castle_wall_gate_l1) measured exactly that:
+        // 10 faces, every vertex at y = 86.30, slope 0.0 deg, over x 1127.75..1133.00 / z 989.00..993.00,
+        // with the terrain falling 87.1 -> 82.8 m across the passage. The NW end met its neighbours inside
+        // the climb; the SE end met faces 0.4-1.3 m below it (47.1 and 58.0 deg).
+        //
+        // THE RULE, generically - no prop names, only geometry. A "plate" is a maximal edge-connected group
+        // of dead-flat up-facing faces that all sit on ONE ch level (>= 3 faces, 1..120 m^2, no side longer
+        // than 8 m - bigger is a floor / a deck / a terrace and tilting it would move real geometry). It is
+        // re-generated when ALL of:
+        //
+        //  1. PROUD: the plate's own height is more than one agent climb above - but at most
+        //     GatePlateProudMaxMeters above - the 10th percentile of the surrounding mesh's heights in the
+        //     ring around the plate's own footprint. This is the "the ground falls away from under me"
+        //     signature, and requiring it to exceed the climb is what keeps already-stitching plates out.
+        //  2. FITTABLE: at least GatePlateMinSamples neighbouring faces inside the ring, spread over at
+        //     least GatePlateMinSpanMeters, with a well-conditioned normal matrix. Weights are the faces'
+        //     own XZ areas (capped at 4 m^2 so one big floor cannot dominate), so this is a least-squares
+        //     fit over the SURFACE, not over the raw soup - the soup carries the slab's own colliders and
+        //     the wall above it, and a fit over it would tilt the plate towards the wall. Our OWN synthesized
+        //     ramp / connector cells are excluded for the same reason: they answer a different question, and
+        //     measured on the suite's narrow-doorway lab they made a real landing read 1.33 m "proud" and
+        //     tilt it 11 deg off a level it must keep.
+        //  3. BETTER: the clamped plane has to beat the flat plate by GatePlateMinImproveMeters on the worst
+        //     neighbour mismatch, otherwise the plate is left byte-identical.
+        //
+        // THE FIT, and the clamps. y = a + b*(x-cx) + c*(z-cz) about the plate's own XZ centroid. The tilt is
+        // clamped twice: to tan(MaxSlopeDegrees) (the agent's walk cap, the user's own bound) and to
+        // GatePlateMaxRise / halfSpan, so a 5 m plate can never become a 6 m wall - a blend is a tilted
+        // floor, not a ramp. The vertical offset is the MEDIAN of the per-sample residuals, clamped to
+        // [-climb, 0]: the median is the L1 minimiser, so it balances the ends, and the clamp never raises
+        // the plate (raising only makes the proud class worse) and never sinks it by more than one agent
+        // climb (which is what the uniform HeightOffsetMeters lift already buys us).
+        //
+        // THE RE-EMIT is a rotation of the plate's OWN vertices - the user's own phrasing, "treated as a solid
+        // plane, rotated by up to 50 degrees to better align with surrounding navmeshes". It is deliberately
+        // not a detach-and-regenerate: keeping the shared vertices keeps every edge the plate had, so the
+        // pass adds and removes no face and touches no edge. A shared VERTEX does move with the plate, so the
+        // handful of faces that met the plate at a corner come along by at most the plate's own offset (one
+        // agent climb, printed per plate in the trace). The alternative - clone the plate's vertices and
+        // bridge each seam with a connector quad - was implemented and measured first: 172 connector quads on
+        // CC_20, and because a 0.2-0.5 m connector sliver is something the steep repair or the cleanup can
+        // remove, it turned Birtu from 5 islands into 8 and CC_20 from 15 into 16. The rotation is what ships.
+        //
+        // Deterministic: faces are visited in index order, groups are keyed by their lowest face index,
+        // every accumulator is a double summed in that order, and the offsets come from a sorted copy of
+        // the residual list. Cheap: one mask pass, one grid build, one local query per plate - 200-350 ms on
+        // CC_20's 241k faces.
+
+        private sealed class PlatePlan
+        {
+            public int[] Faces;
+            public List<int> Verts;               // the plate's own vertices (rotated in place)
+            public float MinX, MaxX, MinZ, MaxZ;
+            public float Cx, Cz, H;
+            public float A0, GradB, GradC, Off;   // y = A0 + Off + GradB*(x-Cx) + GradC*(z-Cz)
+            public float TiltDeg, TiltCapDeg, Offset;
+            public int Samples;
+            public float Proud, Rms, WorstBefore, WorstAfter;
+        }
+
+        private static int BlendGatePlates(MergeOutput o, float cs, float ch, float climb,
+            float maxSlopeDegrees, HashSet<long> forcedRampCells, Action<string> log)
+        {
+            int faceCount = o.Tris.Count / 3;
+            if (faceCount == 0 || o.X.Count < 3) return 0;
+            if (climb <= 0f) return 0;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
+            // --- 1. dead-flat, up-facing face mask ----------------------------------------------------
+            var flat = new bool[faceCount];
+            double sinFlat = Math.Sin(GatePlateFlatDegrees * Math.PI / 180.0);
+            float dyTol = ch * 0.5f + 1e-4f;
+            for (int f = 0; f < faceCount; f++)
+            {
+                int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
+                double ux = o.X[b] - o.X[a], uy = o.Y[b] - o.Y[a], uz = o.Z[b] - o.Z[a];
+                double wx = o.X[c] - o.X[a], wy = o.Y[c] - o.Y[a], wz = o.Z[c] - o.Z[a];
+                double nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                if (len < 1e-12) continue;                                       // degenerate
+                if (Math.Sqrt(nx * nx + nz * nz) / len > sinFlat) continue;       // not dead flat
+                if (FootprintM2(o.X, o.Y, o.Z, a, b, c) <= 0.0) continue;       // must look up
+                flat[f] = true;
+            }
+
+            // --- 2. union the flat faces into one plate per coplanar level ----------------------------
+            var parent = new int[faceCount];
+            for (int i = 0; i < faceCount; i++) parent[i] = i;
+            var edgeOwner = new Dictionary<long, int>(LongKeyComparer.Instance);
+            for (int f = 0; f < faceCount; f++)
+            {
+                if (!flat[f]) continue;
+                for (int k = 0; k < 3; k++)
+                {
+                    int i0 = o.Tris[f * 3 + k], i1 = o.Tris[f * 3 + ((k + 1) % 3)];
+                    if (Math.Abs(o.Y[i0] - o.Y[i1]) > dyTol) continue;
+                    long key = StitchEdgeKey(i0, i1);
+                    int other;
+                    if (edgeOwner.TryGetValue(key, out other))
+                    {
+                        if (other != f) FaceUnion(parent, other, f);
+                    }
+                    else edgeOwner[key] = f;
+                }
+            }
+            edgeOwner = null;
+
+            var groups = new Dictionary<int, List<int>>();
+            var groupOrder = new List<int>();
+            for (int f = 0; f < faceCount; f++)
+            {
+                if (!flat[f]) continue;
+                int root = FaceFind(parent, f);
+                List<int> g;
+                if (!groups.TryGetValue(root, out g))
+                {
+                    g = new List<int>();
+                    groups[root] = g;
+                    groupOrder.Add(root);
+                }
+                g.Add(f);
+            }
+            groupOrder.Sort();                       // by lowest face index: deterministic
+            if (groupOrder.Count == 0) return 0;
+
+            // --- 3. one face grid for the local neighbour queries -------------------------------------
+            // Keyed by the face's CENTROID cell, one entry per face (never by bbox: a face with a long
+            // diagonal would otherwise be listed in every cell it touches and leak its height into rings
+            // metres away - measured on CC_20, where a 13 m gatehouse face poisoned the gate plate's fit).
+            float gcell = Math.Max(4f * cs, 1f);
+            var grid = new Dictionary<long, List<int>>(LongKeyComparer.Instance);
+            for (int f = 0; f < faceCount; f++)
+            {
+                int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
+                float fx = (o.X[a] + o.X[b] + o.X[c]) / 3f;
+                float fz = (o.Z[a] + o.Z[b] + o.Z[c]) / 3f;
+                long key = unchecked(((long)(int)Math.Floor(fx / gcell) << 32) | (uint)(int)Math.Floor(fz / gcell));
+                List<int> lst;
+                if (!grid.TryGetValue(key, out lst)) { lst = new List<int>(); grid[key] = lst; }
+                lst.Add(f);
+            }
+
+            // --- 4. fit every plate against the ORIGINAL mesh; nothing is mutated until all plans exist -
+            float ring = Math.Max(8f * cs, 1.5f);
+            var plans = new List<PlatePlan>();
+            var isPlate = new bool[faceCount];
+            int candidates = 0, skipped = 0;
+            var sampleY = new List<float>();
+            var sampleX = new List<float>();
+            var sampleZ = new List<float>();
+            var sampleW = new List<float>();
+            int rejSize = 0, rejLevel = 0, rejSamples = 0, rejProud = 0, rejFit = 0, rejBetter = 0;
+            for (int gi = 0; gi < groupOrder.Count; gi++)
+            {
+                List<int> g = groups[groupOrder[gi]];
+                if (g.Count < GatePlateMinFaces) continue;
+
+                // plate extents + its own vertex set
+                float minX = float.MaxValue, maxX = float.MinValue;
+                float minZ = float.MaxValue, maxZ = float.MinValue;
+                float hSum = 0f, vSum = 0f, area = 0f;
+                var verts = new List<int>();
+                var seenV = new Dictionary<int, bool>();
+                for (int fi = 0; fi < g.Count; fi++)
+                {
+                    int f = g[fi];
+                    isPlate[f] = true;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int v = o.Tris[f * 3 + k];
+                        if (seenV.ContainsKey(v)) continue;
+                        seenV[v] = true;
+                        verts.Add(v);
+                        if (o.X[v] < minX) minX = o.X[v];
+                        if (o.X[v] > maxX) maxX = o.X[v];
+                        if (o.Z[v] < minZ) minZ = o.Z[v];
+                        if (o.Z[v] > maxZ) maxZ = o.Z[v];
+                        hSum += o.Y[v];
+                        vSum += 1f;
+                    }
+                    double a2 = FootprintM2(o.X, o.Y, o.Z, o.Tris[f * 3], o.Tris[f * 3 + 1], o.Tris[f * 3 + 2]);
+                    if (a2 > 0.0) area += (float)a2;
+                }
+                if (vSum < 3f || area < GatePlateMinAreaM2 || area > GatePlateMaxAreaM2) { rejSize++; ResetPlate(isPlate, g); continue; }
+                float spanX = maxX - minX, spanZ = maxZ - minZ;
+                if (spanX > GatePlateMaxSpanMeters || spanZ > GatePlateMaxSpanMeters)
+                { rejSize++; ResetPlate(isPlate, g); continue; }
+                float h = hSum / vSum;
+                float cx = (minX + maxX) * 0.5f, cz = (minZ + maxZ) * 0.5f;
+                // one ch level, or it is not a plate
+                bool levelOk = true;
+                for (int vi = 0; vi < verts.Count; vi++)
+                    if (Math.Abs(o.Y[verts[vi]] - h) > dyTol) { levelOk = false; break; }
+                if (!levelOk) { rejLevel++; ResetPlate(isPlate, g); continue; }
+                candidates++;
+
+                // --- neighbour samples: non-plate faces in the ring, one per face, area weighted ----
+                sampleX.Clear(); sampleY.Clear(); sampleZ.Clear(); sampleW.Clear();
+                float bandLo = h - 3f * climb, bandHi = h + climb;
+                int ix0 = (int)Math.Floor((minX - ring) / gcell), ix1 = (int)Math.Floor((maxX + ring) / gcell);
+                int iz0 = (int)Math.Floor((minZ - ring) / gcell), iz1 = (int)Math.Floor((maxZ + ring) / gcell);
+                for (int iz = iz0; iz <= iz1; iz++)
+                    for (int ix = ix0; ix <= ix1; ix++)
+                    {
+                        List<int> lst;
+                        if (!grid.TryGetValue(unchecked(((long)ix << 32) | (uint)iz), out lst)) continue;
+                        for (int li = 0; li < lst.Count; li++)
+                        {
+                            int f = lst[li];
+                            if (isPlate[f]) continue;
+                            int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
+                            float fx = (o.X[a] + o.X[b] + o.X[c]) / 3f;
+                            float fz = (o.Z[a] + o.Z[b] + o.Z[c]) / 3f;
+                            float fy = (o.Y[a] + o.Y[b] + o.Y[c]) / 3f;
+                            if (fx < minX - ring || fx > maxX + ring || fz < minZ - ring || fz > maxZ + ring)
+                                continue;
+                            if (fy < bandLo || fy > bandHi) continue;
+                            // Our own synthesized ramp / connector cells are NOT surroundings: they are the
+                            // answer to a different question, and letting them into the fit tilts a real floor.
+                            // Measured on the suite's narrow-doorway lab: the upper landing (h=3.4) sampled its
+                            // own ladder connector at y=2.07, read itself 1.33 m "proud", and was tilted 11 deg
+                            // off a level it must keep - the lab's crossing went from connected to broken.
+                            if (forcedRampCells != null && forcedRampCells.Count > 0
+                                && forcedRampCells.Contains(CellKey(fx, fz, cs)))
+                                continue;
+                            double a2 = FootprintM2(o.X, o.Y, o.Z, a, b, c);
+                            if (a2 <= 0.0) continue;                       // a wall / an underside is not ground
+                            sampleX.Add(fx); sampleY.Add(fy); sampleZ.Add(fz);
+                            sampleW.Add((float)(a2 < 4.0 ? a2 : 4.0));
+                        }
+                    }
+                int ns = sampleY.Count;
+                if (ns < GatePlateMinSamples) { rejSamples++; TracePlate(log, "samples=" + ns, minX, minZ, maxX, maxZ, h, g.Count, area); ResetPlate(isPlate, g); continue; }
+
+                // --- 1. proud ---------------------------------------------------------------------------
+                var sortedY = new List<float>(sampleY);
+                sortedY.Sort();
+                float p10 = sortedY[(int)((sortedY.Count - 1) * 0.10)];
+                float proud = h - p10;
+                if (proud <= climb || proud > GatePlateProudMaxMeters)
+                {
+                    rejProud++;
+                    TracePlate(log, "proud=" + F(proud) + "m p10=" + F(p10) + " n=" + ns, minX, minZ, maxX, maxZ, h, g.Count, area);
+                    ResetPlate(isPlate, g); continue;
+                }
+
+                // --- 2. weighted least squares, taken about the SAMPLE mean -------------------------
+                // The cross-moments must be centred on the sample cloud, not on the plate centroid: the
+                // uncentred normal equations carry an a0*sum(w*dx) term, and solving them as if they did not
+                // is what produced a 10.6 gradient (a 85 deg "plane") for the gate plate's 2 m sample band.
+                // Two passes: the weighted means, then the centred moments.
+                double sw = 0.0, sx = 0.0, sz = 0.0, sy = 0.0;
+                float sminX = float.MaxValue, smaxX = float.MinValue;
+                float sminZ = float.MaxValue, smaxZ = float.MinValue;
+                for (int i = 0; i < ns; i++)
+                {
+                    double w = sampleW[i];
+                    sw += w;
+                    sx += w * (sampleX[i] - cx);
+                    sz += w * (sampleZ[i] - cz);
+                    sy += w * sampleY[i];
+                    if (sampleX[i] < sminX) sminX = sampleX[i];
+                    if (sampleX[i] > smaxX) smaxX = sampleX[i];
+                    if (sampleZ[i] < sminZ) sminZ = sampleZ[i];
+                    if (sampleZ[i] > smaxZ) smaxZ = sampleZ[i];
+                }
+                float spread = Math.Max(smaxX - sminX, smaxZ - sminZ);
+                if (spread < GatePlateMinSpanMeters || sw <= 0.0)
+                {
+                    rejFit++;
+                    TracePlate(log, "spread=" + F(spread) + "m proud=" + F(proud) + "m n=" + ns,
+                        minX, minZ, maxX, maxZ, h, g.Count, area);
+                    ResetPlate(isPlate, g); continue;
+                }
+                double mxd = sx / sw, mzd = sz / sw, myd = sy / sw;
+                double cxx = 0.0, czz = 0.0, cxz = 0.0, cxy = 0.0, czy = 0.0;
+                for (int i = 0; i < ns; i++)
+                {
+                    double w = sampleW[i];
+                    double ux = (sampleX[i] - cx) - mxd;
+                    double uz = (sampleZ[i] - cz) - mzd;
+                    double uy = sampleY[i] - myd;
+                    cxx += w * ux * ux; czz += w * uz * uz; cxz += w * ux * uz;
+                    cxy += w * ux * uy; czy += w * uz * uy;
+                }
+                double det = cxx * czz - cxz * cxz;
+                double cxxCzz = cxx * czz;
+                // Conditioning, not just non-singularity: det must be a real fraction of cxx*czz, i.e. the
+                // samples must not be nearly collinear.
+                if (cxxCzz <= 0.0 || det <= GatePlateMinCorrelation1 * cxxCzz)
+                {
+                    rejFit++;
+                    TracePlate(log, "spread=" + F(spread) + "m proud=" + F(proud) + "m n=" + ns
+                        + " corr=" + F((float)(cxxCzz > 0.0 ? cxz / Math.Sqrt(cxxCzz) : 0.0)),
+                        minX, minZ, maxX, maxZ, h, g.Count, area);
+                    ResetPlate(isPlate, g); continue;
+                }
+                double gradX = (cxy * czz - czy * cxz) / det;
+                double gradZ = (cxx * czy - cxy * cxz) / det;
+                // The plane's height at the PLATE's centroid is where the tilt pivots (a rotation, not a
+                // re-fit of the offset): y = a0 + gradX*(x-cx) + gradZ*(z-cz).
+                double a0 = myd - gradX * mxd - gradZ * mzd;
+                // Sanity: the plane must pass through the plate's own level band, or the sample cloud is
+                // describing something else entirely and the plate is left exactly as it was.
+                if (Math.Abs(a0 - h) > GatePlateProudMaxMeters * 2.0)
+                {
+                    rejFit++;
+                    TracePlate(log, "a0=" + F((float)a0) + "m vs h=" + F(h) + "m n=" + ns
+                        + " gradX=" + F((float)gradX) + " gradZ=" + F((float)gradZ),
+                        minX, minZ, maxX, maxZ, h, g.Count, area);
+                    ResetPlate(isPlate, g); continue;
+                }
+
+                // --- tilt clamp: the agent's walk cap AND the plate's own rise budget ----------------
+                double tilt = Math.Sqrt(gradX * gradX + gradZ * gradZ);
+                float halfSpan = Math.Max(spanX, spanZ) * 0.5f;
+                if (halfSpan < 1e-3f) { skipped++; ResetPlate(isPlate, g); continue; }
+                double tiltCap = Math.Tan(maxSlopeDegrees * Math.PI / 180.0);
+                double riseCap = GatePlateMaxRiseMeters(climb) / halfSpan;
+                if (riseCap < tiltCap) tiltCap = riseCap;
+                if (tiltCap <= 0.0) { rejFit++; ResetPlate(isPlate, g); continue; }
+                if (tilt > tiltCap)
+                {
+                    double sc = tiltCap / tilt;
+                    gradX *= sc;
+                    gradZ *= sc;
+                    tilt = tiltCap;
+                }
+
+                // --- offset: median of the residuals, clamped so the plate never rises and never sinks
+                //     by more than one agent climb (the uniform lift is what keeps it off the collision)
+                var res = new List<float>(ns);
+                for (int i = 0; i < ns; i++)
+                    res.Add((float)(sampleY[i] - (a0 + gradX * (sampleX[i] - cx) + gradZ * (sampleZ[i] - cz))));
+                var resSorted = new List<float>(res);
+                resSorted.Sort();
+                float off = resSorted[resSorted.Count / 2];
+                if (off > 0f) off = 0f;
+                if (off < -climb) off = -climb;
+
+                // --- 3. is it actually better? ------------------------------------------------------
+                float worstBefore = 0f, worstAfter = 0f, rmsAcc = 0f;
+                for (int i = 0; i < ns; i++)
+                {
+                    float e0 = Math.Abs(sampleY[i] - h);
+                    if (e0 > worstBefore) worstBefore = e0;
+                    float e1 = (float)Math.Abs(res[i] + off);
+                    if (e1 > worstAfter) worstAfter = e1;
+                    rmsAcc += sampleW[i] * e1 * e1;
+                }
+                float rms = (float)Math.Sqrt(rmsAcc / sw);
+                if (rms > GatePlateMaxFitRmsMeters || worstAfter + GatePlateMinImproveMeters > worstBefore)
+                {
+                    rejBetter++;
+                    TracePlate(log, "tilt=" + F((float)(Math.Atan(tilt) * 180.0 / Math.PI)) + "deg"
+                        + " proud=" + F(proud) + "m n=" + ns + " rms=" + F(rms) + "m"
+                        + " worst=" + F(worstBefore) + "->" + F(worstAfter) + "m off=" + F(off) + "m",
+                        minX, minZ, maxX, maxZ, h, g.Count, area);
+                    ResetPlate(isPlate, g); continue;
+                }
+
+                var plan = new PlatePlan();
+                plan.Faces = g.ToArray();
+                plan.Verts = verts;
+                plan.MinX = minX; plan.MaxX = maxX; plan.MinZ = minZ; plan.MaxZ = maxZ;
+                plan.Cx = cx; plan.Cz = cz; plan.H = h;
+                plan.A0 = (float)a0;
+                plan.GradB = (float)gradX;
+                plan.GradC = (float)gradZ;
+                plan.Off = off;
+                plan.TiltDeg = (float)(Math.Atan(tilt) * 180.0 / Math.PI);
+                plan.TiltCapDeg = (float)(Math.Atan(tiltCap) * 180.0 / Math.PI);
+                plan.Offset = off;
+                plan.Samples = ns;
+                plan.Proud = proud;
+                plan.Rms = rms;
+                plan.WorstBefore = worstBefore;
+                plan.WorstAfter = worstAfter;
+                plans.Add(plan);
+                // isPlate stays set: a later group cannot sample this plate's faces as "neighbour"
+            }
+
+            if (plans.Count == 0)
+            {
+                Log(log, "v2: gate plates: examined=" + candidates + " blended=0"
+                    + " rejected[tooBig=" + rejSize + " notOneLevel=" + rejLevel + " tooFewNeighbours="
+                    + rejSamples + " notProud=" + rejProud + " notFittable=" + rejFit + " notBetter="
+                    + rejBetter + "] (needs > " + F(climb) + "m proud, <= " + F(GatePlateProudMaxMeters)
+                    + "m, and a plane that beats the flat plate)");
+                return 0;
+            }
+            // --- 5. APPLY: rotate the plate ON ITS OWN VERTICES. This is deliberately a rigid rotation, not a
+            // detach-and-regenerate: a plate that keeps the vertices it shares with its neighbours keeps every
+            // edge it had, so the pass changes NO topology at all. That matters because the alternative was
+            // measured and it cost islands - cloning the plate's vertices and bridging the seams with
+            // connector quads (172 of them on CC_20) turned Birtu from 5 islands into 8 and CC_20 from 15
+            // into 16, because a connector is a 0.2-0.5 m sliver that the steep repair or the cleanup can
+            // remove, and a plate that was the only route between two parts of a component then splits.
+            //
+            // What does move is a shared VERTEX: a neighbour that met the plate at a corner comes along by
+            // at most the plate's own offset (bounded by one agent climb, and measured per plate below).
+            // Deterministic: faces in index order, groups keyed by lowest face index, double accumulators in
+            // that order, offsets from a sorted residual list.
+            plans.Sort(delegate (PlatePlan a, PlatePlan b)
+            {
+                return a.Faces[0].CompareTo(b.Faces[0]);
+            });
+            int verts0 = o.X.Count, blendedFaces = 0;
+            var report = new System.Text.StringBuilder();
+            int reported = 0;
+            for (int pi = 0; pi < plans.Count; pi++)
+            {
+                PlatePlan p = plans[pi];
+                float yLo = float.MaxValue, yHi = float.MinValue;
+                for (int ki = 0; ki < p.Verts.Count; ki++)
+                {
+                    int v = p.Verts[ki];
+                    float py = (float)(p.A0 + p.Off + p.GradB * (o.X[v] - p.Cx) + p.GradC * (o.Z[v] - p.Cz));
+                    if (py < yLo) yLo = py;
+                    if (py > yHi) yHi = py;
+                    o.Y[v] = py;
+                }
+                blendedFaces += p.Faces.Length;
+                if (reported < 4 || GatePlateTrace)
+                {
+                    reported++;
+                    report.Append("    plate#" + reported + " bbox=(" + F(p.MinX) + "," + F(p.MinZ) + ")-("
+                        + F(p.MaxX) + "," + F(p.MaxZ) + ") h=" + F(p.H) + " tilt=" + F(p.TiltDeg)
+                        + "deg (cap " + F(p.TiltCapDeg) + "deg) off=" + F(p.Offset) + "m"
+                        + " ring=" + p.Samples + " samples proud=" + F(p.Proud) + "m"
+                        + " rms=" + F(p.Rms) + "m worst=" + F(p.WorstBefore) + "->" + F(p.WorstAfter)
+                        + "m y=[" + F(yLo) + ".." + F(yHi) + "] faces=" + p.Faces.Length
+                        + " verts=" + p.Verts.Count);
+                    Log(log, report.ToString());
+                    report.Length = 0;
+                }
+            }
+            Log(log, "v2: gate plates: examined=" + candidates + " blended=" + plans.Count
+                + " (" + blendedFaces + " faces rotated in place onto " + plans.Count
+                + " fitted plane(s); " + (o.X.Count - verts0)
+                + " vertices added, no face added or removed, no edge touched)"
+                + " rejected[tooBig=" + rejSize + " notOneLevel=" + rejLevel + " tooFewNeighbours="
+                + rejSamples + " notProud=" + rejProud + " notFittable=" + rejFit + " notBetter="
+                + rejBetter + "] in " + watch.ElapsedMilliseconds + "ms (climb=" + F(climb)
+                + "m proudMax=" + F(GatePlateProudMaxMeters) + "m flatDeg=" + F(GatePlateFlatDegrees)
+                + " ring=" + F(ring) + "m)");
+            return blendedFaces;
+        }
+
+        // Harness-only per-candidate explain line (GatePlateTrace): never set in production.
+        private static void TracePlate(Action<string> log, string why, float minX, float minZ,
+            float maxX, float maxZ, float h, int faces, float area)
+        {
+            if (!GatePlateTrace || log == null) return;
+            log("    gateplate bbox=(" + F(minX) + "," + F(minZ) + ")-(" + F(maxX) + "," + F(maxZ) + ")"
+                + " h=" + F(h) + " faces=" + faces + " area=" + F(area) + "m2 " + why);
+        }
+
+        // A rejected candidate must not keep its faces masked as "plate", or a later (smaller) group that
+        // happens to sit inside it would sample itself as its own neighbour.
+        private static void ResetPlate(bool[] isPlate, List<int> faces)
+        {
+            for (int i = 0; i < faces.Count; i++) isPlate[faces[i]] = false;
+        }
+
+        public static float GatePlateMaxRiseMeters(float agentClimbMeters)
+        {
+            return 2f * agentClimbMeters;
         }
 
         private static float TriNormalYList(MergeOutput o, int a, int b, int c)
@@ -3596,6 +4108,37 @@ namespace BetterBannerlordNavmeshing
         // and is the mechanism that makes a ladder traversable, so its cells are the ONLY ones allowed to
         // carry a face above it.
         public const float SteepFaceMarginDegreesDefault = 10f;
+
+        // ------------------------------------------------------------------
+        // GATE/DOOR PLATE BLEND - tolerances (see BlendGatePlates for the full rule)
+        // ------------------------------------------------------------------
+        // A face counts as part of a "dead-flat plate" at this slope or below. Recast's span tops are
+        // ch-quantised, so a horizontal slab comes out at 0.0 deg; the detail mesh cannot add much.
+        public const float GatePlateFlatDegrees = 2f;
+        // Group size / XZ-area window. Below three faces or one square metre it is a sliver; above 120 m^2, or
+        // longer than 8 m on a side, it is a floor, a deck or a terrace and blending it would move real
+        // geometry. 8 m is the reported gate's own footprint plus room (5.25 x 3.0 m measured).
+        public const int GatePlateMinFaces = 3;
+        public const float GatePlateMinAreaM2 = 1f;
+        public const float GatePlateMaxAreaM2 = 120f;
+        public const float GatePlateMaxSpanMeters = 8f;
+        // "Standing proud of the surroundings": the plate's height minus the 10th percentile of the
+        // neighbouring mesh's heights in the ring around it. The FLOOR of the test is the agent climb itself -
+        // a plate that already meets its surroundings inside the climb has nothing wrong with it, and leaving
+        // it alone is worth an island - and 2.5 m caps the class (a roof / a bridge deck is not a floor, and
+        // its surroundings are metres away).
+        public const float GatePlateProudMaxMeters = 2.5f;
+        // The fit needs enough, spread-out samples to know WHICH way the ground falls.
+        public const int GatePlateMinSamples = 6;
+        public const float GatePlateMinSpanMeters = 1.5f;
+        public const float GatePlateMaxFitRmsMeters = 1.0f;
+        // A blend must be an improvement: the worst neighbour mismatch after the fit has to beat the flat
+        // plate's worst mismatch by this margin, or the plate is left exactly as it was.
+        public const float GatePlateMinImproveMeters = 0.05f;
+        // Conditioning floor on the fit's normal matrix: det(sxx*szz - sxz^2) must exceed this times
+        // sxx*szz, i.e. |correlation| < 0.9995. A near-collinear sample cloud makes the gradient (and the
+        // intercept solved around the plate centroid) explode while still "explaining" the band.
+        public const double GatePlateMinCorrelation1 = 1e-3;
 
         // The face's own height range has to exceed this to count as a jump. Two agent climbs plus one
         // cell height (1.4 m at climb 0.6 / ch 0.2), which clears the lab stair's 1.20 m connector with

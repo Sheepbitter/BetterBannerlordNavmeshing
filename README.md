@@ -390,6 +390,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **inserts** a midpoint into long thin faces (first, so the later passes clean its children), **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, slides ratio needles, and finishes with a Delaunay-style flip polish. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
 | `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
+| `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. `false` = the pre-pass output. See *Gate / door plate blend*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -1195,6 +1196,108 @@ budgeted, so the last digits drift; Birtu and CC_20 reproduce exactly, Basamu is
 (Basamu's quad count is 3303 -> 3333 here rather than the 2962 quoted earlier for this map: that number was
 measured on a different machine, and its cleanup is the most budget-sensitive of the three - repeats of the
 same binary were observed at 2942/2955/2962 elsewhere.)
+
+### Gate / door plate blend - `NavMeshVoxelGatePlateBlend`, **on by default**
+
+The user's brief, verbatim: *"The navmesh IS just a projection from the gate, which is good and we want for our
+auto navmesh gen. But, it just runs perfectly perpendicular to the gate. One side is too high and not stitching.
+Need to make it so that the projected navmesh for the gate, if treated as a solid plane, rotated by up to 50
+degrees (max agent walk slope) to better align with surrounding navmeshes. Otherwise situations like this terrain
+sloping or putting a gate on a sloped ramp prop break down and don't connect their navmesh like this."*
+
+**What the plate actually is (V3.51's diagnosis re-measured, and confirmed).** `european_castle_wall_gate_l1` on
+CC_20, centre (1130.51, 990.74). It is **not** synthesized (`ramps: synthesized=0` at the gate) and **not** the
+door leaf (the `clean` + `state1..4` copies are vertical: H = 85.12-89.75 over a 1.33 x 3.33 m footprint, so
+they cannot make a 5 x 4 m horizontal plate). It is the raw voxel projection of the gate's own **flat floor
+colliders** - `collider_l` / `collider_r` / `extra_collider_*`, five overlapping copies whose tops sit at
+H = 85.013-85.383, quantised to one `ch` span top (85.8) and lifted by the uniform 0.5 m. Measured with
+`--census 1130.51,990.74,3.5 --plate off`:
+
+```
+f112433 f112437 f112438 f112440 f112441 f112447 f112448 f112449 f112450 f115591
+    all slope=0.0deg ny=1.00 y=[86.30..86.30]      <- ten faces, every vertex at exactly 86.30
+f112442  c=(1132.67,85.77,989.29) slope=47.1deg y=[85.10..86.30] maxEdgeDy=1.20
+f112439  c=(1132.08,86.17,988.92) slope=58.0deg y=[85.90..86.30] maxEdgeDy=0.40
+f112446 / f115594 / f115595   slope=16.5 / 21.3 / 14.2deg  y=[86.30..86.90]   <- the NW end, inside the climb
+```
+
+and the terrain under the passage falls `87.14 m (x=1122) -> 82.80 m (x=1140)` (`--probe` row by row), so the
+plate sits 1.1-1.6 m above the low side. The failure is **asymmetric**: the NW end meets its neighbours inside
+the 0.6 m climb, the SE end meets faces 1.20 m below it, and the plate's eastern tip (1133.0, 991.5) is a
+**dead end** - a degree-1 vertex whose nearest surrounding vertex is (1133.75, **85.10**), 0.75 m away in XZ and
+**1.20 m below**.
+
+**The rule - generic, no prop names, only geometry.** A *plate* is a maximal edge-connected group of dead-flat
+(<= 2 deg), up-facing faces that all sit on **one** `ch` level, with 3..120 faces, 1..120 m^2 and no side longer
+than **8 m** (bigger is a floor, a deck or a terrace, and tilting it would move real geometry). It is re-generated
+only when all of these hold:
+
+1. **PROUD** - the plate's own height is more than one agent climb above, but at most 2.5 m above, the 10th
+   percentile of the surrounding mesh's heights in a 2 m ring around the plate's own footprint. That is the
+   "the ground falls away from under me" signature, and requiring it to exceed the climb is what keeps
+   already-stitching plates out.
+2. **FITTABLE** - at least 6 neighbouring faces in the ring, spread over at least 1.5 m, with a well-conditioned
+   normal matrix (`det >= 1e-3 * sxx*szz`, i.e. |correlation| < 0.9995) and an intercept within 2x `proudMax` of
+   the plate's own level. Weights are the faces' own XZ areas capped at 4 m^2. The fit is over the **built mesh**,
+   never over the raw soup - the soup carries the slab's own colliders *and the wall above it*, and a fit over it
+   tilts the plate towards the wall. Our own synthesized ramp / connector cells are excluded too: they answer a
+   different question, and on the suite's narrow-doorway lab they made a real landing read 1.33 m "proud" and tilt
+   it 11 deg off a level it must keep (that is what broke Test 26 until the exclusion went in).
+3. **BETTER** - the clamped plane has to beat the flat plate by 0.05 m on the *worst* neighbour mismatch,
+   otherwise the plate is left byte-identical.
+
+**The fit and the clamps.** `y = a + b*(x-cx) + c*(z-cz)` about the plate's own XZ centroid, solved as a
+least-squares plane through the **centred** moments (the uncentred normal equations carry an `a0*sum(w*dx)` term;
+solving them as if they did not is what produced a 10.6 gradient - an 85 deg "plane" - for a 2 m sample band).
+The tilt is clamped **twice**: to `tan(NavMeshMaxSlopeDegrees)` (the user's own bound) and to
+`2*agentClimb / halfSpan`, so a 5 m plate can never become a 6 m wall - a blend is a tilted floor, not a ramp. The
+vertical offset is the **median** of the per-sample residuals (the L1 minimiser, so it balances the two ends),
+clamped to `[-climb, 0]`: never raise the plate (raising only makes the proud class worse) and never sink it by
+more than one agent climb, which is what the uniform `HeightOffsetMeters` lift already buys.
+
+**The re-emit is a rotation of the plate's OWN vertices** - "treated as a solid plane, rotated", literally. It
+adds and removes **no face** and touches **no edge**: the plate keeps every vertex it shared, so it keeps every
+connection. What does move is a shared *vertex*, so the handful of faces that met the plate at a corner come
+along by at most the plate's own offset (one agent climb, printed per plate).
+
+The alternative was implemented and measured first, because it looks tidier: **clone** the plate's vertices and
+bridge each seam with a two-triangle connector. It is manifoldness-safe (target edges must be true boundary
+edges, multiplicity 1, consumed once; a plate-vertex fan can only take so many connectors) and it looked good on
+the gate - but it placed **172 connector quads on CC_20**, and because a 0.2-0.5 m connector sliver is something
+`RepairSteepFaces` or the sliver cleanup can remove, a plate that was the only route between two parts of a
+component then split: **Birtu 5 -> 8 islands, CC_20 15 -> 16.** The rotation ships instead, and both numbers are
+back where they were.
+
+**Measured at the gate (CC_20, `--platetrace`), before -> after:**
+
+| | before | after |
+|---|---|---|
+| the plate's own faces | 10 faces, all **86.300**, slope **0.0 deg** | same 8-face group + 2, **12.9-13.0 deg**, `y = 85.329 .. 86.576` |
+| plate tilt (cap 24.567 deg, itself inside `MaxSlopeDegrees` 50) | 0.0 deg | **13.013 deg**, offset -0.003 m |
+| NW exit faces | 16.5 / 21.3 / 14.2 deg, `y=[86.30..86.90]` | 12.9 / 19.5 / 8.9 deg, `y=[85.84..86.90]` |
+| SE exit faces | **47.1 deg** (`dy=1.20`) and **58.0 deg** | **33.8 deg** (`dy=0.80`) and **57.5 deg** (`dy=0.28`) |
+| east tip (1133.0, 991.5) vs its neighbour at 85.10 | **1.200 m** apart (dead end) | **0.229 m** apart |
+| worst neighbour mismatch over the 25-sample ring | **1.600 m** | **0.495 m** (inside the 0.6 m climb) |
+| profile at z = 991, x = 1124..1138 | 87.40 / 86.80 / 86.50 / 86.30 / **none** / 85.03 / 84.97 / 84.19 | 87.57 / 86.79 / 86.24 / 86.15 / **85.53** / 85.03 / 84.97 / 84.19 |
+| `--connect` foot -> through -> far-side pairs across the gate | 3 of 5 (2 had no face within 2 m) | **5 of 5 CONNECTED** |
+| islands / `selfOverlap` | 15 / `1/118` | **15 / `1/118`** |
+
+**Bars (unchanged where they were acceptance criteria).** CC_20 **islands 15**, both assert points on island 0,
+`SNAPSHOT: PASS`; Birtu **islands 5**, `ladders total=2` (`civilian_ladder_5m`, `civilian_ladder_6m`) with all
+four ladder probe points `isl=1`; Basamu **islands 1**; `maxEdgeMult=2`, `inverted=0`, `vertical=0`,
+`selfOverlap` and `--scan OVERLAPpairs` **identical to the setting-off build on all three maps** (88/10/85 pairs);
+suite verdicts byte-identical to the stored baseline (every test PASS, the documented `detailFaces>=fanFaces
+False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS) and **no plate is blended anywhere in the suite**. Cost:
+22 ms on Birtu, 112 ms on CC_20, 196 ms on Basamu. `NavMeshVoxelGatePlateBlend=false` restores the old output
+byte for byte.
+
+**Honest residual.** The rotation pivots on the plate's own centroid, so the median offset is what balances the
+ends and a *single* outlier neighbour inside the ring still biases the gradient (the gate's residual is 0.495 m
+against a 0.6 m climb - inside, but with 0.1 m of headroom, and the SE exit keeps a 57.5 deg riser because that
+face is the only thing holding the plate's corner to the wall base). A gate dropped on a *steep ramp prop* rather
+than on open slope is the case this does not yet prove: the ring then samples the prop's own ramp as well as the
+ground, and the `proudMax` ceiling can refuse the plate outright. That is worth its own round with the user's own
+gate-on-a-ramp screenshot. The user's re-import is the acceptance test either way.
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 
