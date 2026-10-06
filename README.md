@@ -391,7 +391,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelPruneMaxIslandFaces` | `400` | Face cap for the prune (`0` = off). Islands with at most this many faces are removed. Raise it if legit isolated areas (sealed rooms, tower tops) disappear; set `NavMeshVoxelPruneIsolatedIslands=false` to disable. |
 | `NavMeshVoxelCleanup` | `true` | v2 final-mesh sliver cleanup (thin/tiny triangles). Runs after merge/stitch/prune and before the invariant gate: welds, drops degenerates, then **inserts** a midpoint into long thin faces (first, so the later passes clean its children), **removes** the near-collinear vertex of a needle/thin face and retriangulates its hole, slides ratio needles, and finishes with a Delaunay-style flip polish. Everything is bounded by the mesh's own error promise and the topology gate; see *Sliver cleanup*. `false` = the pre-cleanup mesh (A/B). Log: the `cleanup:` line (+ a capped per-needle diagnosis when any survive). |
 | `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
-| `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. Then a second stage, **the seam**, bridges a genuine void next to a blended plate - two triangles reusing the four existing vertices so the engine gets an edge portal - only where the gap is 0.1-1.5 m, the step is inside the climb, the strip is no steeper than `NavMeshMaxSlopeDegrees` and its own footprint is empty; 71 / 80 / 110 voids closed on CC_20 / Birtu / Basamu with the island counts unchanged and the suite byte-identical. `false` = the pre-pass output byte for byte. See *Gate / door plate blend*. |
+| `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. `false` = the pre-pass output byte for byte. See *Gate / door plate blend*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
 | `NavMeshVoxelBarriers` | `true` | Carve every barrier body whose blocking mask stops **agents** out of the navmesh as a solid wall, so an agent can no longer path across it. Masks that stop only missiles/weapons are deliberately **not** carved - the engine excludes `MissileOnly` bodies from every agent raycast, so the game itself lets agents walk through those. Two rules keep it from over-cutting: the cut is applied only where the wall straddles that column's navigable band (a wall 25 m above or below a walkway cuts nothing), and every connectivity repair (gap fill, per-tile stitch, merge stitch) refuses to bridge a barrier cell. One-way (`Flip`) is **not** reproduced - the cut is two-sided, which is stricter than the runtime rule, because a navmesh has no directed edges. `false` restores the pre-barrier output byte for byte. See *Barriers*. |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
@@ -1456,213 +1456,34 @@ back where they were.
 | `--connect` foot -> through -> far-side pairs across the gate | 3 of 5 (2 had no face within 2 m) | **5 of 5 CONNECTED** |
 | islands / `selfOverlap` | 15 / `1/118` | **15 / `1/118`** |
 
-#### V3.53: the seam - a void next to the plate is not a slope problem
+#### The seam and the footprint growth were removed (user revert)
 
-The user's next report was *"The slope is fixed at the gate. It looks great, but it didn't connect still."* The
-measurement says that is a **different defect**, and it is not the plate's slope.
+Two later rounds added a **seam** stage (`ClosePlateSeams` - two triangles welded edge to edge across a void
+next to a blended plate) and a **footprint-growth** stage (`GrowPlateFootprint` - growing the plate's footprint
+back toward the prop's own colliders), then moved the whole pass to be the **last** stage that touches geometry.
+The user reverted that work, reporting *stray unpruned islands on cliff props and rooftops* and *a rooftop
+navmesh that had joined two sides of the map and was ruined*. Both stages **appended new triangles** - and an
+appended triangle can land on a prop top or a roof, on a fragment that was previously too small to be pruned.
 
-**What the engine needs, and what the harness had been measuring.** `FaceComponents` counts edge adjacency and
-`--probe` only asks whether a column is covered; the engine does neither. It re-voxelizes the imported faces and
-links two polys when their XZ columns **touch** and their floors differ by at most its climb. A surface can
-therefore be edge-connected around a loop and still be uncrossable where the user walks. `--walk "x,z;x,z;..."` now
-does that test literally - minimum **footprint** distance between the two triangles (vertex-to-triangle both ways,
-which is what "adjacent columns" means), height difference over the whole contact region, breadth-first over faces
-- and prints the route with every step's `dy` and footprint gap. `--pinch` and `--soup` were added alongside it:
-`--pinch` finds vertices whose incident faces share no edge (a point touch), `--soup` dumps the merged soup's
-triangles in a box with their slopes, which is the only way to ask "is there walkable collision in that hole".
+The pass is back to **rotation only**, run **before** the cross-tile stitch and the prune exactly as V3.52 had
+it. That placement is the safe one for a different, structural reason: the rotation adds and removes **no
+face** and touches **no edge**, so the island census is unchanged *by construction*, whereas the two reverted
+stages could only argue for it empirically. The seam log line, the footprint log line, the `GatePlateSeam*` /
+`GatePlateGrow*` constants and the `GatePlateSeamCap` harness knob are gone with them.
 
-**The void.** Probing along `z = 991` through the gate in 0.5 m steps (`--probe`) - and **identically** with
-`NavMeshVoxelGatePlateBlend` **off**, so this is not the blend's doing:
+**What the revert does and does not change, measured (CC_20 / Birtu / Basamu, V3.59 tree):**
 
-```
-x=1128 86.24 | 1129 86.24 | 1130 86.15 | 1131 85.77 | 1132 85.53 | 1133 ---- | 1133.5 ---- | 1134 85.03 | 1135 ---- | 1135.5 84.90 | 1136 84.97
-```
-
-Two bare columns right at the plate's east end, plus a larger 4 x 3 m patch south-east of the passage
-(`x 1131..1135`, `z 992..994`) on 12-18 deg terrain. `--pinch` finds **zero** pinch vertices within 30 m - the
-surface is properly edge-connected - so this is coverage, not topology.
-
-**Why the gap fill misses it.** `FillNarrowGaps` runs at `TiledNavMeshBuilder.cs:3077`, **before**
-`FilterLedgeSpans` (3103) and `FilterWalkableLowHeightSpans` (3148). The gate threshold beam's own underside sits
-0.3-0.9 m above the terrain in the doorway (`--soup 1132,991,1137,996,82,88` shows the beam's vertical faces at
-x 1132.3-1133.4 spanning 84.75-85.59 lifted, over terrain at 83.84-84.72), so those terrain columns still hold a
-walkable span when the gap fill looks at them and are denied clearance a few lines later. Nothing re-fills them
-afterwards, and the resulting band is also wider than the 2-cell (0.5 m) gap-fill cap. `--ledge off` and
-`--climb 1.0` each restore 6 of the 13 probed columns, but only at the 92.3 m battlement - never on the ground -
-which is the proof that neither the ledge filter nor the climb is the operative rule here.
-
-**What ships: `ClosePlateSeams`.** For every plate the blend has just rotated, each of its **mesh-boundary** edges
-(edge multiplicity exactly 1) is offered the nearest foreign **boundary** edge across a gap, and the pair is
-bridged by two triangles that **reuse the four existing vertices**: `(a,b,v)` and `(a,v,u)`, so both boundary edges
-become interior and the engine gets a real **edge portal**, not a corner touch. Every guard below was added because
-its absence was measured, not guessed:
-
-| guard | what happened without it |
-|---|---|
-| `0.1 m <= gap <= 1.5 m` | a touching pair is already connected; past 1.5 m it is a missing prop, not a seam |
-| height step over the whole contact `<= climb` (0.6 m), bounded by the closest pair **plus** each edge's own height variation | measuring only the closest pair lets a steep foreign edge through - and the closest pair of two edge-sharing triangles is always a shared vertex where both surfaces agree, i.e. `dy = 0.000` |
-| `gap * tan(MaxSlopeDegrees) >= step` | otherwise the "seam" is a riser, which is what an agent meets at a void |
-| no vertex shared between the two edges; strip area `>= 0.08 m^2`; segments must not cross | degenerate strips, and strips whose two triangles overlap |
-| `(a,v)` unused; `(a,u)` and `(b,v)` not already shared by two faces | the two triangles add `(a,v)` **twice**, so an existing shared edge there goes four-way: **measured on Birtu, `maxEdgeMult=4`, invariants FAIL, the module refuses to import** |
-| **the strip's own footprint must be empty** | the nearest boundary edge is not always across a void - it can be round the side of a step, and the strip then lands on real geometry. **Measured: 23 of CC_20's 24 `selfOverlap` pairs, and once the cleanup deleted the face holding a component together, CC_20 15 -> 16 islands and Basamu 1 -> 2.** Four sample points (both triangle centroids, both diagonal midpoints) must each be uncovered by any face within `climb + ch` of the strip's own height |
-| each edge consumed once; `GatePlateSeamMaxCount` (1024) cap | two plates bridging the same void twice |
-| whole-mesh recount afterwards, refuse the whole batch if any edge is over-shared | the guards are index-space arithmetic and a mistake costs the entire import |
-
-**Why reusing the vertices is not a detail.** A first version added exact copies of the four vertices and let the
-final weld merge them back. They did merge - through the **sliver cleanup**, which welds *by position* - but onto a
-**nearby** vertex, so the strip's edges became edges the multiplicity bookkeeping had never seen, and Birtu failed
-its invariants. Reusing the originals keeps every added edge in the index space the guards were written in, adds no
-vertex, and keeps the pass's "0 vertices added" claim true.
-
-**V3.55: the footprint, and the pass moved to last.** The seam does not close the void immediately east of the
-CC_20 gate's plate - the spot the user circled - and the reason is now measured rather than inferred. `--soup
-1133.0,990.8,1134.2,991.6,83,88` returns **8 triangles, every one of them VERTICAL**, all in the 85 m band:
-`collider_r` / `extra_collider_r` end faces at x = 1133.28 and x = 1133.37 spanning y = 84.97-85.11. **There is
-no up-facing collision at all inside the gate's east lip.** The prop's own floor ends there. What follows is a
-step, not a gap: the plate's tip sits at 85.30 and the terrain under the lip at ~84.2, so an agent stepping off
-the threshold drops **1.1 m** - more than one 0.6 m climb.
-
-So this round adds the third stage, **the footprint growth**: the plate polygon is grown back toward its own
-source collision, outward across a plate boundary edge, one voxel cell at a time, at the plate's fitted height,
-and only where the **raw soup** says the prop's floor is still there:
-
-| guard | what happens without it |
-|---|---|
-| **FLOOR** - an up-facing soup surface at the cell, at or below the plate's **pre-blend level** `h` plus `ch + climb` | the plate grows into thin air. Anchoring the search to the *fitted plane* instead excluded the prop's own floor and refused every cell: measured **0 strips**. The blend lowers the plate by up to a climb *plus* its tilt, so at the gate the plane is 85.5 while the slab top is still 86.3 |
-| **the soup is not in mesh space** - every mesh height is `bminY + gy*ch + HeightOffsetMeters` above the soup height it came from (measured: plate `h=86.300`, soup floor `85.800`, exactly the 0.5 m setting) | every floor query missed by 0.5 m and nothing grew |
-| **CLEARANCE** - no soup triangle covering the cell between that floor and `walkableHeight` above it | the plate grows under the gate's own wall. Recast's own clearance rule, asked of the soup instead of trusting a filter that already ran before the plate was known |
-| **BARE** - the built mesh does not already cover the cell within one climb of the plane | the plate paints over the neighbour it was meant to meet |
-| outward direction from the **face's own winding**, `(-ez, ex)/len` | a bbox guess is fragile: on a concave plate a point just outside an edge is still inside the bbox, and the guess sent the growth **into the gatehouse** |
-| the ring's slope measured **across** the strip, `abs(plane(mid+n*cs) - plane(mid)) <= cs*tan(MaxSlopeDegrees)` | measuring height **along** the edge instead refuses every long edge: `0.36 m` over a 1.58 m edge against a `0.30 m` bound - the plate's own 13 deg tilt, already inside the cap and legal on the plate |
-| every sample along the edge, at the cell size, claims its cell | three fixed points let two edges growing from a shared corner both grow into it: **4 self-overlapping pairs on Basamu, 1 on Birtu** |
-| growth stops at the first failing cell, and at `GatePlateGrowMaxMeters` (1.0 m) | - |
-
-**And the whole pass moved to be the LAST stage that touches geometry** (after the sliver cleanup and the
-face-quality repair). That placement is load bearing, not cosmetic. Placed earlier - as V3.53 had it, right after
-`RepairNonManifold` - the cleanup ate what it added: 266 grown + 100 seam triangles went in and **44 came out**,
-the plate's own east tip face went with them, and the CC_20 gate went from "covered to x = 1132.75" back to
-"bare at x = 1132.75". A synthesized strip is by definition a fresh thin triangle and the cleanup exists to
-delete exactly those. Nothing that can remove a face may run after this point. Two consequences, both measured:
-(1) a strip that is wrong now stays wrong, so the strip tests are correspondingly strict; (2) the pass only ever
-**appends** faces and vertices, so every index below the pre-pass face count is untouched and the `quadPairs`
-remapped just above stay valid. The rotation is unaffected by the move - it caps the tilt at `MaxSlopeDegrees`
-and `RepairSteepFaces` only ever dropped faces past 60 deg and taller than 1.4 m, so a rotated plate was never one
-of its candidates.
-
-**Tightening `selfOverlap` back to zero (Basamu 11 -> 0).** The seam's four fixed sample points are replaced by a
-*complete* non-overlap proof, which for a simple quad against a triangle is three tests: no foreign vertex
-strictly inside the quad, no foreign edge properly crossing one of the quad's four boundary edges, and neither of
-the two triangle centroids already covered. A shared endpoint or a mere touch deliberately does **not** count -
-the strip is *supposed* to share its ends with the two faces it welds to. A full cell-size lattice over the
-footprint also found every overlap but rejected 70 of CC_20's 71 legitimate seams, because a face continuing
-right up to one of the strip's own welded edges is exactly what a seam is for. Measured after the change:
-`selfOverlap` CC_20 **1** (baseline), Birtu **0**, Basamu **0**.
-
-**Measured (V3.55).** Footprint **CC_20 24 edges / 58 triangles, Birtu 22 / 52, Basamu 10 / 38** (widest 1.0 m);
-seams **CC_20 5, Birtu 4, Basamu 14**; `maxEdgeMult=2`, `inverted=0`, `vertical=0`, `badQuadWalks=0`, invariants
-**PASS** on all three; **islands CC_20 15, Birtu 5, Basamu 1**; `selfOverlap` **1 / 0 / 0**.
-
-**Bars.** Suite verdicts **110/110 byte-identical** to the stored baseline (every test PASS, the documented
-`detailFaces>=fanFaces False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS); no plate is blended and no seam or
-growth is emitted anywhere in the suite, so the suite is untouched by construction. Birtu `ladders total=2`
-(`civilian_ladder_5m` at 302.60/314.95, `civilian_ladder_6m` at 300.08/279.32). `NavMeshVoxelGatePlateBlend=false`
-emits no `gate plates:`, `gate plate footprint:` or `gate plate seams:` line at all and returns
-`V=144036 F=241424 E=386905 quads=1852` on CC_20, i.e. the pre-pass output byte for byte. Both variants build
-0 warnings / 0 errors, deployed.
-
-**V3.56: the frame, restated - the reported gap is 0.170 m, not 1.1 m.** V3.55 concluded the gate's east lip was a
-1.1 m step and stopped there. **That number was wrong**, and the user was right to call it: *"you also say that
-there's a 1.1 meter drop, there definitely is not. The editor cube I placed in the picture is 1x1x1 meter. So the
-vertex drops are .2-.3 meters at worst."* Two independent mistakes produced it, and both are the same one
-wearing different clothes - **a MESH height subtracted from a SOUP height**, when `EmitVertex` writes
-`bminY + gy*ch + HeightOffsetMeters` and every mesh height therefore sits `HeightOffsetMeters` above the soup it
-came from. V3.55 already documented that trap once and then walked into it again.
-
-Putting **both sides of the crossing in one frame - the final emitted mesh, which is what the engine imports**:
-
-| | vertex | mesh Y | frame |
-|---|---|---|---|
-| near side, the growth's outer vertex | `v144038` (1133.195, **85.270**, 991.344) | mesh | - |
-| far side, the boundary vertex | `v64009` (1133.750, **85.100**, 991.250) | mesh | - |
-| **the drop** | | **0.170 m** | mesh |
-
-and the same surfaces in the raw soup, with the 0.5 m offset applied back off:
-
-| what | soup Y | mesh Y (= soup + 0.5) |
+| | with the two stages | rotation only |
 |---|---|---|
-| plate's pre-blend level | 85.8 | 86.300 |
-| the plate's blended plane at the gap | 84.8 | 85.28 |
-| the terrain under the threshold lip | 84.2 - 84.6 | 84.7 - 85.1 |
-| the far-side walkable surface | 84.6 | 85.100 |
+| gate-plate triangles added by the pass | 105 rotated + 42 grown + 12 seam | **105 / 302 rotated only, 0 added, 0 removed** |
+| `--plate off` island count | 15 / 5 / 1 | 15 / 5 / 1 (**identical**) |
+| blend-on island count | 15 / 5 / 1 | **15 / 5 / 1 (identical)** |
 
-V3.55's 1.114 m was `85.304 (mesh) - 84.19 (soup)`: two different frames, and the second one is *underneath* both
-sides rather than being either of them. In the mesh frame the drop is 0.170 m, and the terrain under the lip is
-0.58 m below the plane - inside the 0.6 m climb.
-
-**So the drops were never the problem and the blocker is a pure XZ void.** On the final emitted mesh, at
-`z = 991.25`: covered to `x = 1133.1`, then **bare `1133.2 .. 1134.0`**, then covered again from `1133.75`.
-Recast links only *touching* footprints, so a 0.17 m step across a 0.575 m hole is exactly the case it refuses and
-an agent cannot step over. `--walk` on the final mesh agrees:
-
-```
-target 0 (1132.75,991.25) y=85.51 -> WALKABLE
-target 1 (1133.10,991.25) y=85.38 f240994 -> WALKABLE      <- the new growth triangle
-target 2 (1133.30,991.25) -> NO MESH AT ALL [VOID]
-target 3 (1133.50,991.25) -> NO MESH AT ALL [VOID]
-target 4 (1133.75,991.25) y=85.03 f112402 -> WALKABLE
-```
-
-**Three fixes went in this round, and each was a measurement, not a guess.**
-
-1. **The growth's BARE test used the wrong band.** It asked "is there already mesh within `climb` of the plane?",
-   and the far-side face across the void is 0.18 m below the plane - so it read as *already covered* and the
-   growth refused every cell of the void. Measured: 1 cell grown, the 0.65 m bare band still open. **The band is
-   now one `ch`**, because that is the question being asked: "is there already mesh at *this level*", i.e. would I
-   be painting over a neighbour. The climb belongs to Route B's reach test, where "can an agent step to that" is
-   genuinely the question.
-2. **The floor test compared against the plate's PRE-BLEND level instead of the plane.** The trace said
-   `[floorLow@84.205]` and refused the lip: 84.205 is a *soup* height, 0.58 m below the plane - well inside the
-   climb - but 1.6 m below the pre-blend level, so it did not look like the plate's floor. **It is now compared
-   with the plane, in soup space**, so a floor within one climb of where the strip is going counts as a floor the
-   strip may bridge to. That is the frame mistake again, one level down.
-3. **Route B - crossing a genuine void.** A cell with no usable soup floor at all may still be grown into when
-   nothing in the soup sits within `walkableHeight` above the plane *and* walkable built mesh lies within
-   `GatePlateGrowVoidReachMeters` (0.6 m) at a step inside the climb, capped at
-   `GatePlateGrowVoidMaxSteps` (3 cells) per edge. That is what makes it a connection rather than an invention:
-   there has to be something to connect to, close by, at a step an agent can take.
-
-Measured effect at the gate: coverage now reaches `x = 1133.1` (was `1132.75`), and face `f240994` is a real
-walkable triangle in what was bare ground. Growth counts fell (CC_20 24 -> 18 edges, Birtu 22 -> 10, Basamu
-10 -> 7) because fix 1 deliberately makes the growth more conservative - it now refuses wherever a same-level
-face is already there, instead of reaching over a 0.18 m step to cover it.
-
-**Honest residual - the gate gap is narrowed, not closed, and the next blocker is now identified.** `(1133.30,
-991.25)` and `(1133.50, 991.25)` are still `NO MESH AT ALL`. The trace shows why, and it is a *new* finding rather
-than a repeat: the cells there are `[blockedAbove]`. The gate threshold slab's **own underside** sits at 85.47 in
-mesh space while the plate's blended plane at that X is 85.28 - **the blend has lowered the plate below the prop's
-own collider underside**, so a strip placed at the plane there would sit inside the slab's body, and the clearance
-test correctly refuses it. That is a constraint the blend never imposed on itself and it is the next thing to fix:
-**clamp the fitted plane so it can never go below the prop's own collider underside** (the lowest soup surface over
-the plate's own footprint, plus a margin). With the plate clamped at ~85.5, the terrain under the lip
-(84.7-85.1) is then 0.4-0.8 m below it and the void at `x = 1133.2..1133.7` becomes a strip the growth can
-legitimately fill. This is a clamp on the rotation, not new geometry, and it is measurable the same way.
-
-**Bars.** Suite **110/110 byte-identical** to the stored baseline; islands **CC_20 15 / Birtu 5 / Basamu 1**;
-invariants **PASS** on all three with `maxEdgeMult=2`, `inverted=0`, `vertical=0`; `selfOverlap` **CC_20 1**
-(baseline), **Birtu 0**, **Basamu 0**; Birtu `ladders total=2`; `NavMeshVoxelGatePlateBlend=false` emits no
-gate-plate line and returns `V=144036 F=241424 E=386905 quads=1852`, the pre-pass output byte for byte; both
-variants **0 warnings / 0 errors**, deployed.
-
-**Honest residual - unchanged in substance.** The footprint growth extends the gate's plate
-one 0.25 m cell east (x = 1132.75 -> 1133.2 at z ~ 991.3) and then **correctly stops**, because the prop's own
-floor ends at x = 1133.37 with nothing horizontal beyond it. `--walk` still reports `(1133, 991)` as
-`NO MESH AT ALL [VOID]`, and the ground under the lip is 1.1 m below the plate. **That is not a gap in the navmesh;
-it is a step down a threshold lip, and the hole is arguably the right answer.** The next shape, if that crossing is
-wanted, is therefore not another plate change: it is a **synthesized stair or ramp down the lip** from the plate's
-east edge to the terrain (1.1 m over the 0.85 m of lip = 52 deg against a 50 deg cap, so two flights or a slightly
-longer run), or a decision that a 1.1 m drop off a gate threshold is not agent-traversable and the hole stays.
-Either way it is a *ramp* decision, not a plate decision.
-
+So the revert removes 54 triangles on CC_20, 28 on Birtu and 50 on Basamu - the only geometry the reverted
+stages ever contributed - and **the island census does not move on any of the three scenes**. Any stray floor
+the user saw on a cliff prop or a roof was therefore either a connected fragment (which the census never
+counted) or, on a scene not built here, a separate island; this revert cannot claim the island half of the
+report, and the measurement says so plainly rather than asserting a fix.
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 
