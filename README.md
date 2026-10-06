@@ -393,6 +393,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
 | `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. Then a second stage, **the seam**, bridges a genuine void next to a blended plate - two triangles reusing the four existing vertices so the engine gets an edge portal - only where the gap is 0.1-1.5 m, the step is inside the climb, the strip is no steeper than `NavMeshMaxSlopeDegrees` and its own footprint is empty; 71 / 80 / 110 voids closed on CC_20 / Birtu / Basamu with the island counts unchanged and the suite byte-identical. `false` = the pre-pass output byte for byte. See *Gate / door plate blend*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
+| `NavMeshVoxelBarriers` | `true` | Carve every barrier body whose blocking mask stops **agents** out of the navmesh as a solid wall, so an agent can no longer path across it. Masks that stop only missiles/weapons are deliberately **not** carved - the engine excludes `MissileOnly` bodies from every agent raycast, so the game itself lets agents walk through those. Two rules keep it from over-cutting: the cut is applied only where the wall straddles that column's navigable band (a wall 25 m above or below a walkway cuts nothing), and every connectivity repair (gap fill, per-tile stitch, merge stitch) refuses to bridge a barrier cell. One-way (`Flip`) is **not** reproduced - the cut is two-sided, which is stricter than the runtime rule, because a navmesh has no directed edges. `false` restores the pre-barrier output byte for byte. See *Barriers*. |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
@@ -656,7 +657,7 @@ name):
 | `HasSteps` stairs | included | Voxelized like any floor; steps <= agent climb are traversable. |
 | Dynamic / movable props (`Dynamic`/`Moveable`, dynamic mobility, dynamic rigid body) | included (`NavMeshVoxelIncludeDynamic`) | Captured at their placed pose - e.g. Birtu's merlons are static-in-practice props. Set false for static-only. |
 | Flora (`BodyOwnerFlora`) | **excluded** (`NavMeshVoxelIncludeFlora = false`) | Usually visual; many small shapes add faces without being reliably navigable. |
-| Barriers (`Barrier` / `Barrier3D`) | excluded | Invisible blocker volumes; walkable faces must not sit on them. |
+| Barriers (`Barrier` / `Barrier3D`) | **carved as solid** when the mask blocks agents (`NavMeshVoxelBarriers`, default on); never in the walkable soup | See *Barriers* below. A barrier's triangles are never mixed into the walkable soup - they are rasterised into each tile's heightfield as `RC_NULL_AREA` solid spans, so erosion, the clearance filter and the ledge trim all treat them as real obstacles. The body is still counted in `excluded=[... barrier=<n> ...]`, which keeps its original meaning ("kept out of the walkable soup") and is true of every barrier. |
 | Ladders (`Ladder`) | excluded, **included when `NavMeshVoxelSteppedProps` is on** | Not a walkable surface by themselves and the engine handles ladders separately, so they are dropped by default. With the stepped-props feature on they are collected and the flight is synthesized like a stair's (their rungs are steep-walkable, the gaps between rungs are ramps), because a real ladder's collision is the only thing that carries a navmesh up it. Counted as `laddersIncluded=<n>`. See *Stairs & ladders*. |
 | Non-solid-for-agents markers (`Disabled` / `OnlyCollideWithRaycast` / `DontTransferToPhysicsEngine` / `MissileOnly`) | excluded | Flagged as not solid for agents: such a body must not become walkable navmesh. Counted as `unsolid=` in the exclusion log. (None on Birtu today; future-proofing.) |
 | Terrain-owner bodies (`BodyOwnerTerrain`) | excluded | The terrain is already meshed from the heightfield; reading it again would double up. |
@@ -1944,6 +1945,99 @@ are left as a follow-up; the three ladders were located via the new `--ladders` 
 
 
 
+### Barriers - `NavMeshVoxelBarriers`, **on by default**
+
+A Bannerlord *barrier* is an invisible wall the mission AI refuses to cross. It is not an engine entity type:
+the scene stores a `barrier_builder` script component on an otherwise plain `game_entity`, and the engine's
+editor component (native `Rgl\ScriptComponents\barrier_builder.cpp`) turns the referenced path into a `bo_barrier`
+collision body when the scene loads. Because that generated body is an ordinary physics body it is enumerated by the
+normal scene scan - which is how it is collected here. No XML re-parsing, no re-deriving the path.
+
+#### Which barriers are honoured - flags, never names
+
+`barrier_builder` has a `Mask` string that selects one of exactly four blocking modes (decompiled from
+`TaleWorlds.Native.dll`, the length+strcmp chain at `0x7ff8d04e61e5`..`0x7ff8d04e628c`; the bit values are
+confirmed by the engine's own XML<->flags decoder):
+
+| `Mask` | BodyFlags | Blocks agents? | Carved? |
+| --- | --- | --- | --- |
+| `Everything` | `0x00000200` `Barrier` | yes | **yes** |
+| `Only Agents` | `0x00200200` `Barrier\|AgentOnly` | yes | **yes** |
+| `Only AI Agents` | `0x00200300` `Barrier\|AgentOnly\|AILimiter` | yes | **yes** |
+| `Only Missile and Melee` | `0x00400200` `MissileOnly\|Barrier` | **no** | no |
+
+The reason is in the engine's own exclude-flag presets, not in judgement: `CommonCollisionExcludeFlagsForAgent`
+is `0x2051B189`, which **includes** `MissileOnly` and **excludes** `AgentOnly`. A missile-only body is therefore
+invisible to every agent raycast - it stops arrows, not people - and the game itself walks agents straight through
+it. Carving the navmesh there would stop agents at a wall that does not exist for them. The other three all carry
+`Barrier`, which is deliberately **absent** from every agent-facing exclude set; that is precisely what "invisible
+wall" means. The whole rule is one pure function, `TiledNavMeshBuilder.BarrierBlocksAgents(int)`, so it is unit
+tested offline over all four masks.
+
+#### How the cut works
+
+1. **Collect.** Honour-able barrier bodies are read exactly like any other body but into a separate
+   `TiledNavMeshBuilder.BarrierWalls` list. Their triangles are *never* mixed into the walkable soup - the wall is
+   cut separately, so putting it in the soup too would cut it twice.
+2. **Rasterise as solid.** Per tile, the barrier triangles are converted to Recast space, rasterised into a
+   **scratch** heightfield with `RC_NULL_AREA`, and the resulting spans merged into the tile's own heightfield by
+   hand. The scratch heightfield is not an optimisation, it is what gives provenance: a span carries no "this came
+   from a barrier" bit, so rasterising in place would leave the height rule nothing to release. Every downstream
+   rule (ledge trim, clearance, compaction, erosion) then treats the wall as ordinary real geometry.
+3. **Height rule - do not over-cut.** A cut is applied only where the wall *straddles* that column's navigable
+   band: `zMin <= bandTop + climb && zMax >= bandBottom`, where `[bandBottom, bandTop]` spans **all** of the
+   column's walkable surfaces. A wall that misses the band is released and leaves the mesh untouched. Two details
+   matter: the band is the whole column rather than its lowest span, because a column on a hillside can carry
+   several walkable levels (judging against only the lowest one left walk-through holes in CC_20's `barrier_1`);
+   and the wall must be *planted on the ground*, because a wall floating above the floor blocks nothing.
+4. **Disarm the connectivity repairs.** A cut barrier leaves a strip of empty columns with walkable flanks on both
+   sides - exactly the shape `FillNarrowGaps` exists to bridge, and at `StitchMaxGapCells = 4` a 1 m-thick wall is
+   squarely inside the stitch range. Every cut column is therefore recorded in a shared
+   `ObstructionCells` map (keyed by the same `CellKey` lattice the stepped-prop provenance uses, and
+   provenance-tagged `Barrier`/`Border` so the tile-border work can join the same set), which `FillNarrowGaps`, the
+   per-tile stitch and the merge stitch all consult before bridging. On CC_20 this refuses 30 gap fills.
+5. **Prune.** An island with a face next to a barrier is **never** pruned, whatever its size: the cut can
+   legitimately split one island in two, and the small side must not be deleted in the pass that created it. The
+   log reports how many islands were kept for this reason.
+
+#### One-way (`Flip`) is not reproduced - by design
+
+`Flip` negates the wall's physics normal. It is a collision-response flag, not graph data, and a navmesh has no
+directed edges: the stitch's union-find is symmetric and the engine's only "make this impassable" tool is a
+per-face boolean (`Scene.SetAbilityOfFacesWithId`). A directed constraint cannot be expressed in the output at all.
+
+**We therefore carve a two-sided wall, which is strictly more restrictive than the runtime rule**: an agent the game
+would let through in one direction is stopped in both. This is a deliberate conservatism, chosen because the
+alternative (per-face one-way flags) cannot survive the NMG8 prefab round trip. If a scene relies on a one-way
+barrier to let troops leave a courtyard, the navmesh will hold them in. `Flip` is recorded per wall and logged, so
+the affected bodies are identifiable.
+
+#### Measured on the reported case (`CC_20_siege`, `barrier_1`)
+
+`barrier_1` is 25 path nodes with `Mask = Only Agents` (`0x00200200`), `Z Scale = 10`, `Flip = true`. Its node
+**[10]** sits at `(1112.878, 965.841, 97.352)`, 0.36 m from the reported crossing `1113.21 965.70 98.68`, and the
+wall spans 87.9..108.6 m once planted on the terrain, so 98.68 m is inside it. Built twice from the real CC_20
+snapshot - identical settings, the only difference being `Barriers`:
+
+| | barriers off | barriers on |
+| --- | --- | --- |
+| invariants | PASS | PASS |
+| cells cut by the height rule | - | 573 (163 released as out-of-band) |
+| gap fills refused at a barrier cell | - | 30 |
+| a route crossing the wall's corridor | **yes** | **no** |
+| a route going *around* the ends of the finite wall | yes | yes |
+| faces on both sides of the crossing | 226118 / 226118 | 226138 / 226138 |
+
+A 2 m `_barrier_04x04m` wall sitting at z 122.6..125.5 - 29 m above the street at z~95 - cuts **0** cells and
+leaves the mesh bit-identical to the no-barrier build. That is the height rule doing its job.
+
+#### Cost when switched off
+
+With `NavMeshVoxelBarriers = false` (or on a scene with no honour-able barrier) no barrier geometry is converted,
+binned, rasterised or merged, and no obstruction map is allocated at all: the builder takes exactly its previous
+path. Verified byte-identical against the stored baseline - all 655 deterministic lines of the core suite, and
+`CC_20_siege` (`V=144067 F=241458 E=386975`) and `mp_tdm_Birtu` (`V=28229 F=44518 E=73492`) unchanged.
+
 ### Terrain holes (false lids)
 
 When a scene carves a hole/void in the terrain (a shaft, a tunnel mouth), the terrain heightfield our soup is
@@ -1989,6 +2083,12 @@ NavMesh: assets: preloaded <M> bodies by name (preloadMs=<n>)
 NavMesh: assets: progress entities=<n>/<total> included=<n> tris=<n>      <- every 250 entities (read pass)
 NavMesh: assets: TRACE 'entity' body='<shape name>' flags=0x........ mobility=.. dyn=.. meshCount=.. tris=..   <- only when NavMeshVoxelAssetTrace=true
 NavMesh: assets: entities=... physics=... included=... laddersIncluded=... excluded=[flora=.. barrier=.. terrain=.. ladder=.. dynamic=.. noShape=.. empty=.. exceptions=.. unsolid=..] tris=..
+NavMesh: assets: barriers: bodies=.. carved=.. tris=.. skipped=.. (missile-only masks are not carved; carved walls stay out of the walkable soup)
+NavMesh: assets: barriers: <name> flags=0x........ meshCount=.. tris=.. z=[..]..m (carved as solid; excluded from the walkable soup)
+NavMesh: v2: barriers: bodies=.. skipped=.. tris=.. (carved as solid; missile-only masks are not carved)
+NavMesh: v2: barriers: cut cells=.. released=.. (height rule: wall outside the navigable band), obstruction cells=.. (gap-fill refused=.. stitch refused=..)
+NavMesh: v2: merge-stitch: pairs=.. added=.. refused=.. (of which .. barrier-blocked) (cap=.. cells)
+NavMesh: v2: prune: kept .. barrier-adjacent island(s), .. faces (largest=..) - the cut split them this pass, so the cap does not apply
          (laddersIncluded=<n> only when NavMeshVoxelSteppedProps=true and Ladder-flagged bodies were collected). cappedShapes=... scanMs=...
 NavMesh: assets: kinds stairs=.. wall=.. floor=.. other=.. (name heuristic; log only)
 NavMesh: assets: stepped: ramps=<n> stairs=<n> ladders=<n> holes=<n> noHoles=<n> skipped=<n> (ramps bridge unsupported stretches only; treads are ledge-exempt)   <- only when NavMeshVoxelSteppedProps=true

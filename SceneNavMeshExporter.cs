@@ -105,6 +105,18 @@ namespace BetterBannerlordNavmeshing
         // touched. See TiledNavMeshBuilder.BlendGatePlates and the README.
         public bool NavMeshVoxelGatePlateBlend = true;
 
+        // BARRIERS (default ON). When on, every barrier body whose blocking mask stops agents is
+        // collected and carved out of the navmesh as a solid wall, so an agent can no longer path
+        // across it. Masks that only stop missiles/weapons are deliberately NOT carved - the engine
+        // excludes MissileOnly bodies from every agent raycast, so the game itself lets agents walk
+        // through those, and honouring them here would stop agents at a wall that does not exist for
+        // them. Set false to get the pre-barrier behaviour back byte for byte.
+        //
+        // One-way is NOT reproduced: the barrier's Flip flag is a physics-normal direction, and a
+        // navmesh has no directed edges, so the carved wall blocks both ways. That is strictly more
+        // restrictive than the runtime rule and is documented in README.md.
+        public bool NavMeshVoxelBarriers = true;
+
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
         public string NavMeshSnapshotAssertPoints = "";
@@ -724,6 +736,7 @@ namespace BetterBannerlordNavmeshing
                         ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
                     + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
+                    + " barriers=" + NavMeshVoxelBarriers
                     + " quadMerge=" + NavMeshVoxelQuadMerge
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
                     + " includeDynamic=" + NavMeshVoxelIncludeDynamic
@@ -810,7 +823,7 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
                 NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge,
-                NavMeshConsoleMessages);
+                NavMeshVoxelBarriers, NavMeshConsoleMessages);
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -832,7 +845,7 @@ namespace BetterBannerlordNavmeshing
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
                 true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, true,
-                true);
+                true, true);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline, and
@@ -868,6 +881,7 @@ namespace BetterBannerlordNavmeshing
             int voxelPruneMaxIslandFaces,
             bool voxelSteppedProps,
             bool voxelQuadMerge,
+            bool voxelBarriers,
             bool consoleMessages)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
@@ -919,6 +933,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelStitchMaxGapCells=" + voxelStitchMaxGapCells
                     + " voxelPrune=" + (voxelPruneIsolatedIslands ? voxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + voxelSteppedProps
+                    + " barriers=" + voxelBarriers
                     + " quadMerge=" + voxelQuadMerge
                     + " detail=" + voxelDetailMesh
                     + " voxelDetailSampleDist=" + F(voxelDetailSampleDist) + "m"
@@ -972,6 +987,7 @@ namespace BetterBannerlordNavmeshing
                     int[] assetTris = null;
                     bool[] assetForceWalkable = null;
                     bool[] assetLedgeExempt = null;
+                    TiledNavMeshBuilder.BarrierWalls assetBarriersSync = null;
                     if (voxelIncludeAssets)
                     {
                         SceneCollisionGeometry.AssetTriangles assets =
@@ -982,8 +998,11 @@ namespace BetterBannerlordNavmeshing
                         assetTris = assets.Tris;
                         assetForceWalkable = assets.ForceWalkableTris;
                         assetLedgeExempt = assets.LedgeExemptTris;
+                        assetBarriersSync = assets.Barriers;
                         assetsMs = assets.ScanMs;
                     }
+                    // Carved as solid spans by the builder; never mixed into assetVerts/assetTris.
+                    voxel.Barriers = voxelBarriers ? assetBarriersSync : null;
 
                     VoxelNavMeshGenerator.SoupCapture soupCapture =
                         voxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
@@ -1138,6 +1157,7 @@ namespace BetterBannerlordNavmeshing
                     + " voxelPrune=" + (NavMeshVoxelPruneIsolatedIslands ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
                     + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
+                    + " barriers=" + NavMeshVoxelBarriers
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
                     + " voxelContourMaxError=" + F(NavMeshVoxelContourMaxError) + "vox"
@@ -1172,6 +1192,7 @@ namespace BetterBannerlordNavmeshing
                 int[] assetTris = null;
                 bool[] assetForceWalkable = null;
                     bool[] assetLedgeExempt = null;
+                    TiledNavMeshBuilder.BarrierWalls assetBarriers = null;
                 if (NavMeshVoxelIncludeAssets)
                 {
                     var assetsWatch = System.Diagnostics.Stopwatch.StartNew();
@@ -1184,6 +1205,7 @@ namespace BetterBannerlordNavmeshing
                     assetTris = assets.Tris;
                     assetForceWalkable = assets.ForceWalkableTris;
                     assetLedgeExempt = assets.LedgeExemptTris;
+                    assetBarriers = assets.Barriers;
                     assetsMs = assetsWatch.ElapsedMilliseconds;
                 }
                 else
@@ -1209,6 +1231,7 @@ namespace BetterBannerlordNavmeshing
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
                 voxel.QuadMerge = NavMeshVoxelQuadMerge;
                 voxel.GatePlateBlend = NavMeshVoxelGatePlateBlend;
+                voxel.Barriers = NavMeshVoxelBarriers ? assetBarriers : null;
 
                 var req = new AsyncVoxelBuild();
                 req.Scene = scene;

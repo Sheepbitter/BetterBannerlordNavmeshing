@@ -48,6 +48,181 @@ namespace BetterBannerlordNavmeshing
         // plate blend itself running, which is how the two halves of the pass are told apart on a real scene.
         public static int GatePlateSeamCap = GatePlateSeamMaxCount;
 
+        // ==================================================================
+        // Barrier support (V3.58)
+        // ==================================================================
+        // A Bannerlord "barrier" is an invisible one-way wall the mission AI refuses to cross. It is
+        // NOT an engine entity type: the scene stores a `barrier_builder` script component on an
+        // otherwise plain game_entity, and the engine's editor component (native
+        // Rgl\ScriptComponents\barrier_builder.cpp) turns the referenced path into a `bo_barrier`
+        // collision body at load time. That generated body is an ordinary physics body whose
+        // BodyFlags carry the blocking mode, so it IS enumerated by the normal scene scan - which is
+        // how we collect it (no XML re-parsing, no path re-derivation).
+        //
+        // BLOCKING MODE -> BodyFlags (decompiled from TaleWorlds.Native.dll: the component's build
+        // function selects one of exactly four masks by its `Mask` string; the engine's own
+        // XML<->flags decoder FUN_7ff8d040e6f0 confirms the bit values):
+        //
+        //   "Everything"             -> 0x00000200  Barrier
+        //   "Only Agents"            -> 0x00200200  Barrier | AgentOnly
+        //   "Only AI Agents"         -> 0x00200300  Barrier | AgentOnly | AILimiter
+        //   "Only Missile and Melee" -> 0x00400200  MissileOnly | Barrier
+        //
+        // Which of those must the navmesh respect? Only the ones that block AGENTS. The engine's own
+        // exclude-flag presets answer that outright (TaleWorlds.Engine.BodyFlags):
+        //
+        //   CommonCollisionExcludeFlagsForAgent   = 0x2051B189  includes MissileOnly, excludes AgentOnly
+        //   CommonCollisionExcludeFlagsForMissile = 0x2031B789  includes Barrier|Barrier3D
+        //
+        // so a MissileOnly body is invisible to every agent raycast - it stops arrows, not people -
+        // and carving the mesh there would make agents stop dead at a barrier the game itself lets
+        // them walk through. The other three all carry `Barrier`, which is deliberately ABSENT from
+        // every agent-facing exclude set (that is precisely what "invisible wall" means: the agent
+        // raycasts straight into it). Hence the one rule below, and hence the unit test.
+        //
+        // ONE-WAY IS WAIVED. `Flip` negates the wall's physics normal (the component's build does
+        // `iVar32 = *flip ? -1 : 1` and scales the quad by it) - it is a collision-response flag, not
+        // graph data. A navmesh is an undirected polygon soup (the stitch's union-find is symmetric;
+        // the engine's only "make this impassable" tool is a per-face boolean,
+        // Scene.SetAbilityOfFacesWithId), so a directed constraint cannot be expressed in it at all.
+        // We therefore carve a TWO-SIDED wall, which is strictly more restrictive than the runtime
+        // rule: an agent the game would let through in one direction is stopped in both.
+        // Documented in README.md.
+
+        // BodyFlags bits, restated as plain ints: this file never touches TaleWorlds types, which is
+        // what keeps the core standalone-harness testable (docs/plan-navmesh-v2.md section 2).
+        public const int BodyFlagBarrier = 0x00000200;
+        public const int BodyFlagBarrier3D = 0x00000400;
+        public const int BodyFlagAiLimiter = 0x00000100;
+        public const int BodyFlagAgentOnly = 0x00200000;
+        public const int BodyFlagMissileOnly = 0x00400000;
+
+        /// The whole honour rule, in one pure function so it can be unit-tested offline. True when a
+        /// barrier body with these raw BodyFlags must be carved out of the navmesh.
+        public static bool BarrierBlocksAgents(int flags)
+        {
+            if ((flags & (BodyFlagBarrier | BodyFlagBarrier3D)) == 0)
+                return false;
+            // A MissileOnly body is excluded from every agent raycast set, so the game lets agents walk
+            // through it. Never carve. (An AgentOnly body has no such exclusion and IS carved.)
+            return (flags & BodyFlagMissileOnly) == 0;
+        }
+
+        /// One barrier body's world-space collision geometry, ENGINE Z-up (x, y=height, z) - the same
+        /// space SceneCollisionGeometry emits. Plain arrays, so it crosses the main-thread -> worker
+        /// boundary like the rest of the asset soup.
+        public sealed class BarrierWall
+        {
+            public string Name;
+            public int Flags;              // raw BodyFlags of the source body
+            public float[] VertsXyz;       // engine Z-up world space, 3 per vertex
+            public int[] Tris;             // 0-based indices into VertsXyz
+            public bool Flip;              // barrier_builder's `Flip` (recorded; two-sided cut, see above)
+            public float ZMin, ZMax;       // engine-space vertical extent of the wall
+        }
+
+        /// All honour-able barriers of one scene, in engine Z-up world space.
+        public sealed class BarrierWalls
+        {
+            public readonly List<BarrierWall> Walls = new List<BarrierWall>();
+
+            /// Barriers that were seen but deliberately NOT carved, with the reason. Kept for the log
+            /// so "the tool ignored this barrier" is always explainable.
+            public readonly List<string> Skipped = new List<string>();
+
+            public int TotalTris;
+            public int Count { get { return Walls.Count; } }
+            public bool IsEmpty { get { return Walls.Count == 0; } }
+
+            public void Add(BarrierWall w)
+            {
+                if (w == null || w.Tris == null || w.Tris.Length < 3) return;
+                Walls.Add(w);
+                TotalTris += w.Tris.Length / 3;
+            }
+
+            public void AddSkipped(string name, int flags)
+            {
+                if (Skipped.Count < 64)
+                    Skipped.Add(name + " flags=0x" + flags.ToString("X8") + " (missile-only: not carved)");
+            }
+        }
+
+        // Why a cell is blocked. Provenance-tagged from the start: the tile-border work lands in the
+        // SAME set next round, and the two must be intersectable, so this is a keyed map rather than
+        // a bare HashSet<long>.
+        public enum ObstructionKind
+        {
+            Barrier = 1,
+            Border = 2,      // reserved for the tile-border pass
+        }
+
+        /// World-XZ cells that must not be bridged by any connectivity repair (gap fill, per-tile
+        /// stitch, merge stitch). Keyed by CellKey(x, z, cs) - the same integer lattice the stepped-
+        /// prop provenance uses, so the sets can be merged and compared.
+        public sealed class ObstructionCells
+        {
+            private readonly Dictionary<long, ObstructionKind> _map =
+                new Dictionary<long, ObstructionKind>(LongKeyComparer.Instance);
+            private readonly float _cs;
+
+            public ObstructionCells(float cellSizeMeters)
+            {
+                _cs = cellSizeMeters > 0f ? cellSizeMeters : 1f;
+            }
+
+            public int Count { get { return _map.Count; } }
+            public float CellSize { get { return _cs; } }
+            public IEnumerable<KeyValuePair<long, ObstructionKind>> All { get { return _map; } }
+
+            public void Add(float x, float z, ObstructionKind kind)
+            {
+                long k = CellKey(x, z, _cs);
+                ObstructionKind cur;
+                if (_map.TryGetValue(k, out cur))
+                {
+                    if (cur == kind) return;
+                    _map[k] = (ObstructionKind)((int)cur | (int)kind);
+                }
+                else _map[k] = kind;
+            }
+
+            /// Adds a cell by its already-computed key. Used to merge per-tile sets after the parallel
+            /// pass without re-deriving the key (and without a float round-trip that could land the
+            /// point in a different cell).
+            public void AddRaw(long key, ObstructionKind kind)
+            {
+                ObstructionKind cur;
+                if (_map.TryGetValue(key, out cur))
+                {
+                    if (cur == kind) return;
+                    _map[key] = (ObstructionKind)((int)cur | (int)kind);
+                }
+                else _map[key] = kind;
+            }
+
+            public bool Contains(float x, float z)
+            {
+                return _map.ContainsKey(CellKey(x, z, _cs));
+            }
+
+            /// True when ANY cell on the straight XZ run from (ax,az) to (bx,bz) is obstructed. Used by
+            /// every stitch, which all work on a straight segment between two boundary vertices.
+            public bool SegmentCrosses(float ax, float az, float bx, float bz)
+            {
+                float dx = bx - ax, dz = bz - az;
+                int steps = (int)Math.Ceiling(Math.Sqrt((double)(dx * dx + dz * dz)) / (_cs * 0.5f));
+                if (steps < 1) steps = 1;
+                if (steps > 4096) steps = 4096;
+                for (int i = 0; i <= steps; i++)
+                {
+                    float t = (float)i / steps;
+                    if (Contains(ax + dx * t, az + dz * t)) return true;
+                }
+                return false;
+            }
+        }
+
         public sealed class TiledNavMeshSettings
         {
             // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
@@ -135,6 +310,27 @@ namespace BetterBannerlordNavmeshing
             // plane, so both ends meet the surrounding navmesh inside the climb. See BlendGatePlates.
             public bool GatePlateBlend = true;
 
+            // BARRIER RESPEKT (NavMeshVoxelBarriers, default on). When Barriers is non-empty the
+            // honour-able barrier bodies are rasterised into each tile's heightfield as SOLID
+            // (RC_NULL_AREA) spans, so erosion / the clearance filter / the ledge trim all treat
+            // them as real obstacles and no walkable face can sit on or across them. Null (or an
+            // empty list) keeps the build byte-for-byte identical to the pre-barrier behaviour -
+            // that is what the toggle's `false` restores.
+            //
+            // Two rules keep this from over-cutting:
+            //  * HEIGHT RULE. A cut is applied only where the wall STRADDLES the navigable band:
+            //    zMin <= floorTop + climb && zMax >= floorTop. A 2 m barrier whose base is 25 m below
+            //    a walkway, or one sitting on a ledge above it, therefore cuts nothing on that
+            //    walkway. CC_20's hand-placed _barrier_04x04m bodies sit at z~123.5 on high walls
+            //    while the streets below run at z~95 - they must leave those streets untouched.
+            //  * TWO-SIDED. `Flip` (the barrier's one-way flag) is recorded but not honoured; see the
+            //    block comment at the top of this file.
+            public BarrierWalls Barriers;
+
+            // Barrier accounting, filled by Build (0 when there are none).
+            public int BarrierBodies, BarrierSkipped, BarrierTrisCut, BarrierCellsCut,
+                BarrierCellsReleased, BarrierCellsGated, BarrierStitchRefused, BarrierGapRefused;
+
             // Contour edge length cap (voxels).
             public int MaxEdgeLenVoxels = 12;
 
@@ -213,6 +409,14 @@ namespace BetterBannerlordNavmeshing
                                                     // Per-face provenance for the steep-face repair: those
                                                     // cells are the only ones allowed to carry a face
                                                     // steeper than the walkable cap.
+
+            // Barrier accounting for this tile. BarrierCellsCut/Released are the height rule's verdict
+            // (cut = the wall straddles the navigable band; released = it does not, so the wall is left
+            // out of this tile entirely). BarrierCellsGated counts cells marked into the shared
+            // obstruction map; BarrierGapRefused / BarrierStitchRefused count connectivity repairs this
+            // tile refused because a barrier stood in the way.
+            public int BarrierCellsCut, BarrierCellsReleased, BarrierCellsGated,
+                BarrierGapRefused, BarrierStitchRefused;
         }
 
         public sealed class VoxelMeshResult
@@ -620,6 +824,66 @@ namespace BetterBannerlordNavmeshing
                 + "m at cs=" + F(cs) + "m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)");
             Log(log, "v2: workers=" + workers + " (requested " + requestedWorkers + ", tileCount=" + tileCount + ")");
 
+            // --- barrier input: engine Z-up -> Recast Y-up, binned per tile ---
+            // Built once, read-only in every worker. Null when the feature is off or the scene has no
+            // honour-able barrier, which is what keeps the pre-barrier path byte-for-byte identical.
+            float[] barrierVerts = null;
+            int[] barrierTris = null;
+            int barrierTriCount = 0;
+            // SceneCollisionGeometry always hands us a (possibly empty) BarrierWalls, so the gate is
+            // "has walls", not "is non-null". Only then is anything allocated: a scene with no
+            // honour-able barrier must reach the builder with nothing barrier-shaped in it at all.
+            bool haveBarriers = s.Barriers != null && !s.Barriers.IsEmpty;
+            List<int>[] tileBarrierTris = haveBarriers ? new List<int>[tileCount] : null;
+            if (haveBarriers)
+            {
+                s.BarrierBodies = s.Barriers.Count;
+                s.BarrierSkipped = s.Barriers.Skipped.Count;
+                barrierVerts = BarrierToRecastSpace(s.Barriers, out barrierTris);
+                barrierTriCount = barrierTris != null ? barrierTris.Length / 3 : 0;
+
+                for (int t = 0; t < barrierTriCount; t++)
+                {
+                    int i0 = barrierTris[t * 3], i1 = barrierTris[t * 3 + 1], i2 = barrierTris[t * 3 + 2];
+                    float tx0 = barrierVerts[i0 * 3], tx1 = barrierVerts[i1 * 3], tx2 = barrierVerts[i2 * 3];
+                    float tz0 = barrierVerts[i0 * 3 + 2], tz1 = barrierVerts[i1 * 3 + 2], tz2 = barrierVerts[i2 * 3 + 2];
+                    float triMinX = Math.Min(tx0, Math.Min(tx1, tx2));
+                    float triMaxX = Math.Max(tx0, Math.Max(tx1, tx2));
+                    float triMinZ = Math.Min(tz0, Math.Min(tz1, tz2));
+                    float triMaxZ = Math.Max(tz0, Math.Max(tz1, tz2));
+
+                    int bTx0 = (int)Math.Floor((triMinX - originX - pad) / tileSpan);
+                    int bTx1 = (int)Math.Floor((triMaxX - originX + pad) / tileSpan);
+                    int bTz0 = (int)Math.Floor((triMinZ - originZ - pad) / tileSpan);
+                    int bTz1 = (int)Math.Floor((triMaxZ - originZ + pad) / tileSpan);
+                    if (bTx0 < 0) bTx0 = 0;
+                    if (bTz0 < 0) bTz0 = 0;
+                    if (bTx1 > tilesX - 1) bTx1 = tilesX - 1;
+                    if (bTz1 > tilesZ - 1) bTz1 = tilesZ - 1;
+                    if (bTx0 > bTx1 || bTz0 > bTz1) continue;
+
+                    for (int tz = bTz0; tz <= bTz1; tz++)
+                    {
+                        for (int tx = bTx0; tx <= bTx1; tx++)
+                        {
+                            int idx = tz * tilesX + tx;
+                            List<int> list = tileBarrierTris[idx];
+                            if (list == null)
+                            {
+                                list = new List<int>();
+                                tileBarrierTris[idx] = list;
+                            }
+                            list.Add(t);
+                        }
+                    }
+                }
+                Log(log, "v2: barriers: bodies=" + s.BarrierBodies + " skipped=" + s.BarrierSkipped
+                    + " tris=" + barrierTriCount
+                    + " (carved as solid; missile-only masks are not carved)");
+                for (int i = 0; i < s.Barriers.Skipped.Count && i < 8; i++)
+                    Log(log, "v2: barriers: skipped " + s.Barriers.Skipped[i]);
+            }
+
             // --- bin input triangles into tiles (padded AABB overlap) ---
             var tileTris = new List<int>[tileCount];
             int culledByAabb = 0;
@@ -698,14 +962,33 @@ namespace BetterBannerlordNavmeshing
             var progressLock = new object();
             var progressWatch = Stopwatch.StartNew();
 
+            // One obstruction set PER TILE that actually has barrier geometry, never one per worker.
+            //
+            // The tempting `index % workers` partition is NOT thread-safe: Parallel.For makes no
+            // promise about which indices run concurrently, and with workers = ProcessorCount two
+            // live tiles can share a slot (tiles 5 and 17 both map to slot 5 on a 12-core box). Two
+            // threads then mutate one Dictionary at once, which corrupts it and makes the whole build
+            // non-deterministic - a data race reachable only when barriers are ON, i.e. by default.
+            // Tiles WITHOUT barriers never write to a set at all, so allocating per barrier tile is
+            // both correct and cheap: a wall spans a handful of tiles out of thousands.
+            ObstructionCells[] tileObstructions = barrierTriCount > 0
+                ? new ObstructionCells[tileCount]
+                : null;
+
             Parallel.For(0, tileCount, parallelOptions, delegate (int index)
             {
                 int tx = index % tilesX;
                 int ty = index / tilesX;
+                ObstructionCells mine = tileBarrierTris != null && tileBarrierTris[index] != null
+                    ? new ObstructionCells(s.VoxelCellSizeMeters)
+                    : null;
+                if (tileObstructions != null) tileObstructions[index] = mine;
                 results[index] = BuildTile(index, tx, ty, vertsXyz, tris, tileTris[index], s,
                     originX, originZ, tileSpan, cellsPerTile, bminY, bmaxY, width, height, border, pad,
                     walkableHeight, walkableClimb, walkableRadius, maxSimplificationError,
-                    minRegionArea, mergeRegionArea, areaMod, forceWalkableTriangles, ledgeExemptTriangles);
+                    minRegionArea, mergeRegionArea, areaMod, forceWalkableTriangles, ledgeExemptTriangles,
+                    barrierVerts, barrierTris,
+                    tileBarrierTris != null ? tileBarrierTris[index] : null, mine, index);
 
                 if (log != null)
                 {
@@ -727,6 +1010,41 @@ namespace BetterBannerlordNavmeshing
                 }
             });
             tilesWatch.Stop();
+
+            // --- merge the per-TILE obstruction sets into the one map the fillers consult ---
+            ObstructionCells obstructions = barrierTriCount > 0
+                ? new ObstructionCells(s.VoxelCellSizeMeters)
+                : null;
+            if (obstructions != null)
+            {
+                int cutCells = 0, releasedCells = 0, gated = 0, gapRefused = 0, stitchRefused = 0;
+                for (int i = 0; i < results.Length; i++)
+                {
+                    VoxelTileResult r = results[i];
+                    if (r == null || r.Failed) continue;
+                    cutCells += r.BarrierCellsCut;
+                    releasedCells += r.BarrierCellsReleased;
+                    gated += r.BarrierCellsGated;
+                    gapRefused += r.BarrierGapRefused;
+                    stitchRefused += r.BarrierStitchRefused;
+                }
+                for (int i = 0; i < tileObstructions.Length; i++)
+                {
+                    ObstructionCells t = tileObstructions[i];
+                    if (t == null) continue;
+                    foreach (KeyValuePair<long, ObstructionKind> kv in t.All)
+                        obstructions.AddRaw(kv.Key, kv.Value);
+                }
+                s.BarrierCellsCut = cutCells;
+                s.BarrierCellsReleased = releasedCells;
+                s.BarrierCellsGated = gated;
+                s.BarrierStitchRefused = stitchRefused;
+                s.BarrierGapRefused = gapRefused;
+                Log(log, "v2: barriers: cut cells=" + cutCells + " released=" + releasedCells
+                    + " (height rule: wall outside the navigable band), obstruction cells="
+                    + obstructions.Count + " (gap-fill refused=" + gapRefused + " stitch refused="
+                    + stitchRefused + ")");
+            }
 
             // --- aggregate + log failures (never silently dropped) ---
             int builtTiles = 0;
@@ -874,12 +1192,14 @@ namespace BetterBannerlordNavmeshing
             // soup has solid geometry spanning the gap envelope (wall, closed door, low ceiling).
             if (s.StitchMaxGapCells > 0)
             {
-                int msPairs, msAdded, msRefused;
+                int msPairs, msAdded, msRefused, msBarrierRefused;
                 MergeStitch(merged, vertsXyz, tris, inputTris, soupGrid, soupBig, soupCell,
                     s.VoxelCellSizeMeters, s.CellHeightMeters,
                     s.HeightOffsetMeters, bminY, walkableHeight, walkableClimb, s.StitchMaxGapCells,
-                    out msPairs, out msAdded, out msRefused);
+                    barrierTriCount > 0 ? obstructions : null,
+                    out msPairs, out msAdded, out msRefused, out msBarrierRefused);
                 Log(log, "v2: merge-stitch: pairs=" + msPairs + " added=" + msAdded + " refused=" + msRefused
+                    + (msBarrierRefused > 0 ? " (of which " + msBarrierRefused + " barrier-blocked)" : "")
                     + " (cap=" + s.StitchMaxGapCells + " cells)");
             }
 
@@ -912,7 +1232,8 @@ namespace BetterBannerlordNavmeshing
                         steppedCells.Add(CellKey(cellXz[k], cellXz[k + 1], qcs));
                 }
                 var pst = new PruneStats();
-                PruneSmallIslands(merged, s.PruneMaxIslandFaces, steppedCells, qcs, pst);
+                PruneSmallIslands(merged, s.PruneMaxIslandFaces, steppedCells, qcs, pst,
+                    barrierTriCount > 0 ? obstructions : null);
                 Log(log, "v2: prune: removed " + pst.RemovedIslands + " islands, " + pst.RemovedFaces
                     + " faces (<=" + s.PruneMaxIslandFaces + " faces each); largest removed="
                     + pst.LargestRemoved + " at (" + F(pst.LargestX) + "," + F(pst.LargestY) + ","
@@ -926,6 +1247,10 @@ namespace BetterBannerlordNavmeshing
                     Log(log, "v2: prune: kept islands worst exemption fraction="
                         + F((float)(pst.MaxKeptExemptFraction * 100.0)) + "% of " + pst.MaxKeptFaces
                         + " faces (mixed provenance, no kept island is exempt-formed)");
+                if (pst.BarrierKeptIslands > 0)
+                    Log(log, "v2: prune: kept " + pst.BarrierKeptIslands + " barrier-adjacent island(s), "
+                        + pst.BarrierKeptFaces + " faces (largest=" + pst.BarrierLargestKept
+                        + ") - the cut split them this pass, so the cap does not apply");
             }
 
             // Release the per-tile build structures before the cleanup. Keeping 15k+ tile results alive
@@ -1259,6 +1584,163 @@ namespace BetterBannerlordNavmeshing
             return unchecked(((long)ix << 32) | (uint)iz);
         }
 
+        // ------------------------------------------------------------------
+        // Barrier cutting: barrier geometry -> solid spans in the tile heightfield
+        //
+        // The barriers arrive in ENGINE Z-up (x, y=height, z) and never touch the walkable soup. We
+        // convert them to Recast Y-up once per build, bin them per tile exactly like the input
+        // triangles, rasterise them into a SCRATCH heightfield, and then merge the resulting spans
+        // into the tile's own heightfield by hand.
+        //
+        // The scratch heightfield is not an optimisation - it is what gives us provenance. A span in
+        // the tile heightfield carries no "this came from a barrier" bit, so after rasterising
+        // barriers straight into `hf` we could not tell which spans were ours and the height rule
+        // would have nothing to release. Rasterising separately means every span we merge is known
+        // to be barrier geometry, so a released one can simply be dropped.
+        //
+        // Engine (x, y, z) -> Recast (x, z, y): the same swap the soup capture uses.
+        internal static float[] BarrierToRecastSpace(BarrierWalls walls, out int[] outTris)
+        {
+            outTris = null;
+            if (walls == null || walls.IsEmpty) return null;
+            int totalTris = walls.TotalTris;
+            int totalVerts = 0;
+            for (int i = 0; i < walls.Walls.Count; i++)
+                totalVerts += walls.Walls[i].VertsXyz.Length / 3;
+            var outV = new float[totalVerts * 3];
+            var outT = new int[totalTris * 3];
+            int vo = 0, to = 0;
+            for (int i = 0; i < walls.Walls.Count; i++)
+            {
+                BarrierWall w = walls.Walls[i];
+                int nv = w.VertsXyz.Length / 3;
+                for (int v = 0; v < nv; v++)
+                {
+                    outV[(vo + v) * 3 + 0] = w.VertsXyz[v * 3 + 0];
+                    outV[(vo + v) * 3 + 1] = w.VertsXyz[v * 3 + 2];   // engine z -> Recast y (height)
+                    outV[(vo + v) * 3 + 2] = w.VertsXyz[v * 3 + 1];   // engine y -> Recast z
+                }
+                for (int k = 0; k < w.Tris.Length; k++) outT[to + k] = w.Tris[k] + vo;
+                vo += nv;
+                to += w.Tris.Length;
+            }
+            // Winding is irrelevant: every barrier triangle is rasterised with RC_NULL_AREA, so it can
+            // only ever contribute solid volume, never a walkable surface that depends on facing.
+            outTris = outT;
+            return outV;
+        }
+
+        private static void CutBarriersIntoHeightfield(RcContext ctx, RcHeightfield hf,
+            float[] barrierVerts, int[] barrierTris, int barrierTriCount,
+            int walkableClimb, ObstructionCells obstructions,
+            out int cellsCut, out int cellsReleased)
+        {
+            cellsCut = 0;
+            cellsReleased = 0;
+            if (barrierTris == null || barrierTriCount <= 0) return;
+
+            // 1. Rasterise into a scratch heightfield with the same grid as the tile, so a column index
+            //    means the same world cell in both.
+            var scratch = new RcHeightfield(hf.width, hf.height, hf.bmin, hf.bmax, hf.cs, hf.ch,
+                hf.borderSize);
+            var nullAreas = new int[barrierTriCount];
+            RcRasterizations.RasterizeTriangles(ctx, barrierVerts, barrierTris, nullAreas,
+                barrierTriCount, scratch, walkableClimb);
+
+            // 2. Height rule + merge. For each column that carries barrier geometry, keep the cut only
+            //    when the wall STRADDLES that column's navigable band:
+            //      zMin <= bandTop + climb && zMax >= bandBottom
+            //    where [bandBottom, bandTop] spans ALL of the column's walkable surfaces, not just the
+            //    lowest one. That distinction is not cosmetic: CC_20_siege's barrier_1 runs along a
+            //    hillside where most columns carry two or more walkable levels (a terrace and the street
+            //    below it). Judging against only the lowest one released 521 of 736 barrier columns on
+            //    that scene and left walk-through holes in the wall - exactly what the carve exists to
+            //    prevent. The band is computed from the tile's own heightfield, which already has the
+            //    ordinary soup applied, so a barrier that misses the band misses it because the
+            //    walkable surface really is elsewhere, not because we guessed wrong.
+            float climbMeters = walkableClimb * hf.ch;
+            for (int ci = 0; ci < hf.width * hf.height; ci++)
+            {
+                RcSpan bs = scratch.spans[ci];
+                if (bs == null) continue;
+                int bandBottom = int.MaxValue, bandTop = int.MinValue;
+                for (RcSpan ws = hf.spans[ci]; ws != null; ws = ws.next)
+                {
+                    if (!IsWalkableArea(ws.area)) continue;
+                    if (ws.smin < bandBottom) bandBottom = ws.smin;
+                    if (ws.smax > bandTop) bandTop = ws.smax;
+                }
+                if (bandTop == int.MinValue)
+                {
+                    // No walkable surface in this column. A barrier here can only obstruct geometry
+                    // that does not exist; releasing it keeps stray spans from seeding something the
+                    // low-hanging-obstacle filter could later promote.
+                    cellsReleased++;
+                    continue;
+                }
+                float bandLoY = hf.bmin.Y + bandBottom * hf.ch;
+                float bandHiY = hf.bmin.Y + bandTop * hf.ch;
+                float zMin = hf.bmin.Y + bs.smin * hf.ch;
+                float zMax = hf.bmin.Y + bs.smax * hf.ch;
+                if (zMin > bandHiY + climbMeters || zMax < bandLoY)
+                {
+                    cellsReleased++;
+                    continue;
+                }
+                for (RcSpan sp = bs; sp != null; sp = sp.next)
+                {
+                    InsertSolidSpan(hf, ci, sp.smin, sp.smax);
+                    cellsCut++;
+                }
+
+                // 3. Record the obstruction so no connectivity repair can bridge the wall. Expanded by
+                //    half a metre either way: the cells an agent standing next to the wall occupies are
+                //    just as much a part of "no path through here" as the cells the wall itself owns.
+                if (obstructions != null)
+                {
+                    int cx = ci % hf.width, cz = ci / hf.width;
+                    float wx = hf.bmin.X + (cx + 0.5f) * hf.cs;
+                    float wz = hf.bmin.Z + (cz + 0.5f) * hf.cs;
+                    obstructions.Add(wx, wz, ObstructionKind.Barrier);
+                    int r = Math.Max(1, (int)Math.Ceiling(0.5f / hf.cs));
+                    for (int dz = -r; dz <= r; dz++)
+                        for (int dx = -r; dx <= r; dx++)
+                            obstructions.Add(wx + dx * hf.cs, wz + dz * hf.cs, ObstructionKind.Barrier);
+                }
+            }
+        }
+
+        /// Inserts a solid (RC_NULL_AREA) span of arbitrary height into a column, keeping the list
+        /// sorted bottom-to-top as Recast expects. Never overlaps an existing span: an overlap means
+        /// the barrier and ordinary geometry already agree there, and a merged span is exactly what
+        /// Recast would have produced itself.
+        private static void InsertSolidSpan(RcHeightfield hf, int columnIndex, int smin, int smax)
+        {
+            if (smax <= smin) return;
+            for (RcSpan s = hf.spans[columnIndex]; s != null; s = s.next)
+                if (s.smin < smax && s.smax > smin)
+                {
+                    // Overlapping existing span: grow it to cover the union instead of double-inserting.
+                    if (smin < s.smin) s.smin = smin;
+                    if (smax > s.smax) s.smax = smax;
+                    return;
+                }
+            var ns = new RcSpan();
+            ns.smin = smin;
+            ns.smax = smax;
+            ns.area = RcRecast.RC_NULL_AREA;
+            RcSpan cur = hf.spans[columnIndex];
+            if (cur == null || ns.smax <= cur.smin)
+            {
+                ns.next = cur;
+                hf.spans[columnIndex] = ns;
+                return;
+            }
+            while (cur.next != null && cur.next.smin < ns.smin) cur = cur.next;
+            ns.next = cur.next;
+            cur.next = ns;
+        }
+
         private sealed class PruneStats
         {
             public int RemovedIslands, RemovedFaces, LargestRemoved, KeptIslands;
@@ -1267,10 +1749,12 @@ namespace BetterBannerlordNavmeshing
             public float ExemptX, ExemptY, ExemptZ;
             public double MaxKeptExemptFraction;
             public int MaxKeptFaces;
+            // Islands kept only because they touch a barrier (see the guard in PruneSmallIslands).
+            public int BarrierKeptIslands, BarrierKeptFaces, BarrierLargestKept;
         }
 
         private static void PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,
-            float cs, PruneStats st)
+            float cs, PruneStats st, ObstructionCells obstructions)
         {
             st.RemovedIslands = 0;
             st.RemovedFaces = 0;
@@ -1287,6 +1771,9 @@ namespace BetterBannerlordNavmeshing
             st.ExemptZ = 0f;
             st.MaxKeptExemptFraction = 0.0;
             st.MaxKeptFaces = 0;
+            st.BarrierKeptIslands = 0;
+            st.BarrierKeptFaces = 0;
+            st.BarrierLargestKept = 0;
 
             int nf = o.Tris.Count / 3;
             if (nf == 0)
@@ -1358,8 +1845,42 @@ namespace BetterBannerlordNavmeshing
             var dropped = new Dictionary<int, bool>();
             int largestRoot = -1;
             int exemptRoot = -1;
+
+            // BARRIER-ADJACENT ISLANDS ARE NEVER PRUNED. The cut can legitimately split one island in
+            // two, and the side that happens to be small is then judged by the ordinary cap - which
+            // would delete real navigable surface in the very pass that created it (the same failure
+            // that lost CC_20 two islands when the gate-plate blend was first landed). So: an island
+            // with a face next to a barrier is kept whatever its size. Keeping a small pocket is far
+            // less harmful than deleting the area agents need, and the counters make the delta
+            // auditable in the log.
+            var barrierIsland = new Dictionary<int, bool>();
+            if (obstructions != null && obstructions.Count > 0)
+            {
+                for (int f = 0; f < nf; f++)
+                {
+                    float cx = 0, cz = 0;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        int v = o.Tris[f * 3 + k];
+                        cx += o.X[v];
+                        cz += o.Z[v];
+                    }
+                    if (!obstructions.Contains(cx / 3f, cz / 3f)) continue;
+                    barrierIsland[FaceFind(fp, f)] = true;
+                }
+            }
+
             foreach (KeyValuePair<int, int> kv in count)
             {
+                bool barrierTouched;
+                if (barrierIsland.TryGetValue(kv.Key, out barrierTouched) && barrierTouched)
+                {
+                    st.BarrierKeptIslands++;
+                    st.BarrierKeptFaces += kv.Value;
+                    if (kv.Value > st.BarrierLargestKept) st.BarrierLargestKept = kv.Value;
+                    st.KeptIslands++;
+                    continue;
+                }
                 // Coalition test: with the exemption faces taken out, what is left of this island? If every
                 // remaining core is at most the cap, then the island is a chain of fragments the unmodified
                 // build prunes one by one and only the exemption holds it together - leftover, not a
@@ -1455,8 +1976,10 @@ namespace BetterBannerlordNavmeshing
         private static void MergeStitch(MergeOutput o, float[] soupVerts, int[] soupTris, int soupTriCount,
             Dictionary<long, List<int>> grid, List<int> bigList, float soupCell,
             float cs, float ch, float offset, float bminY, int walkableHeight, int walkableClimb,
-            int stitchMaxGapCells, out int pairs, out int added, out int refused)
+            int stitchMaxGapCells, ObstructionCells obstructions,
+            out int pairs, out int added, out int refused, out int obstructionRefused)
         {
+            obstructionRefused = 0;
             pairs = 0;
             added = 0;
             refused = 0;
@@ -1602,6 +2125,15 @@ namespace BetterBannerlordNavmeshing
                             mxA, mzA, mxB, mzB, cs, envLo, envHi))
                     {
                         refused++;
+                        continue;
+                    }
+
+                    // Barrier gate, same rule as the per-tile stitch: the connector's own segment must
+                    // not touch an obstructed cell. Reported separately from `refused` so the log shows
+                    // how much of the refusal is barrier-driven rather than soup-driven.
+                    if (obstructions != null && obstructions.SegmentCrosses(mxA, mzA, mxB, mzB))
+                    {
+                        obstructionRefused++;
                         continue;
                     }
 
@@ -4038,7 +4570,9 @@ namespace BetterBannerlordNavmeshing
             int width, int height, int border, float pad,
             int walkableHeight, int walkableClimb, int walkableRadius, float maxSimplificationError,
             int minRegionArea, int mergeRegionArea, RcAreaModification areaMod,
-            bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles)
+            bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles,
+            float[] barrierVerts, int[] barrierTris, List<int> tileBarrierList,
+            ObstructionCells obstructions, int tileIndex)
         {
             var r = new VoxelTileResult();
             r.Index = index;
@@ -4128,6 +4662,34 @@ namespace BetterBannerlordNavmeshing
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
 
+                // BARRIER CUT. Runs here, immediately after the ordinary soup has been rasterised and
+                // the low-hanging filter applied, for two reasons:
+                //  * the height rule needs the tile's own walkable floor, which only exists once the
+                //    ordinary soup is in (WalkableFloor, inside CutBarriersIntoHeightfield);
+                //  * it must precede gap fill, or the fill would see the barrier's own columns as an
+                //    ordinary narrow gap and bridge them - which is the failure mode that made the
+                //    first attempt useless (the _barrier_04x04m walls are ~1 m thick, i.e. 4 cells at
+                //    cs 0.25, twice the default fill cap).
+                // The wall becomes a solid span, so every downstream rule (ledge trim, clearance,
+                // compaction, erosion) treats it as ordinary real geometry.
+                if (tileBarrierList != null && tileBarrierList.Count > 0 && barrierTris != null)
+                {
+                    int[] bsubTris = new int[tileBarrierList.Count * 3];
+                    for (int k = 0; k < tileBarrierList.Count; k++)
+                    {
+                        int src = tileBarrierList[k] * 3;
+                        bsubTris[k * 3 + 0] = barrierTris[src + 0];
+                        bsubTris[k * 3 + 1] = barrierTris[src + 1];
+                        bsubTris[k * 3 + 2] = barrierTris[src + 2];
+                    }
+                    int cutCells, releasedCells;
+                    CutBarriersIntoHeightfield(ctx, hf, barrierVerts, bsubTris, tileBarrierList.Count,
+                        walkableClimb, obstructions, out cutCells, out releasedCells);
+                    r.BarrierCellsCut = cutCells;
+                    r.BarrierCellsReleased = releasedCells;
+                    r.BarrierCellsGated = cutCells;
+                }
+
                 // Stepped-prop spans are exempt from the ledge trim (NOT from the clearance rules below):
                 // FilterLedgeSpans deletes any span steeper than atan(walkableClimb / (2*cs)) by nulling
                 // its area, and it runs after the walkable-area marking, so the only way to keep a ramp -
@@ -4191,9 +4753,10 @@ namespace BetterBannerlordNavmeshing
                     // hairline seam by one cell per side and defeat the fill.
                     int gapFilled, gapEmpty;
                     gapFilled = FillNarrowGaps(hf, s.GapFillCells, walkableClimb, border, cellsPerTile,
-                        out gapEmpty);
+                        obstructions, s.VoxelCellSizeMeters, out gapEmpty, out int gapRefused);
                     r.GapFilled = gapFilled;
                     r.GapEmptyColumns = gapEmpty;
+                    r.BarrierGapRefused = gapRefused;
                 }
                 if (s.UseLedgeFilter)
                 {
@@ -4295,8 +4858,13 @@ namespace BetterBannerlordNavmeshing
                     BuildFanOutput(r, pmesh, tx, ty, cellsPerTile, tileSpan, originX, originZ, bminY, s);
 
                 if (s.StitchMaxGapCells > 0 && r.FaceCount > 1)
+                {
+                    int tileStitchRefused;
                     r.Stitched = StitchTileComponents(r, hf, bminY, s.CellHeightMeters, s.HeightOffsetMeters,
-                        walkableHeight, walkableClimb, s.StitchMaxGapCells, s.DetailWeldToleranceMeters);
+                        walkableHeight, walkableClimb, s.StitchMaxGapCells, s.DetailWeldToleranceMeters,
+                        obstructions, out tileStitchRefused);
+                    r.BarrierStitchRefused = tileStitchRefused;
+                }
             }
             catch (Exception ex)
             {
@@ -4321,9 +4889,11 @@ namespace BetterBannerlordNavmeshing
         // this tile's padded heightfield are probed, so exactly one tile decides each world cell and the
         // fill is identical on both sides of a tile boundary (no new cracks).
         private static int FillNarrowGaps(RcHeightfield hf, int gapFillCells, int walkableClimb,
-            int border, int cellsPerTile, out int emptyColumns)
+            int border, int cellsPerTile, ObstructionCells obstructions, float cs,
+            out int emptyColumns, out int obstructionRefused)
         {
             emptyColumns = 0;
+            obstructionRefused = 0;
             int w = hf.width;
             int h = hf.height;
             int ownX0 = border;
@@ -4350,6 +4920,15 @@ namespace BetterBannerlordNavmeshing
                     if (floor[ci] >= 0)
                         continue;                       // column already walkable
                     emptyColumns++;
+                    // A barrier's own cells read as an empty column with walkable flanks on both sides
+                    // - exactly the shape this pass exists to fill. Refuse it here, or the cut made a
+                    // moment ago is undone.
+                    if (obstructions != null && cs > 0f
+                        && obstructions.Contains(hf.bmin.X + (x + 0.5f) * cs, hf.bmin.Z + (z + 0.5f) * cs))
+                    {
+                        obstructionRefused++;
+                        continue;
+                    }
                     int y;
                     if (!TryGapFloor(floor, w, h, x, z, gapFillCells, walkableClimb, out y))
                         continue;
@@ -4368,6 +4947,14 @@ namespace BetterBannerlordNavmeshing
                 if (s.area != RcRecast.RC_NULL_AREA)
                     return s.smax;
             return -1;
+        }
+
+        /// A span counts as navigable exactly where WalkableFloor says it does - anything that is not
+        /// RC_NULL_AREA. Kept as one predicate so the barrier height rule can scan a whole column's
+        /// walkable band without duplicating (and eventually disagreeing with) that definition.
+        private static bool IsWalkableArea(int area)
+        {
+            return area != RcRecast.RC_NULL_AREA;
         }
 
         // True when a one-voxel solid span [y-1, y] fits without overlapping existing geometry.
@@ -4462,8 +5049,10 @@ namespace BetterBannerlordNavmeshing
         // little headroom (a ceiling). Deterministic, and per-tile only (cross-tile continuity is
         // already exact on the lattice).
         private static int StitchTileComponents(VoxelTileResult r, RcHeightfield hf, float bminY, float ch,
-            float offset, int walkableHeight, int walkableClimb, int stitchMaxGapCells, float weldTol)
+            float offset, int walkableHeight, int walkableClimb, int stitchMaxGapCells, float weldTol,
+            ObstructionCells obstructions, out int obstructionRefused)
         {
+            obstructionRefused = 0;
             int nv = r.VertexCount;
             int nf = r.FaceCount;
             if (nv < 3 || nf < 2)
@@ -4606,6 +5195,17 @@ namespace BetterBannerlordNavmeshing
                     int yHi = (int)Math.Ceiling((Math.Max(r.VertsXyz[ua * 3 + 1], r.VertsXyz[va * 3 + 1]) - offset - bminY) / ch) + walkableHeight;
                     if (!StitchGapClear(r, hf, ua, va, yLo, yHi))
                         continue;
+                    // Barrier gate. StitchGapClear above reads the tile heightfield, which now carries
+                    // the barrier as a solid span, so it already refuses most crossings - but only where
+                    // it happens to sample a barrier cell. This is the deterministic check on the
+                    // connector's own segment, which is what actually gets added to the mesh.
+                    if (obstructions != null && obstructions.SegmentCrosses(
+                            r.VertsXyz[ua * 3], r.VertsXyz[ua * 3 + 2],
+                            r.VertsXyz[va * 3], r.VertsXyz[va * 3 + 2]))
+                    {
+                        obstructionRefused++;
+                        continue;
+                    }
 
                     // Quad (two triangles) reusing the four boundary vertices. Keep the new edges fresh
                     // so no edge ends up shared by more than two faces, and wind with +Y normals.
@@ -5596,11 +6196,22 @@ namespace BetterBannerlordNavmeshing
                 for (int i = 0; i < frags.Count; i++) fragRoot[frags[i]] = frags[i];
                 Func<int, int> find = delegate (int x)
                 {
-                    int r = x;
+                    // vFaces is GLOBAL, so a candidate face's neighbours can belong to a DIFFERENT
+                    // component whose fragment id is absent from this component's set. Such a fragment is
+                    // its own root here - it must not be merged by this component's restore, and treating
+                    // it as a singleton is what makes the walk terminate. (Looking it up blindly threw
+                    // KeyNotFoundException; the barrier cut is what made a real scene reach this, by
+                    // splitting a component at a shared boundary vertex.)
+                    int r;
+                    if (!fragRoot.TryGetValue(x, out r)) return x;
                     while (fragRoot[r] != r) r = fragRoot[r];
                     while (fragRoot[x] != r) { int nx = fragRoot[x]; fragRoot[x] = r; x = nx; }
                     return r;
                 };
+                // A fragment outside this component contributes nothing to "which fragments does this
+                // candidate bridge" - counting it would let a face rejoin halves across a component
+                // boundary this restore is not allowed to touch.
+                Func<int, bool> inComponent = delegate (int fr) { return fragRoot.ContainsKey(fr); };
                 int remaining = frags.Count;
 
                 while (remaining > 1)
@@ -5622,6 +6233,8 @@ namespace BetterBannerlordNavmeshing
                             for (int q = 0; q < lst.Count; q++)
                             {
                                 int fr = fragOf[lst[q]];
+                                
+                                if (!inComponent(fr)) continue;      // another component's fragment
                                 int r = find(fr);
                                 if (r != rootSeen) { touched++; size += fragSize[fr]; rootSeen = r; }
                                 if (first < 0) first = r; else if (r != first) { twoSides = true; }
@@ -5645,7 +6258,9 @@ namespace BetterBannerlordNavmeshing
                         if (!vFaces.TryGetValue(o.Tris[best * 3 + k], out lst)) continue;
                         for (int q = 0; q < lst.Count; q++)
                         {
-                            int r = find(fragOf[lst[q]]);
+                            int fr = fragOf[lst[q]];
+                                if (!inComponent(fr)) continue;      // another component's fragment
+                            int r = find(fr);
                             if (r == seen) continue;
                             if (seen >= 0) { fragRoot[seen] = r; remaining--; }
                             seen = r;

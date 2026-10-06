@@ -35,6 +35,12 @@ namespace BetterBannerlordNavmeshing
         // one entity (Birtu's largest was ~5.6k; 200k is far above anything real).
         private const int PerShapeTriCap = 200000;
 
+        // Appended to a barrier's name in the snapshot's per-entity records, so tooling can tell a
+        // barrier from ordinary geometry without re-reading every record's flags. Mirrors
+        // SteppedPropRamps.RampNameSuffix's role for synthesized ramps. The authoritative marker is
+        // still BodyFlags.Barrier / Barrier3D - the suffix is a convenience, never the test.
+        public const string BarrierRecordSuffix = "#barrier";
+
         // Emit a cheap progress line every N entities during the triangle-read pass.
         private const int ProgressEvery = 250;
 
@@ -53,6 +59,12 @@ namespace BetterBannerlordNavmeshing
             // Same length as Tris/3 when any HasSteps/Ladder prop was seen; null otherwise. True =
             // that triangle belongs to a stepped prop, so the builder keeps it off the ledge trim.
             public bool[] LedgeExemptTris;
+            // Honour-able barrier bodies, in the same engine Z-up world space. NEVER mixed into
+            // VertsXyz/Tris: the builder rasterises these separately as solid spans (see
+            // TiledNavMeshBuilder.CutBarriersIntoHeightfield), so they must not also enter the
+            // walkable soup or the wall would be cut twice.
+            public TiledNavMeshBuilder.BarrierWalls Barriers;
+            public int BarriersMeshed, BarriersSkipped;
         }
 
         // Per-entity view of the same collection, for the scene snapshot (offline test case).
@@ -82,6 +94,13 @@ namespace BetterBannerlordNavmeshing
             public int Count, Physics;
             public int ExFlora, ExBarrier, ExTerrain, ExLadder, ExDynamic, ExNoShape, ExEmpty,
                 ExExceptions, ExUnsolid;
+            // Honour-able barrier bodies, engine Z-up world space (see TiledNavMeshBuilder.BarrierWalls).
+            // Their triangles are kept OUT of VertsXyz/Tris on purpose; the builder cuts them separately.
+            public TiledNavMeshBuilder.BarrierWalls Barriers = new TiledNavMeshBuilder.BarrierWalls();
+            // How many barrier bodies we actually read geometry for, and how many we refused because
+            // their mask is missile-only. ExBarrier keeps its original meaning - barriers kept out of the
+            // walkable soup - which is still every barrier, so the existing log line is unchanged.
+            public int BarriersMeshed, BarriersSkipped;
             // Ladder-flagged bodies admitted by the classifier because the stepped-props feature is on
             // (they are excluded, and counted in ExLadder, when it is off).
             public int LadderIncluded;
@@ -103,6 +122,9 @@ namespace BetterBannerlordNavmeshing
             public GameEntity.Mobility Mobility;
             public bool IsDynamic;
             public bool IsStairs;
+            // A barrier body whose mask blocks agents. Such a candidate is read into the Barriers
+            // list instead of the walkable soup.
+            public bool IsBarrier;
         }
 
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
@@ -121,6 +143,9 @@ namespace BetterBannerlordNavmeshing
             r.ScanMs = g.ScanMs;
             r.ForceWalkableTris = g.ForceWalkableTris;
             r.LedgeExemptTris = g.LedgeExemptTris;
+            r.Barriers = g.Barriers;
+            r.BarriersMeshed = g.BarriersMeshed;
+            r.BarriersSkipped = g.BarriersSkipped;
             return r;
         }
 
@@ -162,6 +187,8 @@ namespace BetterBannerlordNavmeshing
             // Classify only. No triangle is read here, so nothing in this pass can hit the
             // null-mesh-table crash. Collection is bounded by the same try/catch as before.
             var candidates = new List<Candidate>();
+            // Honour-able barriers: read exactly like any other body, but never mixed into the soup.
+            var barrierCandidates = new List<Candidate>();
             var preloadNames = new List<string>();
             var preloadSeen = new HashSet<string>(StringComparer.Ordinal);
 
@@ -195,6 +222,7 @@ namespace BetterBannerlordNavmeshing
                     bool isStairs = (all & BodyFlags.HasSteps) != 0;
                     bool isLadder = (all & BodyFlags.Ladder) != 0;
                     bool isBarrier = (all & (BodyFlags.Barrier | BodyFlags.Barrier3D)) != 0;
+                    bool isBarrierForCarve = false;
                     bool isDynamic = (all & (BodyFlags.Dynamic | BodyFlags.Moveable)) != 0
                         || mobility == GameEntity.Mobility.Dynamic
                         || mobility == GameEntity.Mobility.DynamicForced
@@ -208,7 +236,23 @@ namespace BetterBannerlordNavmeshing
                     // (invisible blocker volumes), ladders, flora. Dynamic props are optional.
                     if (isTerrain) { exTerrain++; continue; }
                     if (isFlora && !includeFlora) { exFlora++; continue; }
-                    if (isBarrier) { exBarrier++; continue; }
+                    if (isBarrier)
+                    {
+                        // A barrier is an invisible wall, and whether the navmesh must respect it is
+                        // decided entirely by its blocking mask - never by its name (see the mask table
+                        // and the engine's own exclude-flag presets in TiledNavMeshBuilder). ExBarrier
+                        // keeps counting every barrier that stays out of the walkable soup, which is all
+                        // of them: the honoured ones are read, but into Barriers, not into the soup.
+                        exBarrier++;
+                        if (!TiledNavMeshBuilder.BarrierBlocksAgents(unchecked((int)all)))
+                        {
+                            result.BarriersSkipped++;
+                            result.Barriers.AddSkipped(name, unchecked((int)all));
+                            continue;
+                        }
+                        // fall through: read it, but tag it so pass 2 routes it to Barriers
+                        isBarrierForCarve = true;
+                    }
                     // Ladders: excluded by default - a rung set is not a walkable surface and the engine
                     // handles ladders separately. With the stepped-props feature on they are collected
                     // like any other stepped prop: the rungs are steep-walkable surfaces, SteppedPropRamps
@@ -248,7 +292,12 @@ namespace BetterBannerlordNavmeshing
                     c.Mobility = mobility;
                     c.IsDynamic = isDynamic;
                     c.IsStairs = isStairs;
-                    candidates.Add(c);
+                    c.IsBarrier = isBarrierForCarve;
+                    // A barrier never enters the walkable soup, so it goes into its own list and is
+                    // preloaded with everything else (bo_barrier is a real physics shape and GetTriangle
+                    // read-AVs the process on a body whose native mesh table is not loaded yet).
+                    if (isBarrierForCarve) barrierCandidates.Add(c);
+                    else candidates.Add(c);
 
                     if (string.IsNullOrEmpty(bodyName))
                         preloadNamesEmpty++;
@@ -501,6 +550,121 @@ namespace BetterBannerlordNavmeshing
                         + " included=" + included + " tris=" + (tris.Count / 3));
             }
 
+            // ---------------------------------------------------------------- pass 2b
+            // Barrier bodies. Identical read to the soup pass (same shape API, same preload, same
+            // crash hardening, same trace line) but the output goes into result.Barriers and NEVER
+            // into verts/tris: the builder cuts a barrier as solid geometry on its own terms (with the
+            // height rule), so letting it into the soup as well would cut it twice.
+            //
+            // This is also where the two `barrier_builder` entities' GENERATED bodies are picked up.
+            // Their game_entity has no transform and no authored triangles - the engine builds the
+            // `bo_barrier` body from the referenced path when the scene loads - but the built body is
+            // an ordinary physics body, so it is simply one more entity in the scan.
+            for (int i = 0; i < barrierCandidates.Count; i++)
+            {
+                Candidate c = barrierCandidates[i];
+                try
+                {
+                    int meshCount = SafeInt(() => c.Shape.TriangleMeshCount());
+                    int shapeTris = 0;
+                    for (int m = 0; m < meshCount; m++)
+                        shapeTris += SafeInt(() => c.Shape.TriangleCountInTriangleMesh(m));
+                    if (trace && log != null)
+                        log("assets: TRACE barrier '" + c.Name + "' body='" + c.BodyName + "' flags=0x"
+                            + FlagsHex(c.Flags) + " meshCount=" + meshCount + " tris=" + shapeTris);
+
+                    if (meshCount <= 0 || shapeTris <= 0)
+                    {
+                        // An empty barrier body is a barrier with nothing to carve; count it as skipped
+                        // so the log cannot claim a wall the scene does not actually have.
+                        result.BarriersSkipped++;
+                        result.Barriers.AddSkipped(c.Name, unchecked((int)c.Flags));
+                        exEmpty++;
+                        continue;
+                    }
+
+                    MatrixFrame frame = SafeFrame(c.Entity);
+                    var bv = new List<float>();
+                    var bt = new List<int>();
+                    bool capped = false;
+                    int wrote = 0;
+                    for (int m = 0; m < meshCount && !capped; m++)
+                    {
+                        int tc = SafeInt(() => c.Shape.TriangleCountInTriangleMesh(m));
+                        for (int t = 0; t < tc; t++)
+                        {
+                            if (wrote >= PerShapeTriCap) { capped = true; break; }
+                            try { c.Shape.GetTriangle(tri, m, t); }
+                            catch (Exception) { continue; }
+                            int b = bv.Count / 3;
+                            for (int k = 0; k < 3; k++)
+                            {
+                                Vec3 w = frame.TransformToParent(tri[k]);
+                                bv.Add(w.x); bv.Add(w.y); bv.Add(w.z);
+                            }
+                            bt.Add(b); bt.Add(b + 1); bt.Add(b + 2);
+                            wrote++;
+                        }
+                    }
+                    if (capped) shapesCapped++;
+                    if (wrote <= 0)
+                    {
+                        result.BarriersSkipped++;
+                        result.Barriers.AddSkipped(c.Name, unchecked((int)c.Flags));
+                        continue;
+                    }
+
+                    float zMin = float.MaxValue, zMax = float.MinValue;
+                    for (int v = 0; v < bv.Count / 3; v++)
+                    {
+                        float z = bv[v * 3 + 2];
+                        if (z < zMin) zMin = z;
+                        if (z > zMax) zMax = z;
+                    }
+                    var wall = new TiledNavMeshBuilder.BarrierWall();
+                    wall.Name = c.Name;
+                    wall.Flags = unchecked((int)c.Flags);
+                    wall.VertsXyz = bv.ToArray();
+                    wall.Tris = bt.ToArray();
+                    // `Flip` is the component's one-way direction flag. Recorded, not honoured: the
+                    // navmesh is undirected, so the cut is two-sided either way (see README.md).
+                    wall.Flip = false;
+                    wall.ZMin = zMin;
+                    wall.ZMax = zMax;
+                    result.Barriers.Add(wall);
+                    result.BarriersMeshed++;
+
+                    // The snapshot is the offline test case, so a barrier has to be IN it: that is
+                    // what makes the flag histogram (and any offline re-run) able to see the wall at
+                    // all. Kept as its own record with the barrier's real BodyFlags so tooling can tell
+                    // it from ordinary geometry by flag, never by name.
+                    if (recordEntities)
+                    {
+                        var rec = new AssetEntityRecord();
+                        rec.Name = c.Name + BarrierRecordSuffix;
+                        rec.Flags = c.Flags;
+                        rec.Mobility = (int)c.Mobility;
+                        rec.TriCount = wrote;
+                        rec.Capped = capped;
+                        rec.VertsXyz = wall.VertsXyz;
+                        rec.Tris = wall.Tris;
+                        result.Entities.Add(rec);
+                    }
+                    if (log != null)
+                        log("assets: barrier '" + c.Name + "' flags=0x" + FlagsHex(c.Flags)
+                            + " meshCount=" + meshCount + " tris=" + wrote
+                            + " z=[" + zMin.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+                            + ".." + zMax.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+                            + "]m (carved as solid; excluded from the walkable soup)");
+                }
+                catch (Exception ex)
+                {
+                    exceptions++;
+                    if (log != null && exceptions <= 8)
+                        log("assets: barrier entity '" + c.Name + "' EXCEPTION " + Err(ex));
+                }
+            }
+
             watch.Stop();
             // Ramps are appended after every real triangle, so the mask is a true-tail and a build with
             // no ramps leaves ForceWalkableTris null (the builder then takes its unchanged path).
@@ -547,6 +711,19 @@ namespace BetterBannerlordNavmeshing
             result.ExExceptions = exceptions;
             result.ExUnsolid = exUnsolid;
             result.LadderIncluded = ladderIncluded;
+            // Honour masks: a barrier body is carved only when its mask blocks agents. Decided from
+            // BodyFlags, never from the entity's name.
+            if (exBarrier > 0)
+            {
+                log("assets: barriers: bodies=" + (result.BarriersMeshed + result.BarriersSkipped)
+                    + " carved=" + result.BarriersMeshed + " tris=" + result.Barriers.TotalTris
+                    + " skipped=" + result.BarriersSkipped
+                    + " (missile-only masks are not carved; carved walls stay out of the walkable soup)");
+                for (int k = 0; k < result.Barriers.Skipped.Count && k < 8; k++)
+                    log("assets: barriers: skipped " + result.Barriers.Skipped[k]);
+                if (result.Barriers.Skipped.Count > 8)
+                    log("assets: barriers: skipped ... (+" + (result.Barriers.Skipped.Count - 8) + " more)");
+            }
             result.RampQuads = rampQuads;
             result.RampStairs = rampStairs;
             result.RampHoles = rampHoles;
