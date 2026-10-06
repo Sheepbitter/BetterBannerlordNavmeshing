@@ -2404,6 +2404,7 @@ namespace BetterBannerlordNavmeshing
             int added = 0;
             int growMissTrace = 0;
             var grownCells = new HashSet<long>();
+            int voidCells = 0;
             if (GatePlateTrace && log != null)
             {
                 for (int qi = 0; qi < plans.Count && qi < 3; qi++)
@@ -2465,7 +2466,10 @@ namespace BetterBannerlordNavmeshing
                             if (Math.Abs(ym - PlaneHeight(p, mx, mz)) > cs * maxSlopeTan + 1e-4f) break;
                             if (!GrowRingOk(o, ax, ay_, az, bx, by_, bz, px, pz, p, heightOffsetMeters,
                                     soupVerts, soupTris, soupGrid, soupBig, soupCell, grid, gcell,
-                                    faceCount, climb, ch, clearBand, grownCells)) break;
+                                    faceCount, climb, ch, clearBand, grownCells,
+                                    GatePlateGrowVoidMaxSteps - voidCells,
+                                    out int ringVoid)) break;
+                            voidCells += ringVoid;
                             int q0 = o.X.Count;
                             o.X.Add(ax + px); o.Y.Add(y0); o.Z.Add(az + pz);
                             o.X.Add(bx + px); o.Y.Add(y1); o.Z.Add(bz + pz);
@@ -2530,6 +2534,21 @@ namespace BetterBannerlordNavmeshing
                             log("    grow edge (" + F(ax) + "," + F(o.Y[a]) + "," + F(az) + ")-(" + F(bx) + ","
                                 + F(o.Y[b]) + "," + F(bz) + ") outward (" + F(nx) + "," + F(nz) + ") by "
                                 + F(w) + "m (" + steps + " cells)");
+                            // why it stopped there, at the three fixed sample points of the next ring
+                            float qx = nx * cs * (steps + 1), qz = nz * cs * (steps + 1);
+                            if (steps < maxSteps)
+                            {
+                                log("      stopped at cell " + (steps + 1)
+                                    + GrowWhy(o, ax + qx, az + qz, PlaneHeight(p, ax + qx, az + qz),
+                                        p.H - heightOffsetMeters, soupVerts, soupTris, soupGrid, soupBig,
+                                        soupCell, grid, gcell, faceCount, climb, ch, clearBand)
+                                    + GrowWhy(o, bx + qx, bz + qz, PlaneHeight(p, bx + qx, bz + qz),
+                                        p.H - heightOffsetMeters, soupVerts, soupTris, soupGrid, soupBig,
+                                        soupCell, grid, gcell, faceCount, climb, ch, clearBand)
+                                    + GrowWhy(o, mx + qx, mz + qz, PlaneHeight(p, mx + qx, mz + qz),
+                                        p.H - heightOffsetMeters, soupVerts, soupTris, soupGrid, soupBig,
+                                        soupCell, grid, gcell, faceCount, climb, ch, clearBand));
+                            }
                         }
                     }
                 }
@@ -2556,8 +2575,9 @@ namespace BetterBannerlordNavmeshing
             float[] soupVerts, int[] soupTris,
             Dictionary<long, List<int>> soupGrid, List<int> soupBig, float soupCell,
             Dictionary<long, List<int>> grid, float gcell, int faceCount, float climb, float ch,
-            float clearBand, HashSet<long> grownCells)
+            float clearBand, HashSet<long> grownCells, int voidBudget, out int ringVoid)
         {
+            ringVoid = 0;
             float ex = bx - ax, ez = bz - az;
             float elen = (float)Math.Sqrt(ex * ex + ez * ez);
             float step = ch > 0f ? ch : 0.25f;
@@ -2568,10 +2588,13 @@ namespace BetterBannerlordNavmeshing
                 float t = i / (float)n;
                 float sx = ax + ex * t + px, sz = az + ez * t + pz;
                 float planeY = PlaneHeight(p, sx, sz);
+                bool crossed;
                 if (!GrowCellOk(o, sx, sz, planeY, p.H - heightOffsetMeters, soupVerts, soupTris,
                         soupGrid, soupBig, soupCell, grid, gcell, faceCount, climb, ch,
-                        clearBand, grownCells)) return false;
+                        clearBand, grownCells, out crossed)) return false;
+                if (crossed) ringVoid++;
             }
+            if (ringVoid > voidBudget) return false;
             for (int i = 0; i <= n; i++)
             {
                 float t = i / (float)n;
@@ -2581,11 +2604,44 @@ namespace BetterBannerlordNavmeshing
             return true;
         }
 
-        // One grown cell. True only when the raw soup says the PROP'S OWN FLOOR is still physically at this
-        // cell, that floor has walkableHeight of clearance above it, and the built mesh does not already cover
-        // it. Each of the three exists because its absence produced a wrong answer: without the floor test the
-        // plate grows into thin air, without the clearance test it grows under the gate's own wall, and without
-        // the bare test it paints over the neighbour it was meant to meet.
+        // One grown cell, accepted by EITHER of two routes.
+        //
+        // ROUTE A - the prop's own floor is still there: FLOOR (an up-facing soup surface at the cell, at or
+        // below the plate's PRE-BLEND level plus ch + climb), CLEARANCE (nothing in the soup within
+        // walkableHeight above that floor) and BARE (the built mesh does not already cover the cell within one
+        // climb of the plane). Each of the three exists because its absence produced a wrong answer: without
+        // the floor test the plate grows into thin air, without the clearance test it grows under the gate's own
+        // wall, and without the bare test it paints over the neighbour it was meant to meet.
+        //
+        // ROUTE B - CROSSING THE VOID. Route A cannot fill the gap at the reported gate, and refused it
+        // correctly: the threshold slab's own floor ENDS at x = 1133.37. `--soup 1133.0,990.8,1134.2,991.6,83,88`
+        // returns 8 triangles and every one is VERTICAL - the colliders' end faces at 84.97-85.11 - so the
+        // columns across the gap have no horizontal soup surface at all.
+        //
+        // An earlier round mis-measured that gap and reported a 1.1 m step, which is what stopped this pass
+        // being finished. The number was a frame error: it subtracted a MESH height (the plate tip, 85.304) from
+        // a SOUP height (the terrain under the lip, 84.19). Both sides of the crossing in ONE frame - the
+        // final emitted mesh, which is what the engine imports - are:
+        //
+        //     near side, the growth's outer vertex  v144038 (1133.195, 85.270, 991.344)
+        //     far  side, the boundary vertex      v64009  (1133.750, 85.100, 991.250)
+        //
+        // so the drop is **0.170 m**, comfortably inside the 0.6 m climb, and the only thing wrong is the
+        // **0.555 m XZ void** between them. Recast links only TOUCHING footprints, so the engine sees two
+        // surfaces 0.17 m apart that it refuses to join, and an agent cannot step over the hole.
+        //
+        // Route B fills that band, and only where all of these hold:
+        //   - no soup up-facing floor at the cell within the plate's own level band (it is a void, not a floor
+        //     being refused);
+        //   - nothing in the soup within walkableHeight ABOVE the plane, so there is no wall or ceiling to grow
+        //     into - the clearance test, asked of the raw soup because that is all there is;
+        //   - walkable built mesh within GatePlateGrowVoidReachMeters of the cell AND within one climb of the
+        //     plane. That is what makes it a CONNECTION rather than an invention: there has to be something to
+        //     connect to, close by, at a step an agent can take.
+        // At most GatePlateGrowVoidMaxSteps cells may be crossed per edge, so the growth closes a gap and does
+        // not stroll across a missing prop. The strip is flat and one cell wide, so it stays inside the plate's
+        // own boundary - it extends the plate's edge outward by at most one voxel cell per step, exactly as
+        // Route A does.
         //
         // The floor is looked for at the plate's PRE-BLEND level p.H, not at the fitted plane. That is the whole
         // point: the blend deliberately lowers the plate by up to one climb plus its tilt, so at the gate the
@@ -2598,22 +2654,120 @@ namespace BetterBannerlordNavmeshing
             float[] soupVerts, int[] soupTris,
             Dictionary<long, List<int>> soupGrid, List<int> soupBig, float soupCell,
             Dictionary<long, List<int>> grid, float gcell, int faceCount, float climb, float ch,
-            float clearBand, HashSet<long> grownCells)
+            float clearBand, HashSet<long> grownCells, out bool crossedVoid)
         {
+            crossedVoid = false;
             if (grownCells.Contains(CellKey(x, z, ch))) return false;
 
-            // BARE: the built mesh must not already be there within the climb
-            if (MeshCovers(o, grid, gcell, faceCount, x, z, planeY, climb)) return false;
+            // BARE: the built mesh must not already be at THIS level there.
+            //
+            // The band is one cell height, NOT the agent climb, and that is the whole fix. With the climb band
+            // the far-side face across the gate void - 0.18 m below the plate's plane - counted as "already
+            // covered", so the growth refused every cell of the void and the plate never reached it: measured
+            // 1 cell grown and a 0.65 m bare band still open at z = 991.25. A face a fifth of a metre BELOW the
+            // plane is a separate step, not the same walking surface, and filling the space between them is the
+            // entire point. One `ch` is "same surface"; the climb belongs to Route B's reach test, where the
+            // question really is "can an agent step to that".
+            if (MeshCovers(o, grid, gcell, faceCount, x, z, planeY, ch)) return false;
 
-            // FLOOR + CLEARANCE, straight from the raw soup
-            float slack = ch + climb;
+            // ROUTE A: FLOOR + CLEARANCE, straight from the raw soup.
+            //
+            // The floor is compared with the PLANE (in soup space), not with the plate's pre-blend level. That
+            // distinction is the whole gate gap: the plate's pre-blend level is 86.3 in mesh space (85.8 in soup
+            // space), the terrain under the threshold lip measures 84.2-84.6 in soup space, and the PLANE - what
+            // the strip is actually placed at - is ~84.8 in soup space. So that ground is 0.2-0.6 m below the
+            // plane, i.e. inside the climb, and comparing it against the pre-blend level instead (measured
+            // `[floorLow@84.205]` in the trace) refused the lip as "not the plate's floor" - the same frame
+            // mistake that produced the 1.1 m step, one level down. A floor within one climb of where the strip
+            // is going IS a floor the strip may bridge to.
             float floorY;
-            if (!SoupFloorUpTo(soupVerts, soupTris, soupGrid, soupBig, soupCell,
-                    x, z, plateH + slack, out floorY)) return false;
-            if (floorY < plateH - slack) return false;
+            if (SoupFloorUpTo(soupVerts, soupTris, soupGrid, soupBig, soupCell,
+                    x, z, planeY + climb, out floorY)
+                && floorY >= planeY - climb)
+            {
+                if (SoupObstructs(soupVerts, soupTris, soupGrid, soupBig, soupCell,
+                        x, z, floorY + ch * 0.5f, floorY + clearBand)) return false;
+                return true;
+            }
+            _ = plateH;
+
+            // ROUTE B: no usable floor at all - a true void, with open clearance above the plane and walkable
+            // built mesh close enough and near enough in height to be the thing we are connecting to.
             if (SoupObstructs(soupVerts, soupTris, soupGrid, soupBig, soupCell,
-                    x, z, floorY + ch * 0.5f, floorY + clearBand)) return false;
+                    x, z, planeY - ch * 0.5f, planeY + clearBand)) return false;
+            if (!MeshSurfaceNear(o, grid, gcell, faceCount, x, z, planeY, climb,
+                    GatePlateGrowVoidReachMeters)) return false;
+            crossedVoid = true;
             return true;
+        }
+
+        // Is there walkable built mesh within `reach` of (x,z) in XZ whose height there is within `climb` of
+        // planeY? "Height there" is that face's own surface height at the closest point of its footprint, i.e.
+        // what an agent would stand on at the crossing.
+        private static bool MeshSurfaceNear(MergeOutput o, Dictionary<long, List<int>> grid, float gcell,
+            int faceCount, float x, float z, float planeY, float climb, float reach)
+        {
+            int cx = (int)Math.Floor(x / gcell), cz = (int)Math.Floor(z / gcell);
+            for (int i = cx - 1; i <= cx + 1; i++)
+                for (int j = cz - 1; j <= cz + 1; j++)
+                {
+                    List<int> lst;
+                    if (!grid.TryGetValue(unchecked(((long)i << 32) | (uint)j), out lst)) continue;
+                    for (int k = 0; k < lst.Count; k++)
+                    {
+                        int f = lst[k];
+                        if (f >= faceCount) continue;
+                        int p0 = o.Tris[f * 3], p1 = o.Tris[f * 3 + 1], p2 = o.Tris[f * 3 + 2];
+                        float d2, hy;
+                        MeshFaceDistToPoint(o, p0, p1, p2, x, z, out d2, out hy);
+                        if (d2 > reach * reach) continue;
+                        if (Math.Abs(hy - planeY) <= climb) return true;
+                    }
+                }
+            return false;
+        }
+
+        // squared XZ distance from (x,z) to a face's footprint, and the face's surface height at the closest
+        // point. Zero when the point is inside the footprint.
+        private static void MeshFaceDistToPoint(MergeOutput o, int p0, int p1, int p2, float x, float z,
+            out float dist2, out float hy)
+        {
+            double ax = o.X[p0], az = o.Z[p0], ay = o.Y[p0];
+            double bx = o.X[p1], bz = o.Z[p1], by = o.Y[p1];
+            double cx = o.X[p2], cz = o.Z[p2], cy = o.Y[p2];
+            double den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz);
+            if (Math.Abs(den) > 1e-12)
+            {
+                double wa = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / den;
+                double wb = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / den;
+                double wc = 1.0 - wa - wb;
+                if (wa >= 0.0 && wb >= 0.0 && wc >= 0.0)
+                {
+                    dist2 = 0f;
+                    hy = (float)(wa * ay + wb * by + wc * cy);
+                    return;
+                }
+            }
+            float best = float.MaxValue, bestY = 0f;
+            SegPtNearest(o, p0, p1, x, z, ref best, ref bestY);
+            SegPtNearest(o, p1, p2, x, z, ref best, ref bestY);
+            SegPtNearest(o, p2, p0, x, z, ref best, ref bestY);
+            dist2 = best;
+            hy = bestY;
+        }
+
+        private static void SegPtNearest(MergeOutput o, int ia, int ib, float x, float z,
+            ref float best, ref float bestY)
+        {
+            float dx = o.X[ib] - o.X[ia], dz = o.Z[ib] - o.Z[ia];
+            float len = dx * dx + dz * dz;
+            float t = len < 1e-12f ? 0f : ((x - o.X[ia]) * dx + (z - o.Z[ia]) * dz) / len;
+            if (t < 0f) t = 0f; else if (t > 1f) t = 1f;
+            float ex = o.X[ia] + t * dx - x, ez = o.Z[ia] + t * dz - z;
+            float d2 = ex * ex + ez * ez;
+            if (d2 >= best) return;
+            best = d2;
+            bestY = o.Y[ia] + t * (o.Y[ib] - o.Y[ia]);
         }
 
         // Harness-only: why one grown cell was refused, as a compact tag triple for the trace line.
@@ -2623,15 +2777,38 @@ namespace BetterBannerlordNavmeshing
             Dictionary<long, List<int>> grid, float gcell, int faceCount, float climb, float ch,
             float clearBand)
         {
-            if (MeshCovers(o, grid, gcell, faceCount, x, z, planeY, climb)) return " [covered]";
+            if (MeshCovers(o, grid, gcell, faceCount, x, z, planeY, ch)) return " [covered]";
             float slack = ch + climb;
             float fy;
-            if (!SoupFloorUpTo(soupVerts, soupTris, soupGrid, soupBig, soupCell, x, z, plateH + slack, out fy))
-                return " [no-floor]";
-            if (fy < plateH - slack) return " [low@" + F(fy) + "]";
-            if (SoupObstructs(soupVerts, soupTris, soupGrid, soupBig, soupCell, x, z, fy + ch * 0.5f, fy + clearBand))
-                return " [blocked@" + F(fy) + "]";
-            return " [ok@" + F(fy) + "]";
+            bool has = SoupFloorUpTo(soupVerts, soupTris, soupGrid, soupBig, soupCell, x, z,
+                plateH + slack, out fy);
+            if (has && fy >= plateH - slack)
+                return SoupObstructs(soupVerts, soupTris, soupGrid, soupBig, soupCell, x, z,
+                    fy + ch * 0.5f, fy + clearBand) ? " [blocked@" + F(fy) + "]" : " [okA@" + F(fy) + "]";
+            if (has) return " [floorLow@" + F(fy) + "]";
+            // Route B
+            if (SoupObstructs(soupVerts, soupTris, soupGrid, soupBig, soupCell, x, z,
+                    planeY - ch * 0.5f, planeY + clearBand)) return " [blockedAbove]";
+            float d2, hy;
+            float best = float.MaxValue;
+            int cx = (int)Math.Floor(x / gcell), cz = (int)Math.Floor(z / gcell);
+            for (int i = cx - 1; i <= cx + 1; i++)
+                for (int j = cz - 1; j <= cz + 1; j++)
+                {
+                    List<int> lst;
+                    if (!grid.TryGetValue(unchecked(((long)i << 32) | (uint)j), out lst)) continue;
+                    for (int k = 0; k < lst.Count; k++)
+                    {
+                        int f = lst[k];
+                        if (f >= faceCount) continue;
+                        MeshFaceDistToPoint(o, o.Tris[f * 3], o.Tris[f * 3 + 1], o.Tris[f * 3 + 2],
+                            x, z, out d2, out hy);
+                        if (d2 < best) best = d2;
+                    }
+                }
+            if (best > GatePlateGrowVoidReachMeters * GatePlateGrowVoidReachMeters)
+                return " [noMeshWithin" + F((float)Math.Sqrt(best)) + "m]";
+            return " [okB@d" + F((float)Math.Sqrt(best)) + "]";
         }
 
         private static bool MeshCovers(MergeOutput o, Dictionary<long, List<int>> grid, float gcell,
@@ -5131,6 +5308,16 @@ namespace BetterBannerlordNavmeshing
         // face/edge order, integer cell steps outward.
         public const float GatePlateGrowMaxMeters = 1.0f;
         public const int GatePlateGrowMaxCount = 2048;
+
+        // ROUTE B, the void crossing. See GrowCellOk. A cell with no soup floor of the plate's own may still be
+        // grown into when it is a VOID - nothing in the soup within walkableHeight above the plane - and
+        // walkable built mesh sits within GatePlateGrowVoidReachMeters of it at a step inside the climb. At the
+        // reported gate that band is 0.555 m wide with a 0.170 m drop across it: inside the climb by a factor of
+        // three, and therefore the exact case the engine's footprint-touch linking refuses and an agent walks.
+        // The reach is a little over one agent radius (0.25 m), so Route B can close a seam-sized gap and not
+        // reach across open ground; the cell budget caps it again at three cells, 0.75 m, per edge.
+        public const float GatePlateGrowVoidReachMeters = 0.6f;
+        public const int GatePlateGrowVoidMaxSteps = 3;
 
         // The face's own height range has to exceed this to count as a jump. Two agent climbs plus one
         // cell height (1.4 m at climb 0.6 / ch 0.2), which clears the lab stair's 1.20 m connector with

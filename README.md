@@ -1422,7 +1422,90 @@ emits no `gate plates:`, `gate plate footprint:` or `gate plate seams:` line at 
 `V=144036 F=241424 E=386905 quads=1852` on CC_20, i.e. the pre-pass output byte for byte. Both variants build
 0 warnings / 0 errors, deployed.
 
-**Honest residual - the important one, unchanged in substance.** The footprint growth does extend the gate's plate
+**V3.56: the frame, restated - the reported gap is 0.170 m, not 1.1 m.** V3.55 concluded the gate's east lip was a
+1.1 m step and stopped there. **That number was wrong**, and the user was right to call it: *"you also say that
+there's a 1.1 meter drop, there definitely is not. The editor cube I placed in the picture is 1x1x1 meter. So the
+vertex drops are .2-.3 meters at worst."* Two independent mistakes produced it, and both are the same one
+wearing different clothes - **a MESH height subtracted from a SOUP height**, when `EmitVertex` writes
+`bminY + gy*ch + HeightOffsetMeters` and every mesh height therefore sits `HeightOffsetMeters` above the soup it
+came from. V3.55 already documented that trap once and then walked into it again.
+
+Putting **both sides of the crossing in one frame - the final emitted mesh, which is what the engine imports**:
+
+| | vertex | mesh Y | frame |
+|---|---|---|---|
+| near side, the growth's outer vertex | `v144038` (1133.195, **85.270**, 991.344) | mesh | - |
+| far side, the boundary vertex | `v64009` (1133.750, **85.100**, 991.250) | mesh | - |
+| **the drop** | | **0.170 m** | mesh |
+
+and the same surfaces in the raw soup, with the 0.5 m offset applied back off:
+
+| what | soup Y | mesh Y (= soup + 0.5) |
+|---|---|---|
+| plate's pre-blend level | 85.8 | 86.300 |
+| the plate's blended plane at the gap | 84.8 | 85.28 |
+| the terrain under the threshold lip | 84.2 - 84.6 | 84.7 - 85.1 |
+| the far-side walkable surface | 84.6 | 85.100 |
+
+V3.55's 1.114 m was `85.304 (mesh) - 84.19 (soup)`: two different frames, and the second one is *underneath* both
+sides rather than being either of them. In the mesh frame the drop is 0.170 m, and the terrain under the lip is
+0.58 m below the plane - inside the 0.6 m climb.
+
+**So the drops were never the problem and the blocker is a pure XZ void.** On the final emitted mesh, at
+`z = 991.25`: covered to `x = 1133.1`, then **bare `1133.2 .. 1134.0`**, then covered again from `1133.75`.
+Recast links only *touching* footprints, so a 0.17 m step across a 0.575 m hole is exactly the case it refuses and
+an agent cannot step over. `--walk` on the final mesh agrees:
+
+```
+target 0 (1132.75,991.25) y=85.51 -> WALKABLE
+target 1 (1133.10,991.25) y=85.38 f240994 -> WALKABLE      <- the new growth triangle
+target 2 (1133.30,991.25) -> NO MESH AT ALL [VOID]
+target 3 (1133.50,991.25) -> NO MESH AT ALL [VOID]
+target 4 (1133.75,991.25) y=85.03 f112402 -> WALKABLE
+```
+
+**Three fixes went in this round, and each was a measurement, not a guess.**
+
+1. **The growth's BARE test used the wrong band.** It asked "is there already mesh within `climb` of the plane?",
+   and the far-side face across the void is 0.18 m below the plane - so it read as *already covered* and the
+   growth refused every cell of the void. Measured: 1 cell grown, the 0.65 m bare band still open. **The band is
+   now one `ch`**, because that is the question being asked: "is there already mesh at *this level*", i.e. would I
+   be painting over a neighbour. The climb belongs to Route B's reach test, where "can an agent step to that" is
+   genuinely the question.
+2. **The floor test compared against the plate's PRE-BLEND level instead of the plane.** The trace said
+   `[floorLow@84.205]` and refused the lip: 84.205 is a *soup* height, 0.58 m below the plane - well inside the
+   climb - but 1.6 m below the pre-blend level, so it did not look like the plate's floor. **It is now compared
+   with the plane, in soup space**, so a floor within one climb of where the strip is going counts as a floor the
+   strip may bridge to. That is the frame mistake again, one level down.
+3. **Route B - crossing a genuine void.** A cell with no usable soup floor at all may still be grown into when
+   nothing in the soup sits within `walkableHeight` above the plane *and* walkable built mesh lies within
+   `GatePlateGrowVoidReachMeters` (0.6 m) at a step inside the climb, capped at
+   `GatePlateGrowVoidMaxSteps` (3 cells) per edge. That is what makes it a connection rather than an invention:
+   there has to be something to connect to, close by, at a step an agent can take.
+
+Measured effect at the gate: coverage now reaches `x = 1133.1` (was `1132.75`), and face `f240994` is a real
+walkable triangle in what was bare ground. Growth counts fell (CC_20 24 -> 18 edges, Birtu 22 -> 10, Basamu
+10 -> 7) because fix 1 deliberately makes the growth more conservative - it now refuses wherever a same-level
+face is already there, instead of reaching over a 0.18 m step to cover it.
+
+**Honest residual - the gate gap is narrowed, not closed, and the next blocker is now identified.** `(1133.30,
+991.25)` and `(1133.50, 991.25)` are still `NO MESH AT ALL`. The trace shows why, and it is a *new* finding rather
+than a repeat: the cells there are `[blockedAbove]`. The gate threshold slab's **own underside** sits at 85.47 in
+mesh space while the plate's blended plane at that X is 85.28 - **the blend has lowered the plate below the prop's
+own collider underside**, so a strip placed at the plane there would sit inside the slab's body, and the clearance
+test correctly refuses it. That is a constraint the blend never imposed on itself and it is the next thing to fix:
+**clamp the fitted plane so it can never go below the prop's own collider underside** (the lowest soup surface over
+the plate's own footprint, plus a margin). With the plate clamped at ~85.5, the terrain under the lip
+(84.7-85.1) is then 0.4-0.8 m below it and the void at `x = 1133.2..1133.7` becomes a strip the growth can
+legitimately fill. This is a clamp on the rotation, not new geometry, and it is measurable the same way.
+
+**Bars.** Suite **110/110 byte-identical** to the stored baseline; islands **CC_20 15 / Birtu 5 / Basamu 1**;
+invariants **PASS** on all three with `maxEdgeMult=2`, `inverted=0`, `vertical=0`; `selfOverlap` **CC_20 1**
+(baseline), **Birtu 0**, **Basamu 0**; Birtu `ladders total=2`; `NavMeshVoxelGatePlateBlend=false` emits no
+gate-plate line and returns `V=144036 F=241424 E=386905 quads=1852`, the pre-pass output byte for byte; both
+variants **0 warnings / 0 errors**, deployed.
+
+**Honest residual - unchanged in substance.** The footprint growth extends the gate's plate
 one 0.25 m cell east (x = 1132.75 -> 1133.2 at z ~ 991.3) and then **correctly stops**, because the prop's own
 floor ends at x = 1133.37 with nothing horizontal beyond it. `--walk` still reports `(1133, 991)` as
 `NO MESH AT ALL [VOID]`, and the ground under the lip is 1.1 m below the plate. **That is not a gap in the navmesh;
