@@ -1379,10 +1379,13 @@ namespace BetterBannerlordNavmeshing
                     Log(log, "v2: prune: kept islands worst exemption fraction="
                         + F((float)(pst.MaxKeptExemptFraction * 100.0)) + "% of " + pst.MaxKeptFaces
                         + " faces (mixed provenance, no kept island is exempt-formed)");
-                if (pst.BarrierKeptIslands > 0)
-                    Log(log, "v2: prune: kept " + pst.BarrierKeptIslands + " barrier-adjacent island(s), "
-                        + pst.BarrierKeptFaces + " faces (largest=" + pst.BarrierLargestKept
-                        + ") - the cut split them this pass, so the cap does not apply");
+                if (pst.BarrierAboveCapIslands > 0 || pst.BarrierPrunedIslands > 0)
+                    Log(log, "v2: prune: barrier-adjacent islands judged by the ordinary cap ("
+                        + s.PruneMaxIslandFaces + " faces): " + pst.BarrierAboveCapIslands
+                        + " kept on size (" + pst.BarrierAboveCapFaces + " faces, largest="
+                        + pst.BarrierAboveCapLargest + "), " + pst.BarrierPrunedIslands + " culled ("
+                        + pst.BarrierPrunedFaces + " faces, largest=" + pst.BarrierPrunedLargest
+                        + ") - a barriered-off area needs no navmesh");
             }
 
             // Release the per-tile build structures before the cleanup. Keeping 15k+ tile results alive
@@ -2054,8 +2057,13 @@ namespace BetterBannerlordNavmeshing
             public float ExemptX, ExemptY, ExemptZ;
             public double MaxKeptExemptFraction;
             public int MaxKeptFaces;
-            // Islands kept only because they touch a barrier (see the guard in PruneSmallIslands).
-            public int BarrierKeptIslands, BarrierKeptFaces, BarrierLargestKept;
+            // Barrier-adjacent islands are now judged by the ORDINARY cap like every other island - a
+            // barriered-off area does not need a navmesh, and PruneMaxIslandFaces is the intended
+            // filter (user decision). These counters are pure instrumentation, so the split is
+            // auditable in the log: "kept" means it survived on size alone, "pruned" means the cap
+            // took it. BarrierPrunedLargest exists so a suspiciously large casualty is visible.
+            public int BarrierAboveCapIslands, BarrierAboveCapFaces, BarrierAboveCapLargest;
+            public int BarrierPrunedIslands, BarrierPrunedFaces, BarrierPrunedLargest;
         }
 
         private static void PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,
@@ -2076,9 +2084,12 @@ namespace BetterBannerlordNavmeshing
             st.ExemptZ = 0f;
             st.MaxKeptExemptFraction = 0.0;
             st.MaxKeptFaces = 0;
-            st.BarrierKeptIslands = 0;
-            st.BarrierKeptFaces = 0;
-            st.BarrierLargestKept = 0;
+            st.BarrierAboveCapIslands = 0;
+            st.BarrierAboveCapFaces = 0;
+            st.BarrierAboveCapLargest = 0;
+            st.BarrierPrunedIslands = 0;
+            st.BarrierPrunedFaces = 0;
+            st.BarrierPrunedLargest = 0;
 
             int nf = o.Tris.Count / 3;
             if (nf == 0)
@@ -2151,13 +2162,15 @@ namespace BetterBannerlordNavmeshing
             int largestRoot = -1;
             int exemptRoot = -1;
 
-            // BARRIER-ADJACENT ISLANDS ARE NEVER PRUNED. The cut can legitimately split one island in
-            // two, and the side that happens to be small is then judged by the ordinary cap - which
-            // would delete real navigable surface in the very pass that created it (the same failure
-            // that lost CC_20 two islands when the gate-plate blend was first landed). So: an island
-            // with a face next to a barrier is kept whatever its size. Keeping a small pocket is far
-            // less harmful than deleting the area agents need, and the counters make the delta
-            // auditable in the log.
+            // WHICH ISLANDS TOUCHED A BARRIER - instrumentation only, no exemption. V3.58 kept every
+            // barrier-adjacent island whatever its size, because a cut can split one island in two and
+            // the small side would then be culled by the cap in the very pass that created it. That is
+            // no longer wanted: a section of map a barrier has sealed off does not need a navmesh, and
+            // PruneMaxIslandFaces is the intended filter for it (user decision). So barrier-adjacent
+            // islands now fall through to the ordinary cap/coalition test unchanged and are merely
+            // TALLIED, which keeps the split auditable: "above cap" proves the two big networks either
+            // side of a wall are real navigable area rather than exemption artefacts, and "pruned"
+            // names what the cap took.
             var barrierIsland = new Dictionary<int, bool>();
             if (obstructions != null && obstructions.Count > 0)
             {
@@ -2177,15 +2190,8 @@ namespace BetterBannerlordNavmeshing
 
             foreach (KeyValuePair<int, int> kv in count)
             {
-                bool barrierTouched;
-                if (barrierIsland.TryGetValue(kv.Key, out barrierTouched) && barrierTouched)
-                {
-                    st.BarrierKeptIslands++;
-                    st.BarrierKeptFaces += kv.Value;
-                    if (kv.Value > st.BarrierLargestKept) st.BarrierLargestKept = kv.Value;
-                    st.KeptIslands++;
-                    continue;
-                }
+                bool barrierFlag;
+                bool touchesBarrier = barrierIsland.TryGetValue(kv.Key, out barrierFlag) && barrierFlag;
                 // Coalition test: with the exemption faces taken out, what is left of this island? If every
                 // remaining core is at most the cap, then the island is a chain of fragments the unmodified
                 // build prunes one by one and only the exemption holds it together - leftover, not a
@@ -2198,6 +2204,12 @@ namespace BetterBannerlordNavmeshing
                     dropped[kv.Key] = true;
                     st.RemovedIslands++;
                     st.RemovedFaces += kv.Value;
+                    if (touchesBarrier)
+                    {
+                        st.BarrierPrunedIslands++;
+                        st.BarrierPrunedFaces += kv.Value;
+                        if (kv.Value > st.BarrierPrunedLargest) st.BarrierPrunedLargest = kv.Value;
+                    }
                     if (coalition && kv.Value > maxFaces)
                     {
                         st.ExemptIslands++;
@@ -2217,6 +2229,15 @@ namespace BetterBannerlordNavmeshing
                 else
                 {
                     st.KeptIslands++;
+                    if (touchesBarrier)
+                    {
+                        // Survived on size alone. This is the number that matters: it is the proof
+                        // that the surfaces either side of a wall are genuine navigable area and not
+                        // artefacts of the old exemption.
+                        st.BarrierAboveCapIslands++;
+                        st.BarrierAboveCapFaces += kv.Value;
+                        if (kv.Value > st.BarrierAboveCapLargest) st.BarrierAboveCapLargest = kv.Value;
+                    }
                     int e;
                     exemptCount.TryGetValue(kv.Key, out e);
                     double frac = kv.Value > 0 ? (double)e / kv.Value : 0.0;
