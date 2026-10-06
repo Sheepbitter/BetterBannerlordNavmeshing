@@ -13,6 +13,13 @@ namespace BetterBannerlordNavmeshing
     {
         private const string BuildTag = "Build 3 (adaptive navmesh)";
 
+        // Overlay tints, matching Debug.DebugColor's palette (which is what
+        // MBDebug.RenderText's `color` argument is documented to take). Only the
+        // terminal lines differ; everything else is white.
+        private const uint OverlayWhite = 0xFFFFFFFFu;
+        private const uint OverlayYellow = 0xFFFFFF00u;
+        private const uint OverlayRed = 0xFF4040FFu;
+
         // ---------------- Settings (same names as the terrain script) ----------------
         public SimpleButton ExportNavMesh;
         public SimpleButton ImportNavMeshOnly;
@@ -187,6 +194,23 @@ namespace BetterBannerlordNavmeshing
         // NavMeshConsoleMessages is set to.
         public string NavMeshBuildStatus = NavMeshVisibleLog.IdleStatus;
 
+        // Draw the same status line as floating text in the editor viewport, on top of
+        // the panel row. Off by default because the engine gates the debug-text overlay
+        // on the ini/CVar option `show_debug_text`, which the shipped
+        // Modules\Native\engine_module.ini does not set (so it is off). Turn this on
+        // AND add `show_debug_text = 1` to that file, then restart the editor.
+        public bool NavMeshOverlayText = false;
+
+        // Where the overlay line is drawn, in the engine's own screen coordinates.
+        // (0, 0) is the top-left corner whether the engine treats these as pixels or
+        // as fractions, so it is the safe default; nudge them here if your build puts
+        // the text somewhere else - no rebuild needed, and the values save with the
+        // scene. NavMeshOverlaySeconds is how long the DONE / import-skipped / FAILED
+        // line lingers before the overlay goes away again.
+        public float NavMeshOverlayX = 0f;
+        public float NavMeshOverlayY = 0f;
+        public float NavMeshOverlaySeconds = 5f;
+
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
@@ -213,6 +237,17 @@ namespace BetterBannerlordNavmeshing
         // Last status text already pushed to the script panel, so the tick only
         // touches the engine when the line actually changed.
         private string _pushedStatus = "";
+
+        // Viewport overlay state. Main thread only (driven from OnEditorTick).
+        private const int OverlayIntervalMs = 200;      // ~5 Hz: a few draws a second
+        private const float OverlayDrawLifetime = 0.6f; // seconds, > the interval, so
+                                                        // consecutive draws overlap and
+                                                        // the line never flickers
+        private long _nextOverlayMs;
+        private long _overlayHoldUntilMs;
+        private string _latchedStatus = "";
+        private bool _overlayHintLogged;
+        private uint _overlayColour = OverlayWhite;
 
         // Carries one async v2 build from the dispatch on the main thread to the worker and back.
         // Plain data only: the worker never touches Scene/game objects (only the terrain height
@@ -277,8 +312,9 @@ namespace BetterBannerlordNavmeshing
             NavMeshVisibleLog.Pump();
 
             // Then mirror the line that just went out into this component's own
-            // script-panel row.
+            // script-panel row, and draw it in the viewport.
             PushBuildStatusToPanel();
+            DrawStatusOverlay();
         }
 
         // Mirrors NavMeshVisibleLog.StatusText into NavMeshBuildStatus and asks the
@@ -317,6 +353,95 @@ namespace BetterBannerlordNavmeshing
                 // still carries NavMeshBuildStatus.
                 _pushedStatus = NavMeshBuildStatus;
             }
+        }
+
+        // Draws the same status line as floating text in the editor viewport, using the
+        // engine's own debug-text overlay:
+        //   MBDebug.RenderText(float screenX, float screenY, string text, uint color, float time)
+        //     -> TaleWorlds.Engine.IScriptComponent.RenderDebugText -> engine method
+        //        "render_debug_text"
+        // RenderText (not RenderDebugText) on purpose: RenderDebugText is
+        // [Conditional("_RGL_KEEP_ASSERTS")] and would be compiled out of an assembly
+        // that does not define that symbol; RenderText is unconditional.
+        //
+        // Rules, so the viewport is never cluttered:
+        //   * nothing is drawn while there is no run (status == IdleStatus);
+        //   * while a run is live the line tracks the status, redrawn every
+        //     OverlayIntervalMs (~5 Hz) - never per frame;
+        //   * a DONE / import-skipped / FAILED line lingers for NavMeshOverlaySeconds,
+        //     then the overlay goes away completely.
+        // Main thread only (called from OnEditorTick); never throws.
+        private void DrawStatusOverlay()
+        {
+            if (!NavMeshOverlayText)
+                return;
+
+            long now = NowMs();
+            string status = NavMeshVisibleLog.StatusText;
+            bool live = !string.Equals(status, NavMeshVisibleLog.IdleStatus, StringComparison.Ordinal);
+
+            if (live)
+            {
+                _latchedStatus = status;
+                _overlayColour = ColourFor(status);
+                _overlayHoldUntilMs = now + (long)(NavMeshOverlaySeconds * 1000.0);
+            }
+            else if (now >= _overlayHoldUntilMs)
+            {
+                // Run over and the linger window has passed: draw nothing at all.
+                _latchedStatus = "";
+                return;
+            }
+
+            if (now < _nextOverlayMs)
+                return;
+
+            _nextOverlayMs = now + OverlayIntervalMs;
+
+            try
+            {
+                if (!_overlayHintLogged)
+                {
+                    _overlayHintLogged = true;
+                    // The engine has no managed setter for show_debug_text (IConfig
+                    // .SetRGLConfig takes an opaque numeric id that no TaleWorlds.*
+                    // assembly maps to it), so the option has to be enabled in the ini
+                    // before start-up. Say so once in the engine log rather than
+                    // leaving the user staring at an empty viewport. This does NOT touch
+                    // NavMeshLog, which stays byte-identical.
+                    TaleWorlds.Library.Debug.Print(
+                        "NavMesh: viewport overlay on, but the engine draws debug text only"
+                        + " with `show_debug_text = 1` in Modules\\Native\\engine_module.ini"
+                        + " (needs an editor restart). The NavMeshBuildStatus row in the"
+                        + " script panel is the reliable fallback.");
+                }
+
+                MBDebug.RenderText(NavMeshOverlayX, NavMeshOverlayY, _latchedStatus,
+                    _overlayColour, OverlayDrawLifetime);
+            }
+            catch (Exception)
+            {
+                // Debug text can be unavailable (no debug renderer, stripped engine).
+                // Never let it break the editor tick, and stop retrying every tick.
+                NavMeshOverlayText = false;
+            }
+        }
+
+        // Terminal lines are tinted from the same prefix constants NavMeshVisibleLog
+        // builds them from, so the wording has a single source.
+        private static uint ColourFor(string status)
+        {
+            if (status.StartsWith(NavMeshVisibleLog.FailPrefix, StringComparison.Ordinal))
+                return OverlayRed;
+            if (status.StartsWith(NavMeshVisibleLog.SkipPrefix, StringComparison.Ordinal))
+                return OverlayYellow;
+            return OverlayWhite;
+        }
+
+        private static long NowMs()
+        {
+            return System.Diagnostics.Stopwatch.GetTimestamp()
+                * 1000L / System.Diagnostics.Stopwatch.Frequency;
         }
 
         protected override void OnEditorVariableChanged(string variableName)

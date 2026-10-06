@@ -65,8 +65,20 @@ namespace BetterBannerlordNavmeshing
         // Every line carries this; StatusText hands out the same wording without it.
         private const string Prefix = "NavMesh: ";
 
-        // Resting value of the editor script-panel status row between runs.
-        public const string IdleStatus = "idle";
+        // Terminal-line markers, shared so nothing has to re-type them. The viewport
+        // overlay tints on these (see SceneNavMeshExporter), so the wording stays in
+        // exactly one place.
+        public const string FailPrefix = "FAILED: ";
+        public const string SkipPrefix = "import skipped: ";
+
+        // Resting value of the editor script-panel status row between runs. It also
+        // carries the one prerequisite the mod cannot satisfy for you, because the
+        // engine has no managed setter for it (IConfig.SetRGLConfig takes an opaque
+        // numeric id and no TaleWorlds.* assembly names show_debug_text): the
+        // viewport overlay below only draws when the engine ini option
+        // show_debug_text is on. The panel row itself needs nothing.
+        public const string IdleStatus =
+            "idle (viewport overlay needs show_debug_text = 1 in Modules\\Native\\engine_module.ini)";
 
         // Player budget: at most one progress message every 20 s, at most 2 per run
         // (plus the start and the finish, which always get through - those are the
@@ -232,7 +244,7 @@ namespace BetterBannerlordNavmeshing
         // The last line of a failed run, with the reason. Always printed.
         public static void Fail(string reason)
         {
-            Emit("FAILED: " + Flatten(reason), true);
+            Emit(FailPrefix + Flatten(reason), true);
         }
 
         // A closing line that is NOT a failure: the run produced everything it
@@ -245,7 +257,7 @@ namespace BetterBannerlordNavmeshing
         // out as an ordinary line, so it must never be read as an error.
         public static void Skip(string reason)
         {
-            Emit("import skipped: " + Flatten(reason), true);
+            Emit(SkipPrefix + Flatten(reason), true);
         }
 
         // Editor tick hook: prints whatever the background build queued. A no-op

@@ -299,6 +299,7 @@ Controls (Scene NavMesh Exporter fields):
 | `NavMeshWriteLogFile` | `true` | Write the session log file (every line is also mirrored to the console). |
 | `NavMeshLogFolder` | `""` | Log folder override. Empty = the default path above. |
 | `NavMeshConsoleMessages` | `true` | The log file above stays exactly as verbose as it always was; this additionally mirrors a throttled selection of it to the editor console / the player (see *Console progress*). |
+| `NavMeshOverlayText` | `false` | Also draw the status line as floating text in the editor viewport. Needs `show_debug_text = 1` in the engine ini - see *Viewport overlay*. |
 
 The log contains the scene and machine name, timings, all sampler validation lines, the mesher stats and the
 import result - safe to attach to a bug report.
@@ -396,6 +397,10 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
 | `NavMeshAsyncBuild` | `true` | Run the v2 voxel build on a background thread so the editor UI stays alive during long builds. Applies only when `NavMeshUseVoxelCore` is on; the v1 mesher is always synchronous. See *Async build & performance instrumentation*. |
 | `NavMeshConsoleMessages` | `true` | Mirror the important run lines (start / stage / progress / finish-or-failure) to the editor console, and in game to the player. The log file is unaffected. See *Console progress*. |
+| `NavMeshOverlayText` | `false` | Draw the same status line as floating text in the editor viewport (`MBDebug.RenderText`). Off by default because the engine gates debug text on an ini option; see *Viewport overlay*. |
+| `NavMeshOverlayX` | `0` | Overlay text position, engine screen coordinates. `(0, 0)` is top-left whether the engine reads them as pixels or as fractions. Nudge here if the text lands off-screen - no rebuild needed. |
+| `NavMeshOverlayY` | `0` | Overlay text vertical position; same units and same reasoning as `NavMeshOverlayX`. |
+| `NavMeshOverlaySeconds` | `5` | How long the final `DONE:` / `import skipped:` / `FAILED:` line lingers in the viewport before the overlay clears itself. |
 | `NavMeshWriteLogFile` | `true` | Write the per-session log file (see Logs). |
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
@@ -502,11 +507,74 @@ while that option is on. With it off, an editor-side build starts and then goes 
 progress, no `DONE:` - which looks exactly like the console being broken. **Tick Script Components before
 judging any of this.** The log *file* is unaffected and is the authority either way.
 
-**`NavMeshBuildStatus` - a status indicator, not a setting.** The editor's script-variables panel can show the
-current build stage (`collecting assets -> building tiles -> ... -> importing`, then `done` / `failed`). It is a
-read-only **indicator**: there is no value to configure, it takes no part in the build, and switching it off (or
-deleting the variable) changes nothing about the output - it only removes the panel's live readout. `NavMeshLog`
-owns it; the build stage feeds it from the same lines the console mirroring uses.
+**`NavMeshBuildStatus` - a status indicator, not a setting, and the reliable fallback.** The editor's
+script-variables panel shows the current build stage (`collecting assets -> building tiles -> ... ->
+importing`, then `DONE:` / `import skipped:` / `FAILED:`). It is a read-only **indicator**: there is no
+value to configure, it takes no part in the build, and switching it off (or deleting the variable)
+changes nothing about the output - it only removes the panel's live readout. `NavMeshLog` owns it; the
+build stage feeds it from the same lines the console mirroring uses, so the wording cannot drift.
+
+It is the **reliable** of the two live readouts, and "reliable" has a precise meaning: the value is the
+component's own field, so the row is *correct whenever the panel is built or reselected*, with no engine
+cooperation needed. The module additionally asks the engine to repaint the row every editor tick
+(`ManagedScriptComponent.SetVariableEditorWidgetValue`, engine method `set_variable_editor_widget_value`),
+which is what makes it animate - but that half is best effort. If the row ever looks stale, click the
+entity again (or reopen the panel) and it is correct. `NavMeshLog` remains the authority either way.
+
+Between runs the row reads
+`idle (viewport overlay needs show_debug_text = 1 in Modules\Native\engine_module.ini)` - that string is
+the module telling you the one prerequisite it cannot satisfy for you (see next).
+
+### Viewport overlay (`NavMeshOverlayText`, off by default)
+
+The same status line can also be drawn as floating text over the editor viewport, via the engine's own
+debug-text renderer:
+
+```
+TaleWorlds.Engine.MBDebug.RenderText(float screenX, float screenY, string text, uint color = 0xFFFFFFFF, float time = 0f)
+  -> TaleWorlds.Engine.IScriptComponent.RenderDebugText  [engine method "render_debug_text"]
+```
+
+`RenderText` is used rather than its `[Conditional("_RGL_KEEP_ASSERTS")]` twin `RenderDebugText` on
+purpose: `RenderText` is unconditional, so the call cannot be compiled out of this assembly.
+
+**Prerequisite: `show_debug_text = 1`.** The engine draws debug text only when that option is on, and it
+is **not** in the shipped `Modules\Native\engine_module.ini`, so it is off by default. Add this line to
+that file and restart the editor:
+
+```ini
+show_debug_text = 1
+```
+
+**The engine exposes no way for a mod to turn it on at runtime.** `TaleWorlds.Engine.IConfig` has
+`SetRGLConfig(int type, float value)` / `GetRGLConfig(int type)`, but `type` is an opaque native id and
+no `TaleWorlds.*` assembly maps an id to `show_debug_text` (dnSpy over every loaded assembly: the only
+nearby name is `EngineRenderDisplayMode.ShowDebugTexture`, which is unrelated). The option is also read
+once at start-up (`rglConfig.h` guards access with `get_read_flag() == 1`). So it is an ini edit plus a
+restart, and the module says so in three places rather than leaving you staring at an empty viewport: in
+the panel row's idle text, in one line written to the engine log the first time the overlay draws, and
+here.
+
+**Behaviour, so the viewport is never cluttered:**
+
+- **Nothing is drawn while there is no run.** The draw is skipped entirely once the status is back to
+  `idle` and the linger window has expired.
+- While a run is live the line tracks the status, **redrawn every 200 ms (~5 Hz)** - never per frame.
+- A `DONE:` / `import skipped:` / `FAILED:` line **lingers for `NavMeshOverlaySeconds` (5 s)** and then
+  the overlay clears itself.
+- Terminal lines are tinted from the same prefix constants the text is built from: red for `FAILED:`,
+  yellow for `import skipped:`, white otherwise.
+- `NavMeshOverlayX` / `NavMeshOverlayY` place it. `(0, 0)` is top-left whether the engine treats the
+  coordinates as pixels or as fractions, which is why that is the default; if your build puts the text
+  somewhere else, nudge those two fields in the panel - no rebuild needed.
+- Drawn from `OnEditorTick`, so it is **main thread only**, and it is fed by the same pending/`Pump()`
+  path as everything else: the worker thread never touches it.
+- If the engine has no debug renderer (or throws), the module turns the overlay back off rather than
+  retrying every tick.
+
+**`NavMeshOverlayText` does not work in a mission.** It is driven from `OnEditorTick`, which only runs in
+the editor. In game the feedback channels are `InformationManager.DisplayMessage` (player messages) and
+the log file.
 
 **Async (`NavMeshAsyncBuild = true`, default) - the editor stays responsive:**
 
