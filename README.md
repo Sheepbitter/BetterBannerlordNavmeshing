@@ -105,7 +105,7 @@ the **next** tick, so the input call never blocks. It runs the same pipeline on 
 
 - `bool scene.HasTerrainHeightmap` - a scene has terrain.
 - `void scene.GetTerrainData(out Vec2i nodeDimension, out float nodeSize, out int layerCount, out int layerVersion)`
-  ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ extent `xMeters = nodeSize * nodeDimension.Item1`, `yMeters = nodeSize * nodeDimension.Item2`.
+  ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ extent `xMeters = nodeSize * nodeDimension.Item1`, `yMeters = nodeSize * nodeDimension.Item2`.
 - `void scene.GetTerrainNodeData(int xIndex, int yIndex, out int vertexCountAlongAxis, out float quadLength, out float minHeight, out float maxHeight)`
   - one terrain node's per-axis vertex count, vertex spacing and height range.
 - `float[] scene.GetTerrainHeightData(int nodeXIndex, int nodeYIndex)` - that node's full vertex grid in one native call.
@@ -239,7 +239,7 @@ NavMesh: folder:   cross-check: Scene.GetModulePath() said 'D:\...\Modules\Dedic
 NavMesh: folder: module containing the scene: D:\...\Modules\MyMaps
 ```
 
-Evidence and the native record: `NavMeshPrefabIndex.md` §3.6 and §5.7.
+Evidence and the native record: `NavMeshPrefabIndex.md` Â§3.6 and Â§5.7.
 
 The `prefab index:` block is the mirror of the engine's own index (see
 `NavMeshPrefabIndex.md`). Read it before anything else when an import misbehaves:
@@ -400,8 +400,8 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshLogFolder` | `""` | Log folder override; empty = the default Documents path. |
 
 Mesher cost (v1 path, measured on 3584x3584 m terrain at stride 1, coarsest 16, slope 65, Release, seed 12345): at
-`MaxErrorMeters = 0.25` ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
-`2.0` ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  411 k faces / 35 MB / ~0.5 s; at `4.0` ÃƒÂ¢Ã¢â‚¬Â°Ã‹â€  121 k faces / 10 MB / ~0.3 s.
+`MaxErrorMeters = 0.25` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  1.60 M faces / 136 MB / ~2.1 s (mesher ~150 ms, serialization dominates); at
+`2.0` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  411 k faces / 35 MB / ~0.5 s; at `4.0` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€¹Ã¢â‚¬Â  121 k faces / 10 MB / ~0.3 s.
 
 ## Voxel core (experimental)
 
@@ -477,10 +477,36 @@ Determinism is untouched: the progress counter/logging is observational only, an
 A v2 build is 3 s - 5 min of work, and until the prefab appears (or an error does) the editor gave no
 sign of life at all: the log file was the only witness, and `Console.WriteLine` is invisible there. The
 important run lines are therefore mirrored to the **editor console** through `TaleWorlds.Library.Debug.Print`
-(the console's own channel; `Console.WriteLine` stays as the fallback), and in game to the player through
-`InformationManager.DisplayMessage` - all of it from one helper (`NavMeshVisibleLog`) and gated by
-`NavMeshConsoleMessages`. **The verbose log FILE is unchanged**: every line still goes there, in the same
-order, with the same text; the console only ever gets a throttled selection of it.
+and in game to the player through `InformationManager.DisplayMessage` - all of it from one helper
+(`NavMeshVisibleLog`) and gated by `NavMeshConsoleMessages`. **The verbose log FILE is unchanged**: every line
+still goes there, in the same order, with the same text; the console only ever gets a throttled selection of it.
+
+**What "the editor console" actually is, settled by measurement (V3.54).** Four findings, so the behaviour below
+is not a guess:
+
+- **The `EditorConsole` dock is a native scene-error list, not our log channel.** It is a fixed 32-entry ring of
+  the editor's own scene errors. Nothing this module prints can appear there, and expecting it to is the single
+  most common reason "the console is empty" - it is empty because we never write to it.
+- **The tabbed `QTextEdit` console has no emitter in the binary.** There is no code path in the shipped editor
+  that appends to it, and it is **off by default**, so it cannot be used as a feedback channel either way.
+- **The engine's prefab line is a generic `rgl` printf.** The one line the engine itself contributes when a
+  prefab is written is a bare `rgl` format string, with no stage and no scene name - useful only as proof the
+  write happened.
+- **`NavMeshConsoleMessages` is therefore best-effort mirroring, not delivery.** It sends a *throttled selection*
+  of the run's own lines through `TaleWorlds.Library.Debug.Print`, which lands in the editor's **Output/log**
+  view, and `InformationManager.DisplayMessage` in game. It is not a channel the editor guarantees to display,
+  and it is off with one setting.
+
+**Prerequisite for live editor feedback: tick "Tick Script Components".** The editor only ticks script components
+while that option is on. With it off, an editor-side build starts and then goes silent - no stage lines, no
+progress, no `DONE:` - which looks exactly like the console being broken. **Tick Script Components before
+judging any of this.** The log *file* is unaffected and is the authority either way.
+
+**`NavMeshBuildStatus` - a status indicator, not a setting.** The editor's script-variables panel can show the
+current build stage (`collecting assets -> building tiles -> ... -> importing`, then `done` / `failed`). It is a
+read-only **indicator**: there is no value to configure, it takes no part in the build, and switching it off (or
+deleting the variable) changes nothing about the output - it only removes the panel's live readout. `NavMeshLog`
+owns it; the build stage feeds it from the same lines the console mirroring uses.
 
 **Async (`NavMeshAsyncBuild = true`, default) - the editor stays responsive:**
 
@@ -820,7 +846,7 @@ covered by no triangle at all (a box's vertical faces project to a degenerate se
 the block was seen by nothing. The probe now:
 
 1. samples the stitch line at `StitchProbeSpacingMeters` = **0.1 m** (never coarser),
-2. also samples 4 parallel lines **±0.1 / ±0.2 m** perpendicular (`StitchProbeOffsets`), i.e. across the width of
+2. also samples 4 parallel lines **Â±0.1 / Â±0.2 m** perpendicular (`StitchProbeOffsets`), i.e. across the width of
    the stitch quad, where a thin obstacle under the bridge would hide,
 3. and for each 0.1 m sub-segment additionally refuses when a triangle that spans the envelope is **crossed** by
    it (`SegSegCross2`, proper interior crossings; mere touches are left to the inclusive point tests).
@@ -1340,30 +1366,72 @@ final weld merge them back. They did merge - through the **sliver cleanup**, whi
 its invariants. Reusing the originals keeps every added edge in the index space the guards were written in, adds no
 vertex, and keeps the pass's "0 vertices added" claim true.
 
-Measured: **CC_20 71 voids, Birtu 80, Basamu 110** bridged (widest 1.5 m, worst step 0.6 m = the climb);
-`maxEdgeMult=2`, `inverted=0`, `vertical=0`, `badQuadWalks=0`, invariants **PASS** on all three; **islands CC_20 15,
-Birtu 5, Basamu 1**, all unchanged; `selfOverlap` CC_20 **1** (unchanged) and Birtu **0**. `--dumpnear
-1130.5,990.9,9` before/after shows the new triangles inside the former bare band.
+**V3.55: the footprint, and the pass moved to last.** The seam does not close the void immediately east of the
+CC_20 gate's plate - the spot the user circled - and the reason is now measured rather than inferred. `--soup
+1133.0,990.8,1134.2,991.6,83,88` returns **8 triangles, every one of them VERTICAL**, all in the 85 m band:
+`collider_r` / `extra_collider_r` end faces at x = 1133.28 and x = 1133.37 spanning y = 84.97-85.11. **There is
+no up-facing collision at all inside the gate's east lip.** The prop's own floor ends there. What follows is a
+step, not a gap: the plate's tip sits at 85.30 and the terrain under the lip at ~84.2, so an agent stepping off
+the threshold drops **1.1 m** - more than one 0.6 m climb.
+
+So this round adds the third stage, **the footprint growth**: the plate polygon is grown back toward its own
+source collision, outward across a plate boundary edge, one voxel cell at a time, at the plate's fitted height,
+and only where the **raw soup** says the prop's floor is still there:
+
+| guard | what happens without it |
+|---|---|
+| **FLOOR** - an up-facing soup surface at the cell, at or below the plate's **pre-blend level** `h` plus `ch + climb` | the plate grows into thin air. Anchoring the search to the *fitted plane* instead excluded the prop's own floor and refused every cell: measured **0 strips**. The blend lowers the plate by up to a climb *plus* its tilt, so at the gate the plane is 85.5 while the slab top is still 86.3 |
+| **the soup is not in mesh space** - every mesh height is `bminY + gy*ch + HeightOffsetMeters` above the soup height it came from (measured: plate `h=86.300`, soup floor `85.800`, exactly the 0.5 m setting) | every floor query missed by 0.5 m and nothing grew |
+| **CLEARANCE** - no soup triangle covering the cell between that floor and `walkableHeight` above it | the plate grows under the gate's own wall. Recast's own clearance rule, asked of the soup instead of trusting a filter that already ran before the plate was known |
+| **BARE** - the built mesh does not already cover the cell within one climb of the plane | the plate paints over the neighbour it was meant to meet |
+| outward direction from the **face's own winding**, `(-ez, ex)/len` | a bbox guess is fragile: on a concave plate a point just outside an edge is still inside the bbox, and the guess sent the growth **into the gatehouse** |
+| the ring's slope measured **across** the strip, `abs(plane(mid+n*cs) - plane(mid)) <= cs*tan(MaxSlopeDegrees)` | measuring height **along** the edge instead refuses every long edge: `0.36 m` over a 1.58 m edge against a `0.30 m` bound - the plate's own 13 deg tilt, already inside the cap and legal on the plate |
+| every sample along the edge, at the cell size, claims its cell | three fixed points let two edges growing from a shared corner both grow into it: **4 self-overlapping pairs on Basamu, 1 on Birtu** |
+| growth stops at the first failing cell, and at `GatePlateGrowMaxMeters` (1.0 m) | - |
+
+**And the whole pass moved to be the LAST stage that touches geometry** (after the sliver cleanup and the
+face-quality repair). That placement is load bearing, not cosmetic. Placed earlier - as V3.53 had it, right after
+`RepairNonManifold` - the cleanup ate what it added: 266 grown + 100 seam triangles went in and **44 came out**,
+the plate's own east tip face went with them, and the CC_20 gate went from "covered to x = 1132.75" back to
+"bare at x = 1132.75". A synthesized strip is by definition a fresh thin triangle and the cleanup exists to
+delete exactly those. Nothing that can remove a face may run after this point. Two consequences, both measured:
+(1) a strip that is wrong now stays wrong, so the strip tests are correspondingly strict; (2) the pass only ever
+**appends** faces and vertices, so every index below the pre-pass face count is untouched and the `quadPairs`
+remapped just above stay valid. The rotation is unaffected by the move - it caps the tilt at `MaxSlopeDegrees`
+and `RepairSteepFaces` only ever dropped faces past 60 deg and taller than 1.4 m, so a rotated plate was never one
+of its candidates.
+
+**Tightening `selfOverlap` back to zero (Basamu 11 -> 0).** The seam's four fixed sample points are replaced by a
+*complete* non-overlap proof, which for a simple quad against a triangle is three tests: no foreign vertex
+strictly inside the quad, no foreign edge properly crossing one of the quad's four boundary edges, and neither of
+the two triangle centroids already covered. A shared endpoint or a mere touch deliberately does **not** count -
+the strip is *supposed* to share its ends with the two faces it welds to. A full cell-size lattice over the
+footprint also found every overlap but rejected 70 of CC_20's 71 legitimate seams, because a face continuing
+right up to one of the strip's own welded edges is exactly what a seam is for. Measured after the change:
+`selfOverlap` CC_20 **1** (baseline), Birtu **0**, Basamu **0**.
+
+**Measured (V3.55).** Footprint **CC_20 24 edges / 58 triangles, Birtu 22 / 52, Basamu 10 / 38** (widest 1.0 m);
+seams **CC_20 5, Birtu 4, Basamu 14**; `maxEdgeMult=2`, `inverted=0`, `vertical=0`, `badQuadWalks=0`, invariants
+**PASS** on all three; **islands CC_20 15, Birtu 5, Basamu 1**; `selfOverlap` **1 / 0 / 0**.
 
 **Bars.** Suite verdicts **110/110 byte-identical** to the stored baseline (every test PASS, the documented
-`detailFaces>=fanFaces False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS); no plate is blended and no seam is
-emitted anywhere in the suite, so the suite is untouched by construction. Birtu `ladders total=2`
-(`civilian_ladder_5m` at 302.60/314.95, `civilian_ladder_6m` at 300.08/279.32), both probe points on island 1.
-`NavMeshVoxelGatePlateBlend=false` emits no `gate plates:` and no `gate plate seams:` line at all, i.e. the
-pre-pass output byte for byte. Both variants build 0 warnings / 0 errors, deployed.
+`detailFaces>=fanFaces False`, **LADDER-CAP the one FAIL**, DETERMINISM PASS); no plate is blended and no seam or
+growth is emitted anywhere in the suite, so the suite is untouched by construction. Birtu `ladders total=2`
+(`civilian_ladder_5m` at 302.60/314.95, `civilian_ladder_6m` at 300.08/279.32). `NavMeshVoxelGatePlateBlend=false`
+emits no `gate plates:`, `gate plate footprint:` or `gate plate seams:` line at all and returns
+`V=144036 F=241424 E=386905 quads=1852` on CC_20, i.e. the pre-pass output byte for byte. Both variants build
+0 warnings / 0 errors, deployed.
 
-**Honest residual - the important one.** The seam does **not** close the specific void immediately east of the
-CC_20 gate's plate, and that is the spot the user circled. Its west side is the plate's **degree-1** east tip: a
-single vertex with no boundary edge facing the gap, so an edge-to-edge seam has nothing to weld to there, and the
-far side is bounded by *interior* terrain edges. `--walk` still reports the gate `WALKABLE` end to end (foot ->
-through -> far side, every step `dy=0.000`, widest footprint gap `0.000`) with the blend both on and off, because
-the mesh crosses the passage at `z ~ 989` where it is continuous - so the passage line the user walks *is*
-connected, and `(1133, 991)` stays bare in both builds. Closing it needs the plate's **footprint to grow** across
-the beam's own collision edge (the beam's colliders reach x = 1133.465 while the plate's built faces stop at
-x = 1133.0, because erosion eats one cell and the contour simplifier another), and that is a coverage change, not
-a seam - it needs its own design that can prove the island count the way the guards above do. Basamu's 11 new
-`selfOverlap` pairs (from 0) are the same class: strips that clear all four sample points and still graze a
-neighbour. Both are follow-ups, not something this round can claim.
+**Honest residual - the important one, unchanged in substance.** The footprint growth does extend the gate's plate
+one 0.25 m cell east (x = 1132.75 -> 1133.2 at z ~ 991.3) and then **correctly stops**, because the prop's own
+floor ends at x = 1133.37 with nothing horizontal beyond it. `--walk` still reports `(1133, 991)` as
+`NO MESH AT ALL [VOID]`, and the ground under the lip is 1.1 m below the plate. **That is not a gap in the navmesh;
+it is a step down a threshold lip, and the hole is arguably the right answer.** The next shape, if that crossing is
+wanted, is therefore not another plate change: it is a **synthesized stair or ramp down the lip** from the plate's
+east edge to the terrain (1.1 m over the 0.85 m of lip = 52 deg against a 50 deg cap, so two flights or a slightly
+longer run), or a decision that a 1.1 m drop off a gate threshold is not agent-traversable and the hole stays.
+Either way it is a *ramp* decision, not a plate decision.
+
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 
@@ -1740,7 +1808,7 @@ through. Decompiled evidence (dnSpy, 1.4.8 assemblies):
   **no** hole parameter and **no** hole array. A full dump of `Scene`'s terrain methods shows no hole/carve/
   mask/enumeration API at all (only `GetTerrain*`, `SetLandscapeRainMaskData`, `HasTerrainHeightmap`,
   `ContainsTerrain`, terrain raycasts).
-- ÃƒÂ¢Ã¢â‚¬Â¡Ã¢â‚¬â„¢ Terrain holes are **not enumerable and not representable in the bulk node arrays**; the only observable
+- ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¡ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Terrain holes are **not enumerable and not representable in the bulk node arrays**; the only observable
   signal is a per-point disagreement between the stored height and the hole-aware query.
 
 So the fix is: audit the sampled vertices against the hole-aware point query and **drop the terrain cells that
