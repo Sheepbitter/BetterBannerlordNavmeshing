@@ -1,7 +1,9 @@
 using System;
 using System.Globalization;
+using System.Linq;
 using TaleWorlds.Engine;
 using TaleWorlds.Library;
+using TaleWorlds.MountAndBlade;
 
 namespace BetterBannerlordNavmeshing
 {
@@ -279,6 +281,7 @@ namespace BetterBannerlordNavmeshing
             public bool[] AssetForceWalkable;
             public bool[] AssetLedgeExempt;
             public bool[] TerrainHoleMask;
+            public TiledNavMeshBuilder.BorderPolygon Border;
             public VoxelNavMeshGenerator.SoupCapture SoupCapture;
             public long AssetsMs;
             public int FacesBefore;
@@ -684,6 +687,18 @@ namespace BetterBannerlordNavmeshing
                 td.Spacing = grid.Spacing;
                 td.Stride = NavMeshSampleStride;
                 td.Heights = grid.Heights;
+                // Border polygon, written next to the heights so the harness can replay the clamp
+                // offline. Same read the export uses, so the dump and the build cannot disagree.
+                int snapSoftProbes, snapHardProbes;
+                TiledNavMeshBuilder.BorderPolygon snapBorder =
+                    ReadBorderPolygon(scene, log, out snapSoftProbes, out snapHardProbes);
+                if (snapBorder != null)
+                {
+                    td.BorderXy = snapBorder.ToArray();
+                    td.BorderSource = snapBorder.Source;
+                }
+                td.BorderSoftProbes = snapSoftProbes;
+                td.BorderHardProbes = snapHardProbes;
                 string terrainPath = System.IO.Path.Combine(folder, prefabName + "_snapshot_terrain.bin");
                 SceneSnapshot.WriteTerrainBin(terrainPath, td);
 
@@ -744,6 +759,15 @@ namespace BetterBannerlordNavmeshing
                 sb.AppendLine("grid: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m stride=" + NavMeshSampleStride + " fallback=" + grid.UsedPointFallback
                     + " heights=" + grid.Heights.Length);
+                sb.AppendLine("border: source=" + TiledNavMeshBuilder.BorderPolygon.SourceName(
+                        snapBorder != null ? snapBorder.Source : TiledNavMeshBuilder.BorderPolygon.SourceNone)
+                    + " vertices=" + (snapBorder != null ? snapBorder.VertexCount : 0)
+                    + (snapBorder != null
+                        ? " area=" + F(snapBorder.AreaM2) + "m2 min=" + F(snapBorder.MinX) + ","
+                            + F(snapBorder.MinZ) + " max=" + F(snapBorder.MaxX) + "," + F(snapBorder.MaxZ)
+                        : "")
+                    + " probes soft=" + snapSoftProbes + " hard=" + snapHardProbes
+                    + " (hard wins when >=3; the engine's default-rectangle hard count is never trusted)");
                 sb.AppendLine("assets: entities=" + records.Count + " included=" + assets.EntitiesIncluded
                     + (assets.LadderIncluded > 0 ? " laddersIncluded=" + assets.LadderIncluded : "")
                     + " tris=" + assets.TriangleCount + " cappedShapes=" + assets.ShapesCapped
@@ -824,6 +848,107 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
                 NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge,
                 NavMeshVoxelBarriers, NavMeshConsoleMessages);
+        }
+
+        // BORDER POLYGON READ (V3.59). Runs on the MAIN THREAD and is shared by the editor button, the async
+        // editor dispatch and the in-game mission logic, so both triggers get the same playable area.
+        //
+        // The scene declares its playable bounds with point entities: prefabs `border_soft` /
+        // `border_hard`, tagged `walk_area_vertex` / `walk_area_vertex_hard` (see
+        // Modules\Native\Prefabs\scene_prop_prefabs.xml). The engine convex-hulls them natively and
+        // exposes the hull through Scene.GetSoftBoundaryVertex* / GetHardBoundaryVertex*;
+        // MBSceneUtilities.GetSoftBoundaryPoints / GetHardBoundaryPoints are the managed wrappers and
+        // already return that hull, so nothing here re-derives geometry.
+        //
+        // The one trap, and the reason this is not a two-line call: the hard side is gated on the PROBE
+        // COUNT, never on Scene.GetHardBoundaryVertexCount(). On a scene with fewer than three hard probes
+        // the engine does not report "no border" - its native hard-polygon builder substitutes a
+        // four-vertex default rectangle spanning about (-0.045,-100)..(50,50) and clears a private
+        // "hard border defined" flag that managed code cannot read. Trusting the count would clamp every
+        // borderless scene (and CC_20_siege, Birtu and Basamu, which have soft probes only) to that
+        // rectangle. BannerlordSceneChecker.CheckBorders gates on the count for the same reason; the
+        // policy itself lives in TiledNavMeshBuilder.SelectBorderSource so it can be tested without a scene.
+        //
+        // `flora_bounding_rect` in scene.xscene is NOT used: it is the probes' AABB (looser than the hull -
+        // ~17% slack on CC_20) and no TaleWorlds assembly exposes it.
+        private static TiledNavMeshBuilder.BorderPolygon ReadBorderPolygon(Scene scene,
+            System.Action<string> log, out int softProbes, out int hardProbes)
+        {
+            softProbes = 0;
+            hardProbes = 0;
+            if (scene == null)
+                return null;
+            try
+            {
+                softProbes = scene.FindWeakEntitiesWithTag(MBSceneUtilities.SoftBorderVertexTag).Count();
+                hardProbes = scene.FindWeakEntitiesWithTag(MBSceneUtilities.HardBorderVertexTag).Count();
+            }
+            catch (Exception ex)
+            {
+                // A scene type that cannot answer the tag query must not fail the export: fall through to
+                // the no-border path, which is exactly the pre-V3.59 behaviour.
+                if (log != null)
+                    log("border: probe query failed (" + Flat(ex.GetType().Name) + ": "
+                        + Flat(ex.Message) + "); no border clamp this run");
+                return null;
+            }
+
+            int source = TiledNavMeshBuilder.SelectBorderSource(softProbes, hardProbes);
+            if (source == TiledNavMeshBuilder.BorderPolygon.SourceNone)
+            {
+                if (log != null)
+                    log("border: source=none probes soft=" + softProbes + " hard=" + hardProbes
+                        + " (<3 each; needs at least three to describe a border) - no clamp, build unchanged");
+                return null;
+            }
+
+            var points = new MBList<Vec2>();
+            try
+            {
+                if (source == TiledNavMeshBuilder.BorderPolygon.SourceHard)
+                    points = MBSceneUtilities.GetHardBoundaryPoints(scene);
+                else
+                    points = MBSceneUtilities.GetSoftBoundaryPoints(scene);
+            }
+            catch (Exception ex)
+            {
+                if (log != null)
+                    log("border: boundary query failed (" + Flat(ex.GetType().Name) + ": "
+                        + Flat(ex.Message) + "); no border clamp this run");
+                return null;
+            }
+            if (points == null || points.Count < 3)
+            {
+                if (log != null)
+                    log("border: engine returned " + (points == null ? 0 : points.Count)
+                        + " hull vertices for " + TiledNavMeshBuilder.BorderPolygon.SourceName(source)
+                        + " - no clamp this run");
+                return null;
+            }
+
+            var ring = new float[points.Count * 2];
+            for (int i = 0; i < points.Count; i++)
+            {
+                ring[i * 2] = points[i].x;
+                ring[i * 2 + 1] = points[i].y;
+            }
+            var poly = TiledNavMeshBuilder.BorderPolygon.FromPoints(ring, source);
+            if (poly == null)
+            {
+                if (log != null)
+                    log("border: hull from " + points.Count + " vertices encloses no area - no clamp this run");
+                return null;
+            }
+
+            if (log != null)
+                log("border: source=" + TiledNavMeshBuilder.BorderPolygon.SourceName(source)
+                    + " vertices=" + poly.VertexCount
+                    + " area=" + F(poly.AreaM2) + "m2"
+                    + " min=" + F(poly.MinX) + "," + F(poly.MinZ)
+                    + " max=" + F(poly.MaxX) + "," + F(poly.MaxZ)
+                    + " probes soft=" + softProbes + " hard=" + hardProbes
+                    + " (hard wins when >=3; the engine's default-rectangle hard count is never trusted)");
+            return poly;
         }
 
         // Shared by the editor button and the in-game mission logic. Every message
@@ -960,6 +1085,13 @@ namespace BetterBannerlordNavmeshing
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
                 NavMeshVisibleLog.Stage("collecting assets");
 
+                // The playable area, read on the MAIN THREAD before anything is handed to a worker.
+                // A null polygon makes every border stage a structural no-op, so a scene with no (or
+                // fewer than three) probes builds exactly what it built before V3.59.
+                int borderSoftProbes, borderHardProbes;
+                TiledNavMeshBuilder.BorderPolygon border =
+                    ReadBorderPolygon(scene, log, out borderSoftProbes, out borderHardProbes);
+
                 TerrainNavMeshGenerator.ExportResult result;
                 long assetsMs = 0;
                 if (useVoxelCore)
@@ -1012,7 +1144,7 @@ namespace BetterBannerlordNavmeshing
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
                         assetVerts, assetTris, assetForceWalkable, assetLedgeExempt, grid.HoleMask,
-                        soupCapture, RunLog(log), out voxelBuildMs);
+                        soupCapture, RunLog(log), out voxelBuildMs, border);
                     if (voxelMesh == null)
                     {
                         log("v2: mesh build aborted by the invariant gate; bin NOT written and import NOT attempted.");
@@ -1185,6 +1317,13 @@ namespace BetterBannerlordNavmeshing
                     + " liveTerrainValidation=" + (grid.UsedPointFallback ? "point-sampled" : "bulk+cross-checked"));
                 NavMeshVisibleLog.Stage("collecting assets");
 
+                // The playable area, read on the MAIN THREAD before anything is handed to a worker.
+                // A null polygon makes every border stage a structural no-op, so a scene with no (or
+                // fewer than three) probes builds exactly what it built before V3.59.
+                int borderSoftProbes, borderHardProbes;
+                TiledNavMeshBuilder.BorderPolygon border =
+                    ReadBorderPolygon(scene, log, out borderSoftProbes, out borderHardProbes);
+
                 // Phase 3: asset collision geometry is read on the main thread (scene access) and
                 // carried as plain arrays to the background build.
                 long assetsMs = 0;
@@ -1247,6 +1386,7 @@ namespace BetterBannerlordNavmeshing
                 req.AssetForceWalkable = assetForceWalkable;
                 req.AssetLedgeExempt = assetLedgeExempt;
                 req.TerrainHoleMask = grid.HoleMask;
+                req.Border = border;
                 req.SoupCapture = NavMeshVoxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
                 req.AssetsMs = assetsMs;
                 req.FacesBefore = facesBeforeRun;
@@ -1293,7 +1433,7 @@ namespace BetterBannerlordNavmeshing
                     req.Voxel, req.Settings.WriteObj, req.AgentClimbMeters, Environment.ProcessorCount,
                     req.AssetVertsEngineXyz, req.AssetTris, req.AssetForceWalkable,
                     req.AssetLedgeExempt, req.TerrainHoleMask,
-                    req.SoupCapture, req.Log, out buildMs);
+                    req.SoupCapture, req.Log, out buildMs, req.Border);
                 req.BuildMs = buildMs;
             }
             catch (Exception ex)

@@ -33,7 +33,8 @@ namespace BetterBannerlordNavmeshing
             float agentClimbOverrideMeters, int maxWorkers,
             float[] assetVertsEngineXyz, int[] assetTris, bool[] assetForceWalkable,
             bool[] assetLedgeExempt, bool[] terrainHoleMask, SoupCapture soupCapture,
-            System.Action<string> log, out long buildMs)
+            System.Action<string> log, out long buildMs,
+            TiledNavMeshBuilder.BorderPolygon border = null)
         {
             if (log != null)
                 log("v2: core engaged (tiled voxel). cellSize=" + F(voxelSettings.VoxelCellSizeMeters)
@@ -127,7 +128,8 @@ namespace BetterBannerlordNavmeshing
             TiledNavMeshBuilder.VoxelMeshResult vres =
                 TiledNavMeshBuilder.Build(vertsXyz, tris, voxelSettings, maxWorkers, log,
                     BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetForceWalkable),
-                    BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetLedgeExempt));
+                    BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetLedgeExempt),
+                    border);
 
             watch.Stop();
             buildMs = watch.ElapsedMilliseconds;

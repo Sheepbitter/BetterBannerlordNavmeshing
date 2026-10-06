@@ -15,12 +15,17 @@ namespace BetterBannerlordNavmeshing
     // Both files are little-endian. Formats (version 1):
     //
     //   <prefab>_snapshot_terrain.bin
-    //     int32   version   (= 1)
+    //     int32   version   (= 2; 1 = pre-V3.59, no border block)
     //     int32   width
     //     int32   height
     //     float32 spacing   (m per grid step)
     //     int32   stride    (NavMeshSampleStride used for the run)
     //     float32 heights[width * height]     exactly as SceneTerrainSampler produced them
+    //     -- version 2 only, the border block (V3.59):
+    //     int32   borderVertexCount  (0 = this scene declared no border probes)
+    //     int32   borderSource       (0 none / 1 soft / 2 hard)
+    //     float32 borderXy[2 * borderVertexCount]   CCW ring in engine XZ, as the engine's hull
+    //     int32   borderSoftProbeCount, borderHardProbeCount   (why the source was chosen)
     //
     //   <prefab>_snapshot_assets.bin
     //     int32   version   (= 1)
@@ -38,7 +43,15 @@ namespace BetterBannerlordNavmeshing
     // triangle winding reversal, and the builder's uniform height offset.
     public static class SceneSnapshot
     {
-        public const int Version = 1;
+        // TERRAIN version. 2 = the V3.59 border block; 1 = the pre-border layout.
+        public const int Version = 2;
+        // Accepted on read so a pre-V3.59 terrain snapshot (no border block) still replays - it simply
+        // reports no border, which is the structural no-op path.
+        private const int VersionNoBorder = 1;
+
+        // ASSETS version. The per-entity triangle format did NOT change in V3.59, so it stays at 1 and a
+        // v1 assets file keeps reading; bumping it would have invalidated every snapshot on disk.
+        private const int AssetsVersion = 1;
 
         public sealed class EntityRecord
         {
@@ -62,6 +75,15 @@ namespace BetterBannerlordNavmeshing
             public float Spacing;
             public int Stride;
             public float[] Heights;
+
+            // Border polygon (V3.59), exactly the ring the exporter handed the builder: the engine's
+            // native convex hull of the tagged probes, or null when the scene declared fewer than three.
+            // Carried in the terrain artefact (rather than a third file) because it is one small
+            // per-scene block the harness needs alongside the heights anyway.
+            public float[] BorderXy;
+            public int BorderSource;
+            public int BorderSoftProbes;
+            public int BorderHardProbes;
         }
 
         public static void WriteTerrainBin(string path, TerrainData t)
@@ -75,6 +97,15 @@ namespace BetterBannerlordNavmeshing
                 w.Write(t.Stride);
                 for (int i = 0; i < t.Heights.Length; i++)
                     w.Write(t.Heights[i]);
+                // Border block (V3.59).
+                int bn = (t.BorderXy != null && t.BorderSource != TiledNavMeshBuilder.BorderPolygon.SourceNone)
+                    ? t.BorderXy.Length / 2 : 0;
+                w.Write(bn);
+                w.Write(bn > 0 ? t.BorderSource : TiledNavMeshBuilder.BorderPolygon.SourceNone);
+                for (int i = 0; i < bn * 2; i++)
+                    w.Write(t.BorderXy[i]);
+                w.Write(t.BorderSoftProbes);
+                w.Write(t.BorderHardProbes);
             }
         }
 
@@ -83,8 +114,9 @@ namespace BetterBannerlordNavmeshing
             using (var r = new BinaryReader(File.OpenRead(path), Encoding.UTF8))
             {
                 int version = r.ReadInt32();
-                if (version != Version)
-                    throw new InvalidDataException("terrain snapshot version " + version + " != " + Version);
+                if (version != Version && version != VersionNoBorder)
+                    throw new InvalidDataException("terrain snapshot version " + version + " not in {"
+                        + VersionNoBorder + "," + Version + "}");
                 var t = new TerrainData();
                 t.Width = r.ReadInt32();
                 t.Height = r.ReadInt32();
@@ -95,6 +127,22 @@ namespace BetterBannerlordNavmeshing
                 t.Heights = new float[t.Width * t.Height];
                 for (int i = 0; i < t.Heights.Length; i++)
                     t.Heights[i] = r.ReadSingle();
+                if (version >= Version)
+                {
+                    int bn = r.ReadInt32();
+                    t.BorderSource = r.ReadInt32();
+                    if (bn < 0 || bn > 4096)
+                        throw new InvalidDataException("terrain snapshot border vertex count " + bn + " is absurd");
+                    if (bn > 0)
+                    {
+                        t.BorderXy = new float[bn * 2];
+                        for (int i = 0; i < t.BorderXy.Length; i++)
+                            t.BorderXy[i] = r.ReadSingle();
+                    }
+                    t.BorderSoftProbes = r.ReadInt32();
+                    t.BorderHardProbes = r.ReadInt32();
+                    if (bn == 0) t.BorderSource = TiledNavMeshBuilder.BorderPolygon.SourceNone;
+                }
                 return t;
             }
         }
@@ -103,7 +151,7 @@ namespace BetterBannerlordNavmeshing
         {
             using (var w = new BinaryWriter(File.Create(path), Encoding.UTF8))
             {
-                w.Write(Version);
+                w.Write(AssetsVersion);
                 w.Write(entities != null ? entities.Count : 0);
                 if (entities == null)
                     return;
@@ -131,8 +179,8 @@ namespace BetterBannerlordNavmeshing
             using (var r = new BinaryReader(File.OpenRead(path), Encoding.UTF8))
             {
                 int version = r.ReadInt32();
-                if (version != Version)
-                    throw new InvalidDataException("assets snapshot version " + version + " != " + Version);
+                if (version != AssetsVersion)
+                    throw new InvalidDataException("assets snapshot version " + version + " != " + AssetsVersion);
                 int count = r.ReadInt32();
                 for (int i = 0; i < count; i++)
                 {

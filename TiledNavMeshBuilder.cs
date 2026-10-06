@@ -206,6 +206,16 @@ namespace BetterBannerlordNavmeshing
                 return _map.ContainsKey(CellKey(x, z, _cs));
             }
 
+            /// The obstruction kinds recorded for a cell, or 0 when the cell is clear. Lets a refusal
+            /// be attributed to the wall that caused it (Barrier) or to the border (Border) instead of
+            /// lumping the two together in one counter.
+            public ObstructionKind KindAt(float x, float z)
+            {
+                ObstructionKind cur;
+                if (_map.TryGetValue(CellKey(x, z, _cs), out cur)) return cur;
+                return 0;
+            }
+
             /// True when ANY cell on the straight XZ run from (ax,az) to (bx,bz) is obstructed. Used by
             /// every stitch, which all work on a straight segment between two boundary vertices.
             public bool SegmentCrosses(float ax, float az, float bx, float bz)
@@ -218,6 +228,22 @@ namespace BetterBannerlordNavmeshing
                 {
                     float t = (float)i / steps;
                     if (Contains(ax + dx * t, az + dz * t)) return true;
+                }
+                return false;
+            }
+
+            /// As SegmentCrosses, but only for cells carrying the given provenance. Lets a stitch refusal
+            /// be charged to the border rather than to a barrier when both could have caused it.
+            public bool SegmentCrossesKind(float ax, float az, float bx, float bz, ObstructionKind kind)
+            {
+                float dx = bx - ax, dz = bz - az;
+                int steps = (int)Math.Ceiling(Math.Sqrt((double)(dx * dx + dz * dz)) / (_cs * 0.5f));
+                if (steps < 1) steps = 1;
+                if (steps > 4096) steps = 4096;
+                for (int i = 0; i <= steps; i++)
+                {
+                    float t = (float)i / steps;
+                    if ((KindAt(ax + dx * t, az + dz * t) & kind) != 0) return true;
                 }
                 return false;
             }
@@ -331,6 +357,10 @@ namespace BetterBannerlordNavmeshing
             public int BarrierBodies, BarrierSkipped, BarrierTrisCut, BarrierCellsCut,
                 BarrierCellsReleased, BarrierCellsGated, BarrierStitchRefused, BarrierGapRefused;
 
+            // Border accounting, filled by Build (all 0 when the scene declares no border probes, which
+            // is the structural no-op path: no polygon, no lattice clamp, no soup cull, no span mask).
+            public int BorderCellsMasked, BorderCellsOutside, BorderStitchRefused, BorderGapRefused;
+
             // Contour edge length cap (voxels).
             public int MaxEdgeLenVoxels = 12;
 
@@ -417,6 +447,12 @@ namespace BetterBannerlordNavmeshing
             // tile refused because a barrier stood in the way.
             public int BarrierCellsCut, BarrierCellsReleased, BarrierCellsGated,
                 BarrierGapRefused, BarrierStitchRefused;
+
+            // Border accounting for this tile: BorderCellsOutside counts every column whose centre fell
+            // outside the polygon (including the tile's padding), BorderCellsMasked only the walkable
+            // spans that were actually nulled. The two refusal counters are the connectivity repairs this
+            // tile declined because the border stood in the way.
+            public int BorderCellsMasked, BorderCellsOutside, BorderGapRefused, BorderStitchRefused;
         }
 
         public sealed class VoxelMeshResult
@@ -455,6 +491,13 @@ namespace BetterBannerlordNavmeshing
             public int ConnectorErosionExempt;  // connector spans erosion nulled that the erosion exemption restored
             // Faces re-emitted on a fitted plane by the gate/door plate blend (NavMeshVoxelGatePlateBlend).
             public int GatePlateFaces;
+            // Border clamp effect (V3.59). BorderSource is BorderPolygon.SourceNone/Soft/Hard, 0 when the
+            // scene declares no border probes.
+            public int BorderSource, BorderVertices;
+            public float BorderAreaM2, BorderMinX, BorderMinZ, BorderMaxX, BorderMaxZ;
+            public int BorderCellsMasked, BorderCellsOutside, BorderGapRefused, BorderStitchRefused;
+            public int CulledByBorderTris;
+            public double SoupAreaM2BeforeClamp, SoupAreaM2AfterClamp;
 
             public long TilesMs;
             public long MergeMs;
@@ -726,7 +769,7 @@ namespace BetterBannerlordNavmeshing
         // keeps the input byte-for-byte identical to the pre-ramp behaviour.
         public static VoxelMeshResult Build(float[] vertsXyz, int[] tris, TiledNavMeshSettings s,
             int maxWorkers, Action<string> log, bool[] forceWalkableTriangles = null,
-            bool[] ledgeExemptTriangles = null)
+            bool[] ledgeExemptTriangles = null, BorderPolygon borderPoly = null)
         {
             if (vertsXyz == null)
                 throw new ArgumentNullException("vertsXyz");
@@ -771,18 +814,50 @@ namespace BetterBannerlordNavmeshing
                 if (z > maxZ) maxZ = z;
             }
 
+            // BORDER CLAMP (V3.59), part 1 of 3: bound the region we even consider to the playable
+            // area. On a scene whose border covers a fifth of its terrain this is the single biggest win
+            // in the build - CC_20_siege goes from a 100x100 tile grid over 2000x2000 m of heightmap to
+            // roughly 37x30 over the 583x469 m the probes declare.
+            //
+            // The clamp is an INTERSECTION with the soup AABB, never a replacement: an absent, empty or
+            // non-overlapping border therefore reproduces the unclamped numbers exactly. With border ==
+            // null, or with a border that covers the soup, every term below collapses to its pre-V3.59
+            // value and the tileOff terms are 0, which is what keeps the no-border path byte-identical.
+            float clampMinX = minX, clampMaxX = maxX, clampMinZ = minZ, clampMaxZ = maxZ;
+            bool borderClamped = false;
+            if (borderPoly != null)
+            {
+                float bx0 = Math.Max(minX, borderPoly.MinX), bx1 = Math.Min(maxX, borderPoly.MaxX);
+                float bz0 = Math.Max(minZ, borderPoly.MinZ), bz1 = Math.Min(maxZ, borderPoly.MaxZ);
+                if (bx0 <= bx1 && bz0 <= bz1)
+                {
+                    clampMinX = bx0; clampMaxX = bx1; clampMinZ = bz0; clampMaxZ = bz1;
+                    borderClamped = true;
+                }
+            }
+
             // Fixed snapped world origin on the tile lattice. Every tile boundary
             // and every emitted vertex then lies on the global lattice
             // origin + integer*cs (X/Z) / +integer*ch (Y), which is what makes
-            // cross-tile welding exact.
-            float originX = (float)(Math.Floor((double)minX / tileSpan) * tileSpan);
-            float originZ = (float)(Math.Floor((double)minZ / tileSpan) * tileSpan);
+            // cross-tile welding exact. The snap is unchanged by the clamp - only the
+            // input it is applied to moves - so the lattice is exactly as rigid as before.
+            float originX = (float)(Math.Floor((double)clampMinX / tileSpan) * tileSpan);
+            float originZ = (float)(Math.Floor((double)clampMinZ / tileSpan) * tileSpan);
             float margin = Math.Max(2f, s.AgentHeightMeters + 0.5f);
             float bminY = (float)(Math.Floor((double)(minY - margin) / ch) * ch);
             float bmaxY = (float)(Math.Ceiling((double)(maxY + margin) / ch) * ch);
 
-            int tilesX = Math.Max(1, (int)Math.Ceiling((maxX - originX) / tileSpan));
-            int tilesZ = Math.Max(1, (int)Math.Ceiling((maxZ - originZ) / tileSpan));
+            // Absolute tile index of the clamped region's first column/row, and the DENSE counts. The
+            // tile array stays densely indexed from 0 (so every existing index computation is untouched)
+            // while tileOffX/Z carry the lattice origin back into world space.
+            int absTilesX = Math.Max(1, (int)Math.Ceiling((clampMaxX - originX) / tileSpan));
+            int absTilesZ = Math.Max(1, (int)Math.Ceiling((clampMaxZ - originZ) / tileSpan));
+            int tileOffX = Math.Max(0, (int)Math.Floor((clampMinX - originX) / tileSpan));
+            int tileOffZ = Math.Max(0, (int)Math.Floor((clampMinZ - originZ) / tileSpan));
+            if (tileOffX >= absTilesX) tileOffX = absTilesX - 1;
+            if (tileOffZ >= absTilesZ) tileOffZ = absTilesZ - 1;
+            int tilesX = absTilesX - tileOffX;
+            int tilesZ = absTilesZ - tileOffZ;
             int tileCount = tilesX * tilesZ;
 
             int border = RcConfig.CalcBorder(s.AgentRadiusMeters, cs);
@@ -807,7 +882,15 @@ namespace BetterBannerlordNavmeshing
                 + "m cellsPerTile=" + cellsPerTile + " tiles=" + tilesX + "x" + tilesZ
                 + " border=" + border + " hf=" + width + "x" + height
                 + " origin=(" + F(originX) + "," + F(originZ) + ")"
+                + (tileOffX != 0 || tileOffZ != 0 ? " tileOff=" + tileOffX + "," + tileOffZ : "")
                 + " bminY=" + F(bminY) + " bmaxY=" + F(bmaxY));
+            if (borderPoly != null)
+            {
+                Log(log, "v2: border: lattice clamped to the polygon AABB=" + borderClamped
+                    + " cells=" + tilesX + "x" + tilesZ + " (" + tileCount + " tiles)"
+                    + " area=" + F((float)((clampMaxX - clampMinX) * (clampMaxZ - clampMinZ) / 1000.0))
+                    + "k m2 (soup " + F((float)((maxX - minX) * (maxZ - minZ) / 1000.0)) + "k m2)");
+            }
             Log(log, "v2: params slope=" + F(s.MaxSlopeDegrees) + "deg radius=" + F(s.AgentRadiusMeters)
                 + "m height=" + F(s.AgentHeightMeters) + "m climb=" + F(s.AgentMaxClimbMeters)
                 + "m walkable(r,h,c)=" + walkableRadius + "/" + walkableHeight + "/" + walkableClimb
@@ -852,10 +935,10 @@ namespace BetterBannerlordNavmeshing
                     float triMinZ = Math.Min(tz0, Math.Min(tz1, tz2));
                     float triMaxZ = Math.Max(tz0, Math.Max(tz1, tz2));
 
-                    int bTx0 = (int)Math.Floor((triMinX - originX - pad) / tileSpan);
-                    int bTx1 = (int)Math.Floor((triMaxX - originX + pad) / tileSpan);
-                    int bTz0 = (int)Math.Floor((triMinZ - originZ - pad) / tileSpan);
-                    int bTz1 = (int)Math.Floor((triMaxZ - originZ + pad) / tileSpan);
+                    int bTx0 = (int)Math.Floor((triMinX - originX - pad) / tileSpan) - tileOffX;
+                    int bTx1 = (int)Math.Floor((triMaxX - originX + pad) / tileSpan) - tileOffX;
+                    int bTz0 = (int)Math.Floor((triMinZ - originZ - pad) / tileSpan) - tileOffZ;
+                    int bTz1 = (int)Math.Floor((triMaxZ - originZ + pad) / tileSpan) - tileOffZ;
                     if (bTx0 < 0) bTx0 = 0;
                     if (bTz0 < 0) bTz0 = 0;
                     if (bTx1 > tilesX - 1) bTx1 = tilesX - 1;
@@ -887,6 +970,7 @@ namespace BetterBannerlordNavmeshing
             // --- bin input triangles into tiles (padded AABB overlap) ---
             var tileTris = new List<int>[tileCount];
             int culledByAabb = 0;
+            int culledByBorder = 0;
             int rasterizedTris = 0;
             for (int t = 0; t < inputTris; t++)
             {
@@ -898,10 +982,23 @@ namespace BetterBannerlordNavmeshing
                 float triMinZ = Math.Min(tz0, Math.Min(tz1, tz2));
                 float triMaxZ = Math.Max(tz0, Math.Max(tz1, tz2));
 
-                int xMin = (int)Math.Floor((triMinX - originX - pad) / tileSpan);
-                int xMax = (int)Math.Floor((triMaxX - originX + pad) / tileSpan);
-                int zMin = (int)Math.Floor((triMinZ - originZ - pad) / tileSpan);
-                int zMax = (int)Math.Floor((triMaxZ - originZ + pad) / tileSpan);
+                // BORDER CLAMP, part 2: a triangle whose AABB misses the border's AABB entirely can never
+                // contribute an in-borders cell, so it is dropped before it is binned or rasterised. This
+                // is a superset filter, not the clamp itself - a triangle straddling the border edge is
+                // kept and judged cell by cell in part 3.
+                if (borderPoly != null
+                    && (triMaxX < borderPoly.MinX || triMinX > borderPoly.MaxX
+                        || triMaxZ < borderPoly.MinZ || triMinZ > borderPoly.MaxZ))
+                {
+                    culledByBorder++;
+                    culledByAabb++;
+                    continue;
+                }
+
+                int xMin = (int)Math.Floor((triMinX - originX - pad) / tileSpan) - tileOffX;
+                int xMax = (int)Math.Floor((triMaxX - originX + pad) / tileSpan) - tileOffX;
+                int zMin = (int)Math.Floor((triMinZ - originZ - pad) / tileSpan) - tileOffZ;
+                int zMax = (int)Math.Floor((triMaxZ - originZ + pad) / tileSpan) - tileOffZ;
                 if (xMin < 0) xMin = 0;
                 if (zMin < 0) zMin = 0;
                 if (xMax > tilesX - 1) xMax = tilesX - 1;
@@ -931,6 +1028,7 @@ namespace BetterBannerlordNavmeshing
             }
 
             Log(log, "v2: tris input=" + inputTris + " culledByAabb=" + culledByAabb
+                + (borderPoly != null ? " (of which outside the borderPoly AABB=" + culledByBorder + ")" : "")
                 + " rasterized=" + rasterizedTris + " (rasterized counts per-tile border duplicates)");
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
@@ -971,15 +1069,15 @@ namespace BetterBannerlordNavmeshing
             // non-deterministic - a data race reachable only when barriers are ON, i.e. by default.
             // Tiles WITHOUT barriers never write to a set at all, so allocating per barrier tile is
             // both correct and cheap: a wall spans a handful of tiles out of thousands.
-            ObstructionCells[] tileObstructions = barrierTriCount > 0
+            ObstructionCells[] tileObstructions = (barrierTriCount > 0 || borderPoly != null)
                 ? new ObstructionCells[tileCount]
                 : null;
 
             Parallel.For(0, tileCount, parallelOptions, delegate (int index)
             {
-                int tx = index % tilesX;
-                int ty = index / tilesX;
-                ObstructionCells mine = tileBarrierTris != null && tileBarrierTris[index] != null
+                int tx = index % tilesX + tileOffX;
+                int ty = index / tilesX + tileOffZ;
+                ObstructionCells mine = (tileBarrierTris != null && tileBarrierTris[index] != null) || borderPoly != null
                     ? new ObstructionCells(s.VoxelCellSizeMeters)
                     : null;
                 if (tileObstructions != null) tileObstructions[index] = mine;
@@ -988,7 +1086,7 @@ namespace BetterBannerlordNavmeshing
                     walkableHeight, walkableClimb, walkableRadius, maxSimplificationError,
                     minRegionArea, mergeRegionArea, areaMod, forceWalkableTriangles, ledgeExemptTriangles,
                     barrierVerts, barrierTris,
-                    tileBarrierTris != null ? tileBarrierTris[index] : null, mine, index);
+                    tileBarrierTris != null ? tileBarrierTris[index] : null, mine, index, borderPoly);
 
                 if (log != null)
                 {
@@ -1012,12 +1110,13 @@ namespace BetterBannerlordNavmeshing
             tilesWatch.Stop();
 
             // --- merge the per-TILE obstruction sets into the one map the fillers consult ---
-            ObstructionCells obstructions = barrierTriCount > 0
+            ObstructionCells obstructions = (barrierTriCount > 0 || borderPoly != null)
                 ? new ObstructionCells(s.VoxelCellSizeMeters)
                 : null;
             if (obstructions != null)
             {
                 int cutCells = 0, releasedCells = 0, gated = 0, gapRefused = 0, stitchRefused = 0;
+                int borderCut = 0, borderOutside = 0, borderGapRefused = 0, borderStitchRefused = 0;
                 for (int i = 0; i < results.Length; i++)
                 {
                     VoxelTileResult r = results[i];
@@ -1027,6 +1126,10 @@ namespace BetterBannerlordNavmeshing
                     gated += r.BarrierCellsGated;
                     gapRefused += r.BarrierGapRefused;
                     stitchRefused += r.BarrierStitchRefused;
+                    borderCut += r.BorderCellsMasked;
+                    borderOutside += r.BorderCellsOutside;
+                    borderGapRefused += r.BorderGapRefused;
+                    borderStitchRefused += r.BorderStitchRefused;
                 }
                 for (int i = 0; i < tileObstructions.Length; i++)
                 {
@@ -1044,6 +1147,16 @@ namespace BetterBannerlordNavmeshing
                     + " (height rule: wall outside the navigable band), obstruction cells="
                     + obstructions.Count + " (gap-fill refused=" + gapRefused + " stitch refused="
                     + stitchRefused + ")");
+                if (borderPoly != null)
+                {
+                    s.BorderCellsMasked = borderCut;
+                    s.BorderCellsOutside = borderOutside;
+                    s.BorderGapRefused = borderGapRefused;
+                    s.BorderStitchRefused = borderStitchRefused;
+                    Log(log, "v2: border: masked spans=" + borderCut + " outside cells=" + borderOutside
+                        + " (gap-fill refused=" + borderGapRefused + " stitch refused="
+                        + borderStitchRefused + ")");
+                }
             }
 
             // --- aggregate + log failures (never silently dropped) ---
@@ -1192,14 +1305,15 @@ namespace BetterBannerlordNavmeshing
             // soup has solid geometry spanning the gap envelope (wall, closed door, low ceiling).
             if (s.StitchMaxGapCells > 0)
             {
-                int msPairs, msAdded, msRefused, msBarrierRefused;
+                int msPairs, msAdded, msRefused, msBarrierRefused, msBorderRefused;
                 MergeStitch(merged, vertsXyz, tris, inputTris, soupGrid, soupBig, soupCell,
                     s.VoxelCellSizeMeters, s.CellHeightMeters,
                     s.HeightOffsetMeters, bminY, walkableHeight, walkableClimb, s.StitchMaxGapCells,
                     barrierTriCount > 0 ? obstructions : null,
-                    out msPairs, out msAdded, out msRefused, out msBarrierRefused);
+                    out msPairs, out msAdded, out msRefused, out msBarrierRefused, out msBorderRefused);
                 Log(log, "v2: merge-stitch: pairs=" + msPairs + " added=" + msAdded + " refused=" + msRefused
                     + (msBarrierRefused > 0 ? " (of which " + msBarrierRefused + " barrier-blocked)" : "")
+                    + (msBorderRefused > 0 ? " (of which " + msBorderRefused + " border-blocked)" : "")
                     + " (cap=" + s.StitchMaxGapCells + " cells)");
             }
 
@@ -1353,7 +1467,21 @@ namespace BetterBannerlordNavmeshing
             result.Workers = workers;
             result.InputTriangles = inputTris;
             result.CulledByAabb = culledByAabb;
+            result.CulledByBorderTris = culledByBorder;
             result.RasterizedTriangles = rasterizedTris;
+            result.SoupAreaM2BeforeClamp = (double)(maxX - minX) * (maxZ - minZ);
+            result.SoupAreaM2AfterClamp = (double)(clampMaxX - clampMinX) * (clampMaxZ - clampMinZ);
+            result.BorderCellsMasked = borderPoly != null ? s.BorderCellsMasked : 0;
+            result.BorderCellsOutside = borderPoly != null ? s.BorderCellsOutside : 0;
+            result.BorderGapRefused = borderPoly != null ? s.BorderGapRefused : 0;
+            result.BorderStitchRefused = borderPoly != null ? s.BorderStitchRefused : 0;
+            result.BorderSource = borderPoly != null ? borderPoly.Source : BorderPolygon.SourceNone;
+            result.BorderVertices = borderPoly != null ? borderPoly.VertexCount : 0;
+            result.BorderAreaM2 = borderPoly != null ? borderPoly.AreaM2 : 0f;
+            result.BorderMinX = borderPoly != null ? borderPoly.MinX : 0f;
+            result.BorderMinZ = borderPoly != null ? borderPoly.MinZ : 0f;
+            result.BorderMaxX = borderPoly != null ? borderPoly.MaxX : 0f;
+            result.BorderMaxZ = borderPoly != null ? borderPoly.MaxZ : 0f;
             result.SteppedMarkedCells = aggMarkedCells;
             result.SteppedRestoredSpans = aggRestoredSpans;
             result.SteppedDroppedClearance = aggDroppedClearance;
@@ -1582,6 +1710,195 @@ namespace BetterBannerlordNavmeshing
             int ix = (int)Math.Floor(x / cs);
             int iz = (int)Math.Floor(z / cs);
             return unchecked(((long)ix << 32) | (uint)iz);
+        }
+
+        // ------------------------------------------------------------------
+        // BORDER POLYGON (V3.59)
+        //
+        // The playable area of a battle scene is declared by the engine's border probes: point entities
+        // tagged walk_area_vertex (soft) or walk_area_vertex_hard (hard). The engine convex-hulls them
+        // natively (rglConvex_polygon, monotone chain, CCW) and exposes the result through
+        // Scene.GetSoftBoundaryVertex* / GetHardBoundaryVertex*; MBSceneUtilities.GetSoftBoundaryPoints
+        // and GetHardBoundaryPoints are the managed wrappers. Hard wins: MissionHardBorderPlacer turns
+        // the hard polygon into a real invisible wall (the engine's FillEntityWithHardBorderPhysicsBarrier
+        // builds the __scene_hard_border__ mesh), so it is the tighter, physical limit, while the soft
+        // polygon only bounds spawn/deployment validity.
+        //
+        // This type is the pure, TaleWorlds-free half: the scene-facing read lives in the exporter, the
+        // snapshot round-trips the same shape, and everything downstream (lattice clamp, soup cull, span
+        // mask, obstruction cells) is a pure function of these vertices.
+        //
+        // Deliberately NOT implemented here: any hull of our own. The engine already hulls the probes, and
+        // a second hull would be a second opinion on the same data. What we do add is a winding
+        // normalisation, because the membership test below is a half-plane test that is only valid for a
+        // CCW ring - if a snapshot were ever hand-edited clockwise the whole scene would invert.
+        public sealed class BorderPolygon
+        {
+            public const int SourceNone = 0;
+            public const int SourceSoft = 1;
+            public const int SourceHard = 2;
+
+            // CCW ring in engine XZ: _xy[2i] = x, _xy[2i+1] = z.
+            private readonly float[] _xy;
+            private readonly int _n;
+
+            public readonly int Source;
+            public readonly float MinX, MinZ, MaxX, MaxZ;
+            public readonly float AreaM2;
+
+            private BorderPolygon(float[] xy, int source)
+            {
+                _xy = xy;
+                _n = xy.Length / 2;
+                Source = source;
+
+                float a = 0f;
+                float mnx = float.MaxValue, mnz = float.MaxValue, mxx = float.MinValue, mxz = float.MinValue;
+                for (int i = 0; i < _n; i++)
+                {
+                    float x = xy[i * 2], z = xy[i * 2 + 1];
+                    if (x < mnx) mnx = x;
+                    if (x > mxx) mxx = x;
+                    if (z < mnz) mnz = z;
+                    if (z > mxz) mxz = z;
+                    float jx = xy[((i + 1) % _n) * 2], jz = xy[((i + 1) % _n) * 2 + 1];
+                    a += x * jz - jx * z;
+                }
+                MinX = mnx; MinZ = mnz; MaxX = mxx; MaxZ = mxz;
+                AreaM2 = Math.Abs(a) * 0.5f;
+            }
+
+            public int VertexCount { get { return _n; } }
+
+            /// Flat CCW ring, x/z pairs - the snapshot's wire form.
+            public float[] ToArray() { return (float[])_xy.Clone(); }
+
+            /// Builds a polygon from a flat x/z ring. Returns null (no clamp, byte-identical build) for a
+            /// ring with fewer than three vertices or one that encloses nothing, so a malformed snapshot
+            /// can never invert or empty a scene.
+            public static BorderPolygon FromPoints(float[] xy, int source)
+            {
+                if (xy == null || xy.Length < 6 || xy.Length % 2 != 0) return null;
+                int n = xy.Length / 2;
+                // Signed area; flip a clockwise ring so the half-plane test below is valid.
+                float a = 0f;
+                for (int i = 0; i < n; i++)
+                {
+                    float x = xy[i * 2], z = xy[i * 2 + 1];
+                    float jx = xy[((i + 1) % n) * 2], jz = xy[((i + 1) % n) * 2 + 1];
+                    a += x * jz - jx * z;
+                }
+                if (a == 0f || float.IsNaN(a)) return null;
+                if (a < 0f)
+                {
+                    var flipped = new float[xy.Length];
+                    for (int i = 0; i < n; i++)
+                    {
+                        flipped[i * 2] = xy[(n - 1 - i) * 2];
+                        flipped[i * 2 + 1] = xy[(n - 1 - i) * 2 + 1];
+                    }
+                    xy = flipped;
+                }
+                // CONVEXITY GUARD. The engine always hands us its convex hull, and the half-plane test
+                // below is only meaningful for a convex ring: on a concave one it silently rejects most
+                // of the interior and the clamp erases the map (measured - a hand-edited ring ordered by
+                // probe index rather than by hull produced 5754240 "outside" cells of 5753040 and an
+                // empty mesh). Rather than ship that failure mode we refuse the ring, and a refused ring
+                // is null, i.e. the no-border no-op: a bad ring degrades to today's behaviour instead of
+                // to an empty mesh. A collinear vertex (cross == 0) is legal and common in probe data.
+                for (int i = 0; i < n; i++)
+                {
+                    float ax = xy[i * 2], az = xy[i * 2 + 1];
+                    int j = (i + 1 == n) ? 0 : i + 1;
+                    int k = (j + 1 == n) ? 0 : j + 1;
+                    float ex = xy[j * 2] - ax, ez = xy[j * 2 + 1] - az;
+                    float fx = xy[k * 2] - xy[j * 2], fz = xy[k * 2 + 1] - xy[j * 2 + 1];
+                    if (ex * fz - ez * fx < -1e-3f) return null;
+                }
+                var p = new BorderPolygon(xy, source);
+                return p.AreaM2 > 0f ? p : null;
+            }
+
+            /// Point-in-polygon, CCW half-plane test. Points exactly ON an edge count as inside: the
+            /// border line itself is the limit of the playable area, and the cell whose centre lands on it
+            /// is as much inside as one a centimetre either side. No acceptance threshold is used - the
+            /// game applies its own 0.05 m in MBSceneUtilities.IsPointInsideBoundaries, but that exists
+            /// to forgive probe noise on a boolean question; here we simply never emit a cell outside.
+            public bool Contains(float x, float z)
+            {
+                for (int i = 0; i < _n; i++)
+                {
+                    int j = (i + 1 == _n) ? 0 : i + 1;
+                    float ex = _xy[j * 2] - _xy[i * 2];
+                    float ez = _xy[j * 2 + 1] - _xy[i * 2 + 1];
+                    float cx = x - _xy[i * 2];
+                    float cz = z - _xy[i * 2 + 1];
+                    if (ex * cz - ez * cx < 0f) return false;
+                }
+                return true;
+            }
+
+            public static string SourceName(int source)
+            {
+                if (source == SourceHard) return "hard";
+                if (source == SourceSoft) return "soft";
+                return "none";
+            }
+        }
+
+        /// Which border polygon to honour. Mirrors BannerlordSceneChecker.CheckBorders, and exists as a
+        /// pure function precisely so the policy can be tested without an editor scene.
+        ///
+        /// The hard side is gated on the PROBE COUNT, never on Scene.GetHardBoundaryVertexCount(): on a
+        /// scene with fewer than three hard probes the engine's native getter does not report "no border",
+        /// it returns a four-vertex default rectangle spanning roughly (-0.045,-100) to (50,50) and clears
+        /// a private "hard border defined" flag that managed code cannot see (rglScene.cpp, the hard-polygon
+        /// lazy builder). Trusting the count would clamp every borderless scene to that rectangle.
+        public static int SelectBorderSource(int softProbeCount, int hardProbeCount)
+        {
+            if (hardProbeCount >= 3) return BorderPolygon.SourceHard;
+            if (softProbeCount >= 3) return BorderPolygon.SourceSoft;
+            return BorderPolygon.SourceNone;
+        }
+
+        /// Nulls every walkable span in a column whose centre is outside the border polygon, and marks the
+        /// cell into the shared obstruction map so gap fill and both stitches cannot bridge the border.
+        ///
+        /// Runs after FilterLowHangingWalkableObstacles and NOT before it, which is the one place this
+        /// pass differs from a literal "right after rasterisation": that filter re-marks any unmarked span
+        /// that has a walkable floor within climb beneath it, so a mask applied before it would be
+        /// promoted straight back. It is still ahead of every stage that could add or move a face -
+        /// FilterLedgeSpans, FilterWalkableLowHeightSpans, BuildCompactHeightfield, ErodeWalkableArea,
+        /// the region/contour/detail passes, the gap fill, the per-tile stitch and the merge stitch - so
+        /// all of them work on cells that should exist.
+        ///
+        /// The membership predicate is a pure function of world XZ, which is what makes it safe to apply
+        /// to a tile's PADDING cells as well as its own: the neighbour that owns that cell applies the
+        /// identical verdict, so the two tiles agree everywhere and cross-tile welding is untouched.
+        private static int ApplyBorderMask(RcHeightfield hf, BorderPolygon border,
+            ObstructionCells obstructions, out int cellsOutside)
+        {
+            cellsOutside = 0;
+            int cut = 0;
+            int w = hf.width, h = hf.height;
+            for (int ci = 0; ci < w * h; ci++)
+            {
+                int cx = ci % w, cz = ci / w;
+                float wx = hf.bmin.X + (cx + 0.5f) * hf.cs;
+                float wz = hf.bmin.Z + (cz + 0.5f) * hf.cs;
+                if (border.Contains(wx, wz)) continue;
+                cellsOutside++;
+                // Mark the cell even when it carries no walkable span: an empty column outside the border
+                // is exactly what the gap fill scans for, and it must refuse it.
+                if (obstructions != null) obstructions.Add(wx, wz, ObstructionKind.Border);
+                for (RcSpan sp = hf.spans[ci]; sp != null; sp = sp.next)
+                {
+                    if (!IsWalkableArea(sp.area)) continue;
+                    sp.area = RcRecast.RC_NULL_AREA;
+                    cut++;
+                }
+            }
+            return cut;
         }
 
         // ------------------------------------------------------------------
@@ -1977,9 +2294,11 @@ namespace BetterBannerlordNavmeshing
             Dictionary<long, List<int>> grid, List<int> bigList, float soupCell,
             float cs, float ch, float offset, float bminY, int walkableHeight, int walkableClimb,
             int stitchMaxGapCells, ObstructionCells obstructions,
-            out int pairs, out int added, out int refused, out int obstructionRefused)
+            out int pairs, out int added, out int refused, out int obstructionRefused,
+            out int borderRefused)
         {
             obstructionRefused = 0;
+            borderRefused = 0;
             pairs = 0;
             added = 0;
             refused = 0;
@@ -2133,7 +2452,9 @@ namespace BetterBannerlordNavmeshing
                     // how much of the refusal is barrier-driven rather than soup-driven.
                     if (obstructions != null && obstructions.SegmentCrosses(mxA, mzA, mxB, mzB))
                     {
-                        obstructionRefused++;
+                        if (obstructions.SegmentCrossesKind(mxA, mzA, mxB, mzB, ObstructionKind.Border))
+                            borderRefused++;
+                        else obstructionRefused++;
                         continue;
                     }
 
@@ -4572,7 +4893,7 @@ namespace BetterBannerlordNavmeshing
             int minRegionArea, int mergeRegionArea, RcAreaModification areaMod,
             bool[] forceWalkableTriangles, bool[] ledgeExemptTriangles,
             float[] barrierVerts, int[] barrierTris, List<int> tileBarrierList,
-            ObstructionCells obstructions, int tileIndex)
+            ObstructionCells obstructions, int tileIndex, BorderPolygon borderPoly)
         {
             var r = new VoxelTileResult();
             r.Index = index;
@@ -4661,6 +4982,24 @@ namespace BetterBannerlordNavmeshing
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
+
+                // BORDER CLAMP, part 3: the per-cell mask. See ApplyBorderMask for why this sits here
+                // rather than immediately after the rasteriser.
+                //
+                // DELIBERATE agent-radius inset. Every span outside the polygon is nulled, and then
+                // ErodeWalkableArea pulls the surviving boundary back a further walkableRadius cells
+                // (0.25 m at the defaults, one cell at cs 0.25). That inset is wanted, not a rounding
+                // artefact: the hard border is a physical wall in game (the engine's own
+                // __scene_hard_border__ collider), and the soft one bounds where an agent may be
+                // deployed, so the agent's CENTRE has to stay inside. Emitting a face whose centre sits
+                // exactly on the border line would put a unit half outside its own walk area.
+                if (borderPoly != null)
+                {
+                    int cellsOutside;
+                    int masked = ApplyBorderMask(hf, borderPoly, obstructions, out cellsOutside);
+                    r.BorderCellsMasked = masked;
+                    r.BorderCellsOutside = cellsOutside;
+                }
 
                 // BARRIER CUT. Runs here, immediately after the ordinary soup has been rasterised and
                 // the low-hanging filter applied, for two reasons:
@@ -4752,11 +5091,14 @@ namespace BetterBannerlordNavmeshing
                     // column as a drop and deletes the floor cell beside a gap, which would widen a
                     // hairline seam by one cell per side and defeat the fill.
                     int gapFilled, gapEmpty;
+                    int gapRefused, gapRefusedByBorder;
                     gapFilled = FillNarrowGaps(hf, s.GapFillCells, walkableClimb, border, cellsPerTile,
-                        obstructions, s.VoxelCellSizeMeters, out gapEmpty, out int gapRefused);
+                        obstructions, s.VoxelCellSizeMeters, out gapEmpty, out gapRefused,
+                        out gapRefusedByBorder);
                     r.GapFilled = gapFilled;
                     r.GapEmptyColumns = gapEmpty;
                     r.BarrierGapRefused = gapRefused;
+                    r.BorderGapRefused = gapRefusedByBorder;
                 }
                 if (s.UseLedgeFilter)
                 {
@@ -4859,11 +5201,12 @@ namespace BetterBannerlordNavmeshing
 
                 if (s.StitchMaxGapCells > 0 && r.FaceCount > 1)
                 {
-                    int tileStitchRefused;
+                    int tileStitchRefused, tileBorderRefused;
                     r.Stitched = StitchTileComponents(r, hf, bminY, s.CellHeightMeters, s.HeightOffsetMeters,
                         walkableHeight, walkableClimb, s.StitchMaxGapCells, s.DetailWeldToleranceMeters,
-                        obstructions, out tileStitchRefused);
+                        obstructions, out tileStitchRefused, out tileBorderRefused);
                     r.BarrierStitchRefused = tileStitchRefused;
+                    r.BorderStitchRefused = tileBorderRefused;
                 }
             }
             catch (Exception ex)
@@ -4890,10 +5233,11 @@ namespace BetterBannerlordNavmeshing
         // fill is identical on both sides of a tile boundary (no new cracks).
         private static int FillNarrowGaps(RcHeightfield hf, int gapFillCells, int walkableClimb,
             int border, int cellsPerTile, ObstructionCells obstructions, float cs,
-            out int emptyColumns, out int obstructionRefused)
+            out int emptyColumns, out int obstructionRefused, out int borderRefused)
         {
             emptyColumns = 0;
             obstructionRefused = 0;
+            borderRefused = 0;
             int w = hf.width;
             int h = hf.height;
             int ownX0 = border;
@@ -4926,7 +5270,10 @@ namespace BetterBannerlordNavmeshing
                     if (obstructions != null && cs > 0f
                         && obstructions.Contains(hf.bmin.X + (x + 0.5f) * cs, hf.bmin.Z + (z + 0.5f) * cs))
                     {
-                        obstructionRefused++;
+                        if ((obstructions.KindAt(hf.bmin.X + (x + 0.5f) * cs, hf.bmin.Z + (z + 0.5f) * cs)
+                                & ObstructionKind.Border) != 0)
+                            borderRefused++;
+                        else obstructionRefused++;
                         continue;
                     }
                     int y;
@@ -5050,9 +5397,10 @@ namespace BetterBannerlordNavmeshing
         // already exact on the lattice).
         private static int StitchTileComponents(VoxelTileResult r, RcHeightfield hf, float bminY, float ch,
             float offset, int walkableHeight, int walkableClimb, int stitchMaxGapCells, float weldTol,
-            ObstructionCells obstructions, out int obstructionRefused)
+            ObstructionCells obstructions, out int obstructionRefused, out int borderRefused)
         {
             obstructionRefused = 0;
+            borderRefused = 0;
             int nv = r.VertexCount;
             int nf = r.FaceCount;
             if (nv < 3 || nf < 2)
@@ -5203,7 +5551,11 @@ namespace BetterBannerlordNavmeshing
                             r.VertsXyz[ua * 3], r.VertsXyz[ua * 3 + 2],
                             r.VertsXyz[va * 3], r.VertsXyz[va * 3 + 2]))
                     {
-                        obstructionRefused++;
+                        if (obstructions.SegmentCrossesKind(
+                                r.VertsXyz[ua * 3], r.VertsXyz[ua * 3 + 2],
+                                r.VertsXyz[va * 3], r.VertsXyz[va * 3 + 2], ObstructionKind.Border))
+                            borderRefused++;
+                        else obstructionRefused++;
                         continue;
                     }
 

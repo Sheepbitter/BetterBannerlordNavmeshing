@@ -433,7 +433,86 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   see *Assets (structures)*), `NavMeshVoxelTerrainHoleAudit` (default false; see *Terrain holes*),
   `NavMeshVoxelWriteSoupObj` (default false; soup dump), `NavMeshVoxelAssetTrace` (default false; crash
   triage). Agent height is fixed at 1.8 m; **radius is configurable** and **climb is auto-derived** so the
-  slope setting is actually walkable (see below).
+  slope setting is actually walkable (see below). The **border clamp** has no setting: it follows the
+  scene's own border probes (see *Border clamp* below).
+
+### Border clamp (playable area) — on whenever the scene declares one
+
+A battle scene declares the playable area with **border probes**: point entities tagged
+`walk_area_vertex` (soft) or `walk_area_vertex_hard` (hard), from the engine prefabs `border_soft` /
+`border_hard` (`Modules\Native\Prefabs\scene_prop_prefabs.xml`; each carries a
+`meta_mesh_component` for an editor-only column and is otherwise just a position). The engine
+convex-hulls them natively (`rglConvex_polygon`, monotone chain, CCW) and exposes the hull through
+`Scene.GetSoftBoundaryVertex*` / `GetHardBoundaryVertex*`; `MBSceneUtilities.GetSoftBoundaryPoints` /
+`GetHardBoundaryPoints` are the managed wrappers. Nothing here re-derives that hull.
+
+**No setting, no toggle.** A scene that declares a border is clamped; a scene that does not is
+untouched. The no-border path is a structural no-op — no polygon, no lattice clamp, no soup cull, no
+span mask — and is byte-identical to the pre-V3.59 build (verified: identical vertex/triangle/quad
+digests on CC_20 and Birtu against a DLL built from the previous commit).
+
+| probe | scene | result |
+|---|---|---|
+| >= 3 `walk_area_vertex_hard` | any | **hard** polygon wins (it is the tighter, physical limit) |
+| else >= 3 `walk_area_vertex` | any | soft polygon |
+| else (< 3 either) | any | **no clamp** |
+
+The hard side is gated on the **probe count**, never on `Scene.GetHardBoundaryVertexCount()`. On a
+scene with fewer than three hard probes the engine does not report "no border": its native
+hard-polygon builder substitutes a four-vertex default rectangle spanning roughly
+`(-0.045,-100)..(50,50)` and clears a private "hard border defined" flag that managed code cannot
+read. Trusting the count would clamp every borderless scene — and CC_20_siege, Birtu and Basamu, which
+have soft probes only — to that rectangle. `BannerlordSceneChecker.CheckBorders` gates on the count for
+the same reason; the policy is a pure function, `TiledNavMeshBuilder.SelectBorderSource(soft, hard)`, so
+it can be tested without a scene.
+
+**What the clamp does**, in order of how much it changes:
+
+1. **Lattice clamp.** The tile grid is intersected with the polygon's AABB. The tile lattice snapping
+   is unchanged (only its input moves), so cross-tile welding stays exact; the tile array stays densely
+   indexed and `tileOffX/tileOffZ` carry the lattice origin. On CC_20_siege: **125x125 -> 37x30 tiles**
+   (15625 -> 1110), and the sampled area drops from 4000k m² to 273k m².
+2. **Soup cull.** A triangle whose XZ AABB misses the polygon's AABB is dropped before it is binned or
+   rasterised. CC_20_siege: 787971 of 1282573 triangles (61%); Basamu: 2310962 of 3912455 (59%).
+   The count folds into the existing `culledByAabb` log field (which keeps its meaning, "triangles that
+   reached no tile") and is also broken out as `of which outside the border AABB`.
+3. **Per-cell span mask.** Every walkable span in a column whose **centre** is outside the polygon is
+   nulled, exactly as if it were real solid geometry, so the ledge trim, clearance filter, compaction,
+   erosion, regions, contours and the detail mesh all keep working on cells that should exist. It runs
+   *after* `FilterLowHangingWalkableObstacles` — not before, because that filter re-marks any unmarked
+   span that has a walkable floor within a climb beneath it and would promote the masked cells straight
+   back — and *before* gap fill, both stitches, the steep-face repair and the prune.
+4. **Obstruction cells.** Masked cells are recorded in the same `ObstructionCells` map the barriers use,
+   under the reserved `ObstructionKind.Border`, so **gap fill, the per-tile stitch and `MergeStitch`
+   cannot bridge the border** either. Refusals are counted separately from barrier refusals
+   (`gap-fill refused=… ` / `stitch refused=…` on the `border:` line).
+
+**Deliberate agent-radius inset.** The surviving boundary is pulled back a further
+`walkableRadius` cells (0.25 m at the defaults — one cell at cs 0.25) by `ErodeWalkableArea`. That inset
+is wanted, not an artefact: the hard border is a *physical wall* in game (the engine's own
+`__scene_hard_border__` collider, built by `MissionHardBorderPlacer` via
+`Scene.FillEntityWithHardBorderPhysicsBarrier`), and the soft one bounds deployment validity, so an
+agent's centre must stay inside the border rather than on it.
+
+**Ring guards.** `BorderPolygon.FromPoints` normalises the winding (a clockwise ring is flipped) and
+**refuses a non-convex ring** (returning null = the no-border no-op). The half-plane membership test is
+only meaningful on a convex ring, and a concave one silently rejects most of the interior — measured
+during development: a ring ordered by probe index rather than by hull marked 5754240 of 5753040 cells
+"outside" and produced an empty mesh. A bad ring now degrades to today's behaviour instead.
+
+`flora_bounding_rect` in `scene.xscene` is deliberately **not** used: it is the probes' AABB (looser than
+the hull — ~17% slack on CC_20) and no TaleWorlds assembly exposes it.
+
+The polygon is read once on the main thread in the **shared** `RunPipeline` (so the editor button, the
+async editor dispatch and the in-game hotkey all get it), logged as one atomic line:
+
+```
+border: source=soft vertices=5 area=227882m2 min=930.129,825.350 max=1512.867,1294.046 probes soft=5 hard=0 (hard wins when >=3; the engine's default-rectangle hard count is never trusted)
+```
+
+and it is written into the scene snapshot (terrain artefact, version 2, a trailing border block:
+vertex count + source byte + x/z pairs + both probe counts) so the offline harness can replay a clamp
+without the editor. A version-1 snapshot still reads and simply reports no border.
 
 ### Async build & performance instrumentation
 
