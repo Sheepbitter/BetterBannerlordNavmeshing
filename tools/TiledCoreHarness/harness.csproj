@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>TiledCoreHarness</AssemblyName>
+    <RootNamespace>TiledCoreHarness</RootNamespace>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+
+    <!-- Program.cs is the only file in this folder and it is listed explicitly below, so the SDK's
+         default '**/*.cs' glob is turned off to make double-globbing impossible. This also keeps this
+         project from ever seeing the module sources it links in by relative path. -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The design proof: the voxel core + DotRecast compile with ZERO TaleWorlds refs. -->
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\ThirdParty\DotRecast\**\*.cs" />
+    <Compile Include="..\..\TiledNavMeshBuilder.cs" />
+    <Compile Include="..\..\SteppedPropRamps.cs" />
+    <Compile Include="..\..\NavMeshCleanup.cs" />
+    <Compile Include="..\..\Nmg8Writer.cs" />
+    <Compile Include="..\..\SceneSnapshot.cs" />
+  </ItemGroup>
+
+</Project>

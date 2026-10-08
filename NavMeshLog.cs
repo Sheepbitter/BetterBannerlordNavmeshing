@@ -19,6 +19,18 @@ namespace BetterBannerlordNavmeshing
         private static StreamWriter _writer;
         private static string _path;
         private static bool _enabled;
+        // Clock seam: resolved once per Initialize call and used by the banner, the filename and every
+        // line prefix, so all three agree. Defaults to the wall clock, which keeps the no-stamp behaviour
+        // byte-identical to before.
+        private static Func<DateTime> _now = delegate { return DateTime.Now; };
+        private static DateTime _runStamp;
+
+        // Seam for tests/tools that want to drive the clock without stamping a whole run.
+        public static Func<DateTime> NowProvider
+        {
+            get { return _now; }
+            set { _now = (value != null) ? value : (delegate { return DateTime.Now; }); }
+        }
 
         public static bool IsEnabled
         {
@@ -34,8 +46,20 @@ namespace BetterBannerlordNavmeshing
         // every call also starts a new run with a separator banner. A folder
         // override is honoured on the opening call; the default is
         // <Documents>\Mount and Blade II Bannerlord\BetterBannerlordNavmeshing\Logs\.
-        public static void Initialize(bool enabled, string folderOverride)
+        //
+        // CLOCK SEAM. This class wrote DateTime.Now in three places - the run banner, the log FILENAME,
+        // and every single line prefix - so two artefact runs differed in the banner, the filename and
+        // every line, no matter how deterministic the mesh was. That is the "editor outputs differ by
+        // KB" symptom, and it is independent of NavMeshCleanup.
+        //
+        // `stamp` resolves all three from ONE value: supplied, the filename, the banner and every line
+        // prefix are all derived from it, so two runs of the same mesh are byte-comparable after the
+        // filename. Not supplied (the default, and every existing caller), behaviour is byte-identical to
+        // before. NowProvider is the same seam for callers that want to inject a clock without
+        // stamping a whole run.
+        public static void Initialize(bool enabled, string folderOverride, DateTime? stamp = null)
         {
+            _runStamp = stamp.HasValue ? stamp.Value : _now();
             lock (Sync)
             {
                 try
@@ -57,7 +81,7 @@ namespace BetterBannerlordNavmeshing
                         }
                     }
 
-                    WriteLocked("===== run @ " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " =====");
+                    WriteLocked("===== run @ " + _runStamp.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + " =====");
                     WriteLocked("log file: " + _path);
                     Console.WriteLine("NavMesh: log file: " + _path);
                 }
@@ -109,7 +133,7 @@ namespace BetterBannerlordNavmeshing
             try
             {
                 string file = Path.Combine(folder,
-                    "NavMesh_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".log");
+                    "NavMesh_" + _runStamp.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture) + ".log");
                 var stream = new FileStream(file, FileMode.Append, FileAccess.Write, FileShare.Read);
                 _writer = new StreamWriter(stream);
                 _writer.AutoFlush = true;
@@ -150,7 +174,7 @@ namespace BetterBannerlordNavmeshing
 
             try
             {
-                _writer.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "] " + flat);
+                _writer.WriteLine("[" + _runStamp.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "] " + flat);
             }
             catch (Exception)
             {

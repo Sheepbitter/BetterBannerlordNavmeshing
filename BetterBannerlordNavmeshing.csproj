@@ -79,6 +79,8 @@
   <ItemGroup>
     <Compile Remove="ThirdParty\DotRecast\**\*.cs" />
     <Compile Include="ThirdParty\DotRecast\**\*.cs" />
+    <!-- tools/ holds standalone tools (the TiledCoreHarness acceptance suite), never the game DLL. -->
+    <Compile Remove="tools\**\*.cs" />
   </ItemGroup>
 
   <!-- Deploy the built assembly into the module's bin folder for this variant. -->

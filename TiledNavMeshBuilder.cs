@@ -304,7 +304,29 @@ namespace BetterBannerlordNavmeshing
             // Removes needle/thin vertices and retriangulates their fans (decimation), then flips to
             // polish. Conservative tolerances (0.05 m), island count and manifoldness preserved.
             public bool CleanupSlivers = true;
-            public int CleanupMaxMs = 6000;
+            // RENAMED from CleanupMaxMs. DIAGNOSTIC ONLY: it no longer bounds any work. It sets
+            // DeadlineExceeded on the cleanup Stats, which is logged, and nothing else. <= 0 disables
+            // the warning. The work itself is sized by counted work units - see
+            // CleanupDecimateGuardMultiple and BuildCleanupBudgets below.
+            public int CleanupDeadlineMs = 6000;
+            // The shipped quality/time knob. It sizes the Decimate guard budget as
+            // CleanupDecimateGuardMultiple * C0 + F0 / CleanupDecimateGuardFloorDivisor, where C0 is the
+            // candidate set the pass's own mask selects at sweep 0 (a pure function of the input) and F0
+            // is the face count at pass entry. It is the budget expected to be the dominant limiter, but
+            // NOT the only one that can bind: RefineLongThin and RelaxThin have their own budgets, tighter
+            // than their sweep caps imply. Raising this raises runtime, and the per-pass work counters on
+            // the cleanup log line make that visible immediately.
+            public int CleanupDecimateGuardMultiple = 8;
+            // Calibration-only overrides. 0 (or <= 0 for the multiplier) = "use Budgets.Default()".
+            // These exist so the calibration can be driven from the harness CLI with no code edit between
+            // runs; they are not intended as shipped tuning knobs.
+            public int CleanupDecimateSweepCap = 0;
+            public int CleanupRefineSweepCap = 0;
+            public int CleanupRelaxSweepCap = 0;
+            public int CleanupFlipIterationCap = 0;
+            public int CleanupRelaxBudgetFloor = 0;
+            public int CleanupFlipEdgeVisitMultiple = 0;
+            public int CleanupDecimateGuardFloorDivisor = 0;
 
             // Final quad merge (part of the cleanup, after the flip polish). Thin faces are combined
             // with a near-coplanar neighbour into one emitted 4-vertex face (the writer writes the
@@ -763,6 +785,26 @@ namespace BetterBannerlordNavmeshing
         // must be marked walkable even when their slope exceeds MaxSlopeDegrees. SteppedPropRamps uses
         // it for synthesized stair/ladder ramps, which are meant to be traversed. Null (the default)
         // keeps the input byte-for-byte identical to the pre-ramp behaviour.
+        // The single place where a setting becomes a budget. Every knob the cleanup reads comes through here,
+        // so there is one mapping to audit rather than one per call site.
+        internal static NavMeshCleanup.Budgets BuildCleanupBudgets(TiledNavMeshSettings s)
+        {
+            var b = NavMeshCleanup.Budgets.Default(s.CleanupDeadlineMs);
+            b.DecimateGuardMultiple = s.CleanupDecimateGuardMultiple;
+            // The sweep caps and the two floor divisors are BUILD CONSTANTS (hard outer bounds and the
+            // denominators of the floor terms). A 0 override means "leave the default"; there is no way to
+            // express "unbounded" through a cap, and the calibration that needs an unbounded guard budget
+            // gets there with CleanupDecimateGuardMultiple instead.
+            if (s.CleanupDecimateSweepCap > 0) b.DecimateSweepCap = s.CleanupDecimateSweepCap;
+            if (s.CleanupRefineSweepCap > 0) b.RefineSweepCap = s.CleanupRefineSweepCap;
+            if (s.CleanupRelaxSweepCap > 0) b.RelaxSweepCap = s.CleanupRelaxSweepCap;
+            if (s.CleanupFlipIterationCap > 0) b.FlipIterationCap = s.CleanupFlipIterationCap;
+            if (s.CleanupRelaxBudgetFloor > 0) b.RelaxBudgetFloor = s.CleanupRelaxBudgetFloor;
+            if (s.CleanupFlipEdgeVisitMultiple > 0) b.FlipEdgeVisitMultiple = s.CleanupFlipEdgeVisitMultiple;
+            if (s.CleanupDecimateGuardFloorDivisor > 0) b.DecimateGuardFloorDivisor = s.CleanupDecimateGuardFloorDivisor;
+            return b;
+        }
+
         public static VoxelMeshResult Build(float[] vertsXyz, int[] tris, TiledNavMeshSettings s,
             int maxWorkers, Action<string> log, bool[] forceWalkableTriangles = null,
             bool[] ledgeExemptTriangles = null, BorderPolygon borderPoly = null,
@@ -1463,6 +1505,7 @@ namespace BetterBannerlordNavmeshing
             // pruned mesh; only retriangulates it (decimate needle/thin vertices + flip polish). The
             // island count is asserted unchanged and the outline moves by <= a small tolerance.
             int[] quadPairs = null;
+            NavMeshCleanup.Budgets clnC = BuildCleanupBudgets(s);
             if (s.CleanupSlivers && merged.Tris.Count >= 3)
             {
                 var cv = new List<float>(merged.X.Count * 3);
@@ -1471,7 +1514,7 @@ namespace BetterBannerlordNavmeshing
                     cv.Add(merged.X[i]); cv.Add(merged.Y[i]); cv.Add(merged.Z[i]);
                 }
                 var ct = new List<int>(merged.Tris);
-                NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, s.CleanupMaxMs, s.QuadMerge);
+                NavMeshCleanup.Stats cln = NavMeshCleanup.Run(cv, ct, clnC, s.QuadMerge);
                 if (cln.Welded > 0 || cln.Removed > 0 || cln.Decimated > 0 || cln.Relaxed > 0
                     || cln.Refined > 0 || cln.Flipped > 0 || cln.Quads > 0)
                 {
@@ -1485,7 +1528,7 @@ namespace BetterBannerlordNavmeshing
                 }
                 if (cln.Quads > 0 && cln.QuadPairs != null)
                     quadPairs = cln.QuadPairs.ToArray();
-                Log(log, "cleanup: welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
+                Log(log, "cleanup: [det v1] welded=" + cln.Welded + " removed=" + cln.Removed + " decimated="
                     + cln.Decimated + " relaxed=" + cln.Relaxed + " refined=" + cln.Refined
                     + " flipped=" + cln.Flipped + " quads=" + cln.Quads
                     + " quadsXZworst=" + F((float)cln.QuadXzWorstAngle) + "deg (margin "
@@ -1497,7 +1540,26 @@ namespace BetterBannerlordNavmeshing
                     + F(cln.BoundaryMaxMove) + "m components " + cln.ComponentsBefore + "->"
                     + cln.ComponentsAfter + (cln.ComponentsBefore == cln.ComponentsAfter ? " (kept)"
                         : " (CHANGED!)") + " [cand=" + cln.CandVerts + " rejMove=" + cln.RejMove
-                    + " rejFan=" + cln.RejFan + " rejRing=" + cln.RejRing + " rejTopo=" + cln.RejTopo + "]");
+                    + " rejFan=" + cln.RejFan + " rejRing=" + cln.RejRing + " rejTopo=" + cln.RejTopo + "]"
+                    // ---- [det v1] deterministic-diagnostics block ----
+                    // The fields above keep their order and names so an old and a new log line can be
+                    // eyeballed side by side. Everything appended here is a pure function of the input
+                    // EXCEPT the ms values and the deadline pair, which are wall-clock by construction and
+                    // are therefore excluded from any byte-comparison of two runs.
+                    + " work: decCand0=" + cln.DecimateCand0 + " guardEvals=" + cln.DecimateGuardEvals + "/"
+                    + cln.DecimateGuardBudget + " budgetHit=" + cln.DecimateBudgetHit + " sweeps="
+                    + cln.DecimateSweeps + "/" + clnC.DecimateSweepCap
+                    + " | refineVisits=" + cln.RefineFaceVisits + "/" + cln.RefineFaceVisitBudget
+                    + " sweeps=" + cln.RefineSweeps + "/" + clnC.RefineSweepCap
+                    + " | relaxEvals=" + cln.RelaxEvals + "/" + cln.RelaxBudget
+                    + " sweeps=" + cln.RelaxSweeps + "/" + clnC.RelaxSweepCap
+                    + " | flipVisits=" + cln.FlipEdgeVisits + "/" + cln.FlipEdgeVisitBudget
+                    + " E0=" + cln.FlipE0 + " iters=" + cln.FlipIters + "/" + clnC.FlipIterationCap
+                    + " | flipRebuildMs=" + cln.FlipRebuildMs + "/" + cln.FlipRebuilds + " rebuilds"
+                    + " ms: refine=" + cln.RefineMs + " decimate=" + cln.DecimateMs + " relax="
+                    + cln.RelaxMs + " flip=" + cln.FlipMs + " quads=" + cln.QuadMergeMs + " total="
+                    + cln.CleanupMs + " deadline=" + cln.DeadlineBudgetMs + " exceeded="
+                    + (cln.DeadlineExceeded ? 1 : 0));
                 if (cln.Diag != null)
                     for (int i = 0; i < cln.Diag.Count; i++) Log(log, "cleanup: " + cln.Diag[i]);
                 if (cln.DecimDiag != null) Log(log, "cleanup: " + cln.DecimDiag);

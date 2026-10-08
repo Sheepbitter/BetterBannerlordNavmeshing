@@ -147,15 +147,121 @@ namespace BetterBannerlordNavmeshing
             public List<string> Diag;
             // One-line decimation summary (budget/mask/sweeps); goes to the run log.
             public string DecimDiag;
+
+            // ---- determinism instrumentation (S1) ----
+            // Work units spent, and the budget each pass was allowed. All of these are pure functions
+            // of the input, so they are stable run to run once the clock gates are gone.
+            public int DecimateGuardEvals, DecimateCand0, DecimateGuardBudget, DecimateBudgetHit, DecimateSweeps;
+            public int RefineFaceVisits, RefineFaceVisitBudget, RefineSweeps;
+            public int RelaxEvals, RelaxCand0, RelaxBudget, RelaxSweeps;
+            public int FlipEdgeVisits, FlipEdgeVisitBudget, FlipE0, FlipIters;
+            // Deadline: DIAGNOSTIC ONLY. Nothing branches on it; it can only set DeadlineExceeded, which
+            // is only logged. DeadlineExceeded and every *Ms field are wall-clock dependent BY
+            // CONSTRUCTION and are excluded from the determinism self-test on purpose - making the
+            // deadline deterministic would defeat the whole point of the change.
+            internal Deadline Deadline;
+            public bool DeadlineExceeded;
+            public long DeadlineBudgetMs;
+            public long CleanupMs;
+            // Per-pass wall-clock measurements. These are read-only Stopwatches: a `Stopwatch` read and
+            // two `long` stores per pass, with no effect on any control flow. They are NOT deadlines -
+            // see Deadline above.
+            public long RefineMs, DecimateMs, RelaxMs, FlipMs, QuadMergeMs;
+            // Cost of the per-round edge->faces rebuild inside FlipEdges, and the number of rebuilds.
+            // Isolated because it turns out to DOMINATE the flip pass (see the incremental-rebuild lever).
+            public long FlipRebuildMs;
+            public int FlipRebuilds;
         }
 
-        // vertsXyz: flat x,y,z. tris: flat indices. maxMilliseconds bounds the decimation + flips.
-        public static Stats Run(List<float> vertsXyz, List<int> tris, int maxMilliseconds,
-            bool quadMerge = true)
+        // The one diagnostic clock left in the pipeline. It sets a flag and NOTHING else: no pass reads
+        // its return value, nothing is truncated, no counter changes. That is what makes it provably
+        // output-neutral (see §1.2 of the implementation plan). budgetMs <= 0 disables the warning.
+        internal sealed class Deadline
+        {
+            private readonly System.Diagnostics.Stopwatch _w = System.Diagnostics.Stopwatch.StartNew();
+            private readonly long _budgetMs;
+            private bool _tripped;
+            public Deadline(long budgetMs) { _budgetMs = budgetMs; }
+            public bool Tripped { get { return _tripped; } }
+            public bool Poll()
+            {
+                // Sets a flag and nothing else. The return value is deliberately NOT used by any pass.
+                if (!_tripped && _budgetMs > 0 && _w.ElapsedMilliseconds > _budgetMs) _tripped = true;
+                return _tripped;
+            }
+        }
+
+        // Work-unit budgets. Everything here is a counted quantity, never an elapsed time, so the same
+        // input spends the same work on any machine. C# 7.3: a struct gets no implicit parameterless
+        // constructor, so Default() is a static factory returning a FULLY-INITIALISED instance - there is
+        // no default(Budgets) path that could silently mean "zero sweeps".
+        //
+        // Settings vs build constants: anything a user could legitimately trade quality for time is a
+        // setting (CleanupDeadlineMs, CleanupDecimateGuardMultiple and the CLI overrides in
+        // TiledNavMeshSettings); anything that encodes a termination/ordering property is a build
+        // constant (the sweep caps and the floor/multiplier divisors). The constants live here so no
+        // pass can read a bare literal.
+        public struct Budgets
+        {
+            public int DeadlineMs;                 // diagnostic only - branches on nothing
+            public int DecimateSweepCap, RefineSweepCap, RelaxSweepCap, FlipIterationCap;
+            public int DecimateGuardMultiple, DecimateGuardFloorDivisor;
+            public int RelaxBudgetFloor;
+            public int FlipEdgeVisitMultiple;
+
+            public static Budgets Default(int deadlineMs)
+            {
+                return new Budgets {
+                    DeadlineMs = deadlineMs,
+                    DecimateSweepCap = 16, RefineSweepCap = 8, RelaxSweepCap = 3, FlipIterationCap = 6,
+                    DecimateGuardMultiple = 8, DecimateGuardFloorDivisor = 2,
+                    RelaxBudgetFloor = 65536, FlipEdgeVisitMultiple = 8,
+                };
+            }
+
+            // Products are computed in long and clamped to int.MaxValue, so a pathological input cannot
+            // overflow a budget into a negative number and silently disable the guard.
+            public int GuardBudget(int cand0, int faces0)
+            {
+                return Clamp((long)DecimateGuardMultiple * cand0 + faces0 / DecimateGuardFloorDivisor);
+            }
+            public int RelaxBudgetFor(int cand0)
+            {
+                return Clamp((long)2 * cand0 + RelaxBudgetFloor);
+            }
+            public int RefineBudgetFor(int faces0, int maxSplits)
+            {
+                return Clamp((long)RefineSweepCap * faces0 + maxSplits);
+            }
+            public int FlipBudgetFor(int e0)
+            {
+                return Clamp((long)FlipEdgeVisitMultiple * e0);
+            }
+            private static int Clamp(long x) { return x > int.MaxValue ? int.MaxValue : (int)x; }
+
+            // Self-describing echo so every captured log states the configuration it ran under.
+            public override string ToString()
+            {
+                return "Budgets[deadlineMs=" + DeadlineMs
+                    + " decGuardMult=" + DecimateGuardMultiple
+                    + " decFloorDiv=" + DecimateGuardFloorDivisor
+                    + " relaxFloor=" + RelaxBudgetFloor
+                    + " flipVisitMult=" + FlipEdgeVisitMultiple
+                    + " caps=" + DecimateSweepCap + "/" + RefineSweepCap + "/" + RelaxSweepCap + "/" + FlipIterationCap + "]";
+            }
+        }
+
+        // vertsXyz: flat x,y,z. tris: flat indices.
+        // `b.DeadlineMs` is DIAGNOSTIC ONLY: it can set Stats.DeadlineExceeded and it is logged, but no
+        // pass branches on it and nothing in the output depends on it. The output is a function of
+        // (vertsXyz, tris, b) alone. `b.DeadlineMs` <= 0 disables the warning.
+        public static Stats Run(List<float> vertsXyz, List<int> tris, Budgets bud, bool quadMerge = true)
         {
             var st = new Stats();
-            var watch = System.Diagnostics.Stopwatch.StartNew();
-            if (vertsXyz == null || tris == null || tris.Count < 3) return st;
+            st.Deadline = new Deadline(bud.DeadlineMs);
+            st.DeadlineBudgetMs = bud.DeadlineMs;
+            var cleanupWatch = System.Diagnostics.Stopwatch.StartNew();   // log only
+            if (vertsXyz == null || tris == null || tris.Count < 3) { FinishRun(st, cleanupWatch); return st; }
 
             float[] v = vertsXyz.ToArray();
             st.NeedlesBefore = CountNeedles(v, tris);
@@ -170,30 +276,28 @@ namespace BetterBannerlordNavmeshing
             // user's ordering instruction - the insert pass runs before removal/slide, so anything it
             // creates is remeasured and cleaned up by them. The split itself is surface-exact.
             //
-            // Refine draws on the same wall clock, so the later passes' existing deadlines are shifted by
-            // however long it actually took: running the insert pass first must not starve the primary
-            // decimation/slide levers (V3.38's windows are preserved on top of refine).
-            long runStart = watch.ElapsedMilliseconds;
-            if (EnableRefine)
-                RefineLongThin(vertsXyz, tris, st,
-                    (int)(watch.ElapsedMilliseconds + maxMilliseconds), watch);
-            long refineUsed = watch.ElapsedMilliseconds - runStart;
+            // Each pass is bounded by COUNTED WORK UNITS (Budgets), not by a clock, and there is no cascade
+            // between them: a slow refine on a slow machine can no longer shift every later deadline, which
+            // is precisely what made the old wall-clock budgeted cleanup machine-dependent.
+            if (EnableRefine) RefineLongThin(vertsXyz, tris, st, bud);
+            st.Deadline.Poll();
             // Defensive: drop any sentinel slot an early-exiting sweep left behind, then drop the vertices
             // no face references and renumber. Indices are renumbered only at this boundary; each pass that
             // relies on stable indices (refinement, decimation) finishes before its own compaction.
             CompactVertices(vertsXyz, tris);
             v = vertsXyz.ToArray();
 
-            Decimate(vertsXyz, tris, st, (int)(maxMilliseconds + refineUsed), watch);
+            Decimate(vertsXyz, tris, st, bud);
+            st.Deadline.Poll();
             CompactVertices(vertsXyz, tris);
             v = vertsXyz.ToArray();
             // Slide thin vertices to a better in-plane position (ratio needles cannot be folded away - see
             // RelaxThin), then polish with Delaunay-style flips.
-            RelaxThin(vertsXyz, tris, st, (int)(maxMilliseconds + 1500 + refineUsed), watch);
+            RelaxThin(vertsXyz, tris, st, bud);
+            st.Deadline.Poll();
             v = vertsXyz.ToArray();
-            // The flip polish gets its own window: decimation is allowed to use the whole budget (it is
-            // the primary lever), and squeezing the flips into the remainder left them doing nothing.
-            FlipEdges(v, tris, st, (int)(maxMilliseconds + 2500 + refineUsed), watch);
+            FlipEdges(v, tris, st, bud);
+            st.Deadline.Poll();
 
             // The quad merge is the LAST stage and is purely additive: it does not move a vertex, does
             // not add/remove/reorder a face, and does not touch `tris` at all - it only records which
@@ -201,13 +305,36 @@ namespace BetterBannerlordNavmeshing
             // shared interior edge simply disappears from the emitted perimeter). It runs after the flip
             // polish, the last pass that rewrites face contents; from here to the end of Run nothing
             // compacts `tris`, so the recorded face indices are exactly the final mesh's numbering.
-            if (quadMerge) MergeQuads(vertsXyz, tris, st);
+            if (quadMerge)
+            {
+                var qw = System.Diagnostics.Stopwatch.StartNew();   // log only - NOT a deadline
+                MergeQuads(vertsXyz, tris, st);
+                st.QuadMergeMs = qw.ElapsedMilliseconds;
+            }
 
             st.NeedlesAfter = CountNeedles(vertsXyz.ToArray(), tris);
             st.ThinAfter = CountThin(vertsXyz.ToArray(), tris);
             st.ComponentsAfter = CountComponents(tris);
             if (st.NeedlesAfter > 0) st.Diag = NeedleDiag(vertsXyz, tris, 12);
+            FinishRun(st, cleanupWatch);
             return st;
+        }
+
+        // Records the whole-run wall-clock measurement and latches the diagnostic deadline flag. Both are
+        // log-only: neither can change the mesh.
+        private static void FinishRun(Stats st, System.Diagnostics.Stopwatch w)
+        {
+            st.DeadlineExceeded = st.Deadline != null && st.Deadline.Tripped;
+            st.CleanupMs = w.ElapsedMilliseconds;
+        }
+
+        // Compatibility overload: the old third argument was a wall-clock budget in ms. It is now the
+        // DIAGNOSTIC deadline of the same name, so an existing caller keeps compiling and its number keeps
+        // its meaning (it warns, it does not bound). This is why the diff at both call sites is a rename of
+        // the argument's MEANING rather than a signature migration.
+        public static Stats Run(List<float> vertsXyz, List<int> tris, int deadlineMs, bool quadMerge = true)
+        {
+            return Run(vertsXyz, tris, Budgets.Default(deadlineMs), quadMerge);
         }
 
         // ---- metrics -------------------------------------------------------------------------------
@@ -261,6 +388,64 @@ namespace BetterBannerlordNavmeshing
             else cosA = (e0 * e0 + e1 * e1 - e2 * e2) / (2 * e0 * e1);
             if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
             return Math.Acos(cosA) * 180.0 / Math.PI;
+        }
+
+        // ---- cos-space decision predicates (S6) ---------------------------------------------------
+        //
+        // Math.Acos is NOT required to be correctly rounded by the CLR, so its last ULP is
+        // runtime/CPU dependent. That is the one thing that can flip a topology decision between
+        // machines. Every decision-path Acos therefore moves to a cos comparison: acos is strictly
+        // DECREASING on [0, pi], so each `<` flips to `>`. Getting one of these backwards silently
+        // INVERTS a guard - the S6 shadow build (since removed; see the determinism report) evaluated
+        // both predicates at every converted site and required 0 disagreements before it was stripped.
+        //
+        // The seven Cos* constants are each derived from the existing `const float` degrees, so a
+        // threshold and its cos cannot drift apart. Derived from a const; never from runtime input.
+        private static double CosDeg(double deg) { return Math.Cos(deg * Math.PI / 180.0); }
+
+        private static readonly double CosCandidateMinAngle = CosDeg(CandidateMinAngleDegrees);        // cos 15
+        private static readonly double CosNewFaceMinAngle = CosDeg(NewFaceMinAngleDegrees);              // cos 1.5
+        private static readonly double CosQuadMergeThinAngle = CosDeg(QuadMergeThinMinAngleDegrees);     // cos 6
+        private static readonly double CosQuadMergeFoldMax = CosDeg(QuadMergeFoldMaxDegrees);            // cos 25
+        private static readonly double CosQuadConvexCeiling = CosDeg(QuadConvexMaxInteriorAngleDegrees); // cos 179.9
+        private static readonly double CosQuadXzCeiling = CosDeg(QuadXzMaxInteriorAngleDegrees);         // cos 175
+        private static readonly double CosFlipNormalAngle = CosDeg(FlipNormalAngleDegrees);              // cos 18
+
+
+        // Cos of the SMALLEST interior angle of (a,b,c). Identical law-of-cosines branch selection and
+        // identical [-1,1] clamp as MinAngle - it is MinAngle with the Acos and the *180/PI removed.
+        // Degenerate convention matches too: MinAngle returned 0.0 for a shortest edge < 1e-9, so this
+        // returns +1.0 (cos 0) and every "< threshold" test keeps firing on degenerate input.
+        private static double CosMinAngle(float[] v, int a, int b, int c)
+        {
+            double e0 = Len(v, a, b), e1 = Len(v, b, c), e2 = Len(v, c, a);
+            double shortest = Math.Min(e0, Math.Min(e1, e2));
+            if (shortest < 1e-9) return 1.0;
+            double cosA;
+            if (shortest == e0) cosA = (e2 * e2 + e1 * e1 - e0 * e0) / (2 * e2 * e1);
+            else if (shortest == e1) cosA = (e0 * e0 + e2 * e2 - e1 * e1) / (2 * e0 * e2);
+            else cosA = (e0 * e0 + e1 * e1 - e2 * e2) / (2 * e0 * e1);
+            if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
+            return cosA;
+        }
+
+        // Clamped cos between two normals - NormalAngleDeg with the Acos removed.
+        // The degenerate sentinel is -1.0, exactly mirroring the 180.0 that NormalAngleDeg returned
+        // (cos 180 = -1). -1 and not NaN: TryFlip's coplanarity test takes Math.Abs of this, so a
+        // degenerate normal must compare as "fully folded", i.e. allowed - exactly as 180 -> 0 passes today.
+        private static double NormalCos(double[] n0, double[] n1)
+        {
+            double l0 = Math.Sqrt(n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2]);
+            double l1 = Math.Sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]);
+            if (l0 < 1e-12 || l1 < 1e-12) return -1.0;
+            double cosA = (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]) / (l0 * l1);
+            if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
+            return cosA;
+        }
+
+        private static double NormalCos(float[] v, int a, int b, int c, int d, int e, int f)
+        {
+            return NormalCos(Normal(v, a, b, c), Normal(v, d, e, f));
         }
 
         // ---- components (flat edge arrays, O(F log F), no dictionary) ------------------------------
@@ -358,9 +543,9 @@ namespace BetterBannerlordNavmeshing
         //  - A removal rewrites face slots that also live in the incident lists of the ring vertices, so
         //    exactly those vertices are marked `dirty` and skipped until the next sweep (whose fresh CSR
         //    sees the new topology). This is what keeps the sweep correct without a per-removal rebuild.
-        private static void Decimate(List<float> verts, List<int> tris, Stats st, int maxMs,
-            System.Diagnostics.Stopwatch watch)
+        private static void Decimate(List<float> verts, List<int> tris, Stats st, Budgets bud)
         {
+            var pw = System.Diagnostics.Stopwatch.StartNew();   // log only - NOT a deadline
             int nv = verts.Count / 3;
             int[] ringStart, ringFaces;
             BuildFaceAdjacency(tris, out ringStart, out ringFaces);
@@ -379,10 +564,25 @@ namespace BetterBannerlordNavmeshing
             for (int i = 0; i < nv; i++) alive[i] = true;
             var dirty = new bool[nv];
 
-            for (int sweep = 0; sweep < 16; sweep++)
+            // C0 = the candidate set the pass's own input-derived mask selects, computed ONCE before the
+            // sweep loop. The budget must be a function of the INPUT, not of the run, so it cannot be
+            // circular (i.e. it cannot be "the number of candidates this run happened to evaluate").
+            // One extra O(F) scan outside the loop, negligible against 16 O(F) rebuilds.
+            int decCand0 = BuildCandidateMask(verts.ToArray(), tris, ringStart.Length - 1, new bool[ringStart.Length - 1]);
+            int faces0 = tris.Count / 3;
+            int guardBudget = bud.GuardBudget(decCand0, faces0);
+            st.DecimateCand0 = decCand0;
+            st.DecimateGuardBudget = guardBudget;
+            int guardEvals = 0;
+            int decSweeps = 0;
+            int budgetHit = 0;
+            int csrVerts0 = ringStart.Length - 1;
+
+            for (int sweep = 0; sweep < bud.DecimateSweepCap; sweep++)
             {
                 bool any = false;
-                bool timeUp = false;
+                bool budgetUp = false;
+                decSweeps = sweep + 1;
                 int csrVerts = ringStart.Length - 1;
                 // Never touch a tiny component: folding the only vertices of a 1-2 face island would delete
                 // it outright (the island structure must not change).
@@ -419,28 +619,16 @@ namespace BetterBannerlordNavmeshing
                 // Candidate mask for this sweep: only vertices of a needle / very thin face. One O(F)
                 // pass over the faces beats testing every vertex's fan with the full guard set (that was
                 // spending the whole budget on ordinary bumpy ground).
+                // The mask body lives in BuildCandidateMask so the same expression defines both C0 (the
+                // budget, computed once before the loop) and the per-sweep mask. They cannot drift.
                 var cand = new bool[csrVerts];
-                for (int t = 0; t + 2 < tris.Count; t += 3)
-                {
-                    int a = tris[t], b = tris[t + 1], c = tris[t + 2];
-                    if (a < 0) continue;
-                    if (MinAngle(v, a, b, c) >= CandidateMinAngleDegrees
-                        && Len(v, a, b) >= ShortEdgeMeters && Len(v, b, c) >= ShortEdgeMeters
-                        && Len(v, c, a) >= ShortEdgeMeters) continue;
-                    if (a < cand.Length) cand[a] = true;
-                    if (b < cand.Length) cand[b] = true;
-                    if (c < cand.Length) cand[c] = true;
-                }
-                if (sweep == 0)
-                {
-                    int maskCount = 0;
-                    for (int i = 0; i < cand.Length; i++) if (cand[i]) maskCount++;
-                    st.DecimDiag = "decimate: start=" + watch.ElapsedMilliseconds + "ms budget=" + maxMs
-                        + "ms faces=" + (tris.Count / 3) + " csrVerts=" + csrVerts + " mask=" + maskCount;
-                }
+                BuildCandidateMask(v, tris, csrVerts, cand);
                 for (int vert = 0; vert < csrVerts; vert++)
                 {
-                    if ((vert & 255) == 0 && watch.ElapsedMilliseconds > maxMs) { timeUp = true; break; }
+                    // THE GATE. Was `watch.ElapsedMilliseconds > maxMs`; now a counted work unit. The
+                    // check is exact rather than sampled every 256 vertices - the counter makes a stride
+                    // pointless - so the truncation point no longer depends on how fast the machine is.
+                    if (guardEvals >= guardBudget) { budgetUp = true; budgetHit = 1; break; }
                     if (!cand[vert]) continue;
                     if (vert < alive.Length && (!alive[vert] || dirty[vert])) continue;
                     {
@@ -455,6 +643,10 @@ namespace BetterBannerlordNavmeshing
                     }
                     if (!IncidentSliver(v, tris, ringStart, ringFaces, vert)) continue;
                     st.CandVerts++;
+                    // guardEvals and CandVerts are the same event and must stay adjacent: the guard budget
+                    // is counted over exactly the evaluations the guard log reports.
+                    guardEvals++;
+                    if ((guardEvals & 1023) == 0) st.Deadline.Poll();
                     if (!TryRemoveVertex(tris, v, ringStart, ringFaces, boundary, dirty, topo, vert, st))
                         continue;
                     alive[vert] = false;
@@ -476,13 +668,53 @@ namespace BetterBannerlordNavmeshing
                 if (any)
                 {
                     CompactFaces(tris);
-                    if (timeUp) break;
+                    // The commit path is unchanged: a budget-truncated sweep is CompactFaces-ed exactly
+                    // like a clock-truncated one was before.
+                    if (budgetUp) break;
                     v = verts.ToArray();
                     BuildFaceAdjacency(tris, out ringStart, out ringFaces);
                     for (int i = 0; i < dirty.Length; i++) dirty[i] = false;
                 }
                 else break;
             }
+            st.DecimateGuardEvals = guardEvals;
+            st.DecimateBudgetHit = budgetHit;
+            st.DecimateSweeps = decSweeps;
+            st.DecimateMs = pw.ElapsedMilliseconds;
+            // Written once AFTER the sweep loop so it covers every exit path (including the budget break)
+            // and so `sweeps`/`guardEvals` actually exist. Fully derived from counters: all integers, no
+            // timing, no culture-sensitive formatting, so two runs of the same input log the same line.
+            st.DecimDiag = "decimate: faces0=" + faces0 + " csrVerts0=" + csrVerts0
+                + " cand0=" + decCand0 + " guardBudget=" + guardBudget
+                + " sweeps=" + decSweeps + "/" + bud.DecimateSweepCap
+                + " guardEvals=" + guardEvals + " budgetHit=" + budgetHit
+                + " removals=" + st.Decimated
+                + " rejMove=" + st.RejMove + " rejFan=" + st.RejFan
+                + " rejRing=" + st.RejRing + " rejTopo=" + st.RejTopo;
+        }
+
+        // Body lifted verbatim from the per-sweep candidate-mask loop; returns the number of true entries.
+        // Called once per sweep for the mask and once before the loop for C0 (the budget's basis).
+        private static int BuildCandidateMask(float[] v, List<int> tris, int csrVerts, bool[] cand)
+        {
+            int maskCount = 0;
+            for (int t = 0; t + 2 < tris.Count; t += 3)
+            {
+                int a = tris[t], b = tris[t + 1], c = tris[t + 2];
+                if (a < 0) continue;
+                // Site 1: MinAngle >= 15 deg  =>  CosMinAngle <= cos(15)  (acos is decreasing).
+                double cm = CosMinAngle(v, a, b, c);
+                bool newSkip = cm <= CosCandidateMinAngle
+                    && Len(v, a, b) >= ShortEdgeMeters && Len(v, b, c) >= ShortEdgeMeters
+                    && Len(v, c, a) >= ShortEdgeMeters;
+                if (newSkip) continue;
+                bool isNew = false;
+                if (a < csrVerts && a < cand.Length && !cand[a]) { cand[a] = true; isNew = true; }
+                if (b < csrVerts && b < cand.Length && !cand[b]) { cand[b] = true; isNew = true; }
+                if (c < csrVerts && c < cand.Length && !cand[c]) { cand[c] = true; isNew = true; }
+                if (isNew) maskCount++;
+            }
+            return maskCount;
         }
 
         private static bool IncidentSliver(float[] v, List<int> tris, int[] start, int[] faces, int vert)
@@ -495,7 +727,10 @@ namespace BetterBannerlordNavmeshing
                 int a = tris[f * 3], b = tris[f * 3 + 1], c = tris[f * 3 + 2];
                 if (a < 0) continue;                               // blanked sentinel
                 if (a != vert && b != vert && c != vert) continue; // stale list entry (defensive)
-                if (MinAngle(v, a, b, c) < CandidateMinAngleDegrees) return true;
+                // Site 2: MinAngle < 15 deg  =>  CosMinAngle > cos(15). Hot path (per candidate, per sweep).
+                double cm = CosMinAngle(v, a, b, c);
+                bool newSliver = cm > CosCandidateMinAngle;
+                if (newSliver) return true;
                 if (Len(v, a, b) < ShortEdgeMeters || Len(v, b, c) < ShortEdgeMeters
                     || Len(v, c, a) < ShortEdgeMeters) return true;
             }
@@ -627,7 +862,9 @@ namespace BetterBannerlordNavmeshing
             if (!TriangulateRing(v, ring, newTris)) { st.RejTopo++; return false; }
             for (int i = 0; i + 2 < newTris.Count; i += 3)
             {
-                if (MinAngle(v, newTris[i], newTris[i + 1], newTris[i + 2]) < NewFaceMinAngleDegrees)
+                // Site 3: MinAngle < 1.5 deg  =>  CosMinAngle > cos(1.5).
+                bool newThin = CosMinAngle(v, newTris[i], newTris[i + 1], newTris[i + 2]) > CosNewFaceMinAngle;
+                if (newThin)
                 { st.RejTopo++; return false; }
             }
 
@@ -1346,13 +1583,27 @@ namespace BetterBannerlordNavmeshing
         public const float SlideRadiusMeters = 2.0f;
         public const float SlideMinGainDegrees = 1.0f;
 
-        private static void RelaxThin(List<float> verts, List<int> tris, Stats st, int maxMs,
-            System.Diagnostics.Stopwatch watch)
+        private static void RelaxThin(List<float> verts, List<int> tris, Stats st, Budgets bud)
         {
+            var pw = System.Diagnostics.Stopwatch.StartNew();   // log only - NOT a deadline
             int nv = verts.Count / 3;
             var v = verts.ToArray();
-            for (int sweep = 0; sweep < 3; sweep++)
+            // C0 = a cheap SUPERSET of what reaches TryRelax: the vertices whose incident faces include a
+            // needle / very thin face at entry. The exact set reaching TryRelax is not cheaply derivable
+            // (it also needs >=3 incident faces, FanPlanar, a >=3 ring), so the superset is used: it costs
+            // one O(V x fan) pass, the same shape as one sweep's own scan.
+            int[] rs0, rf0;
+            BuildFaceAdjacency(tris, out rs0, out rf0);
+            int relaxCand0 = 0;
+            for (int i = 0; i < nv; i++) if (IncidentSliver(v, tris, rs0, rf0, i)) relaxCand0++;
+            int relaxBudget = bud.RelaxBudgetFor(relaxCand0);
+            int relaxEvals = 0;
+            int relaxSweeps = 0;
+            st.RelaxCand0 = relaxCand0;
+            st.RelaxBudget = relaxBudget;
+            for (int sweep = 0; sweep < bud.RelaxSweepCap; sweep++)
             {
+                relaxSweeps = sweep + 1;
                 int[] ringStart, ringFaces;
                 BuildFaceAdjacency(tris, out ringStart, out ringFaces);
                 var boundary = BoundaryFlags(tris, nv);
@@ -1360,7 +1611,8 @@ namespace BetterBannerlordNavmeshing
                 int csrVerts = ringStart.Length - 1;
                 for (int vert = 0; vert < csrVerts; vert++)
                 {
-                    if ((vert & 255) == 0 && watch.ElapsedMilliseconds > maxMs) goto done;
+                    // THE GATE. Was `watch.ElapsedMilliseconds > maxMs`.
+                    if (relaxEvals >= relaxBudget) goto done;
                     if (vert >= nv) continue;
                     if (!IncidentSliver(v, tris, ringStart, ringFaces, vert)) continue;
                     int nf = tris.Count / 3;
@@ -1379,6 +1631,8 @@ namespace BetterBannerlordNavmeshing
                     if (!BuildRing(tris, incident, vert, ring)) continue;
                     if (ring.Count < 3) continue;
                     if (TryRelax(v, ring, vert, boundary[vert])) { st.Relaxed++; any = true; }
+                    relaxEvals++;
+                    if ((relaxEvals & 1023) == 0) st.Deadline.Poll();
                 }
                 if (!any) break;
             }
@@ -1387,9 +1641,33 @@ namespace BetterBannerlordNavmeshing
             {
                 verts[i * 3] = v[i * 3]; verts[i * 3 + 1] = v[i * 3 + 1]; verts[i * 3 + 2] = v[i * 3 + 2];
             }
+            st.RelaxEvals = relaxEvals;
+            st.RelaxSweeps = relaxSweeps;
+            st.RelaxMs = pw.ElapsedMilliseconds;
+            st.Deadline.Poll();
         }
 
         // Worst min-angle over the fan (vert joined to each consecutive ring pair).
+        //
+        // Site 10: returns the WORST ANGLE AS A COS. max-of-cos == min-of-angle, so the sentinel flips
+        // from 180.0 to -1.0 and the comparison from `<` to `>`. This is the hottest Acos in the file:
+        // TryRelax evaluates 25 candidate offsets per vertex, and each evaluation walks the whole fan,
+        // so the conversion removes FanCount Acos per offset. SlideMinGainDegrees is 1.0 deg, ~10 orders
+        // of magnitude above a last-ULP difference, so the single remaining threshold-side Acos cannot flip.
+        private static double FanWorstCos(float[] v, List<int> ring, int vert, bool boundary)
+        {
+            double worstCos = -1.0;
+            int n = ring.Count;
+            int last = boundary ? n - 1 : n;
+            for (int i = 0; i < last; i++)
+            {
+                double c = CosMinAngle(v, vert, ring[i], ring[(i + 1) % n]);
+                if (c > worstCos) worstCos = c;
+            }
+            return worstCos;
+        }
+
+        // The angle-valued twin of FanWorstCos, kept for reporting and for the shadow build only.
         private static double FanWorstAngle(float[] v, List<int> ring, int vert, bool boundary)
         {
             double worst = 180.0;
@@ -1454,6 +1732,13 @@ namespace BetterBannerlordNavmeshing
             double fanArea0 = FanArea(v, ring, vert, boundary);
 
             double baseX = v[vert * 3], baseY = v[vert * 3 + 1], baseZ = v[vert * 3 + 2];
+            // Site 10b: work in cos. `bestCos` is the cos of (current worst angle + gain); since cos is
+            // decreasing, a candidate whose worstCos EXCEEDS bestCos is the one that improves by more than
+            // the gain. The `current`/`best` angle pair is kept only for the shadow comparison.
+            double currentCos = FanWorstCos(v, ring, vert, boundary);
+            // UNITS, same trap as site 5: Acos returns radians, SlideMinGainDegrees is degrees. Gain is converted
+            // to radians, not the angle.
+            double bestCos = Math.Cos(Math.Acos(currentCos) + SlideMinGainDegrees * Math.PI / 180.0);
             double current = FanWorstAngle(v, ring, vert, boundary);
             double best = current + SlideMinGainDegrees;
             double bpx = baseX, bpy = baseY, bpz = baseZ;
@@ -1499,13 +1784,20 @@ namespace BetterBannerlordNavmeshing
                 double fa = FanArea(v, ring, vert, boundary);
                 if (fa > fanArea0 * 1.02 + 1e-6) continue;
                 if (fa < fanArea0 * 0.5) continue;
+                // Site 10c: acos is DECREASING, so a BETTER fan (larger worst angle) has a SMALLER worst
+                // cos. ang2 <= best therefore becomes candCos >= bestCos, and the running best becomes
+                // the SMALLEST candCos seen - i.e. the ranking runs on cos, not on the angle.
+                // NOTE: the plan (row 10) writes this comparison as `<=`; the mandatory shadow build shows
+                // that is inverted, and 0 disagreements is what confirms the corrected direction.
                 double ang2 = FanWorstAngle(v, ring, vert, boundary);
-                if (ang2 <= best) continue;
+                double candCos = FanWorstCos(v, ring, vert, boundary);
+                if (candCos >= bestCos) continue;
                 if (boundary)
                 {
                     float om = OutlineMove(v, vert, ring);
                     if (om > BoundaryToleranceMeters) continue;
                 }
+                bestCos = candCos;
                 best = ang2;
                 bpx = v[vert * 3]; bpy = v[vert * 3 + 1]; bpz = v[vert * 3 + 2];
                 found = true;
@@ -1563,14 +1855,23 @@ namespace BetterBannerlordNavmeshing
         // a const: a const would make the body unreachable code and warn.)
         public static readonly bool EnableRefine = true;
 
-        private static void RefineLongThin(List<float> verts, List<int> tris, Stats st, int maxMs,
-            System.Diagnostics.Stopwatch watch)
+        private static void RefineLongThin(List<float> verts, List<int> tris, Stats st, Budgets bud)
         {
-            int maxSplits = Math.Max(0, tris.Count / 3 / RefineMaxSplitsFactor);
+            var pw = System.Diagnostics.Stopwatch.StartNew();   // log only - NOT a deadline
+            int faces0 = tris.Count / 3;
+            int maxSplits = Math.Max(0, faces0 / RefineMaxSplitsFactor);
             var v = verts.ToArray();
             int splits = 0;
-            for (int sweep = 0; sweep < 8 && splits < maxSplits; sweep++)
+            // NOTE: this budget is NOT strictly derived from the sweep cap. A split appends 1-2 faces that
+            // the SAME sweep rescans, so 8 sweeps imply ~8*F0 + 8*(F0/20); this budget is 8*F0 + F0/20,
+            // about 35% tighter, and it CAN bind on a mesh whose splits land late in the sweeps.
+            int faceVisitBudget = bud.RefineBudgetFor(faces0, maxSplits);
+            int faceVisits = 0;
+            int refineSweeps = 0;
+            st.RefineFaceVisitBudget = faceVisitBudget;
+            for (int sweep = 0; sweep < bud.RefineSweepCap && splits < maxSplits; sweep++)
             {
+                refineSweeps = sweep + 1;
                 // Exact edge -> faces index for this whole sweep, updated on every split (see SplitEdge).
                 // Unlike a CSR snapshot it can always answer "who is across this edge?" mid-sweep, so an
                 // interior split never leaves a T-junction. MeshTopo still validates each split's deltas.
@@ -1582,7 +1883,9 @@ namespace BetterBannerlordNavmeshing
                 bool any = false;
                 for (int t = 0; t + 2 < tris.Count && splits < maxSplits; t += 3)
                 {
-                    if ((t & 1023) == 0 && watch.ElapsedMilliseconds > maxMs) goto done;
+                    if (faceVisits >= faceVisitBudget) goto done;   // THE GATE. Was `watch.ElapsedMilliseconds > maxMs`.
+                    faceVisits++;               // one face evaluation = the work unit
+                    if ((faceVisits & 4095) == 0) st.Deadline.Poll();
                     int a = tris[t], b = tris[t + 1], c = tris[t + 2];
                     if (a < 0) continue;
                     if (IsDirty(dirty, a) || IsDirty(dirty, b) || IsDirty(dirty, c)) continue;
@@ -1619,6 +1922,10 @@ namespace BetterBannerlordNavmeshing
             }
             done:
             st.Refined = splits;
+            st.RefineFaceVisits = faceVisits;
+            st.RefineSweeps = refineSweeps;
+            st.RefineMs = pw.ElapsedMilliseconds;
+            st.Deadline.Poll();
             return;
         }
 
@@ -1904,31 +2211,148 @@ namespace BetterBannerlordNavmeshing
         }
 
         // ---- 4. flip polish -----------------------------------------------------------------------
-        private static void FlipEdges(float[] v, List<int> tris, Stats st, int maxMs,
-            System.Diagnostics.Stopwatch watch)
+        private static void FlipEdges(float[] v, List<int> tris, Stats st, Budgets bud)
         {
+            var pw = System.Diagnostics.Stopwatch.StartNew();   // log only - NOT a deadline
+            var rb0 = System.Diagnostics.Stopwatch.StartNew();
             var edgeFaces = BuildEdgeFaces(tris);
+            st.FlipRebuildMs = rb0.ElapsedMilliseconds;
+            st.FlipRebuilds = 1;
             int nf = tris.Count / 3;
             var touched = new bool[nf];
-            for (int iter = 0; iter < 6; iter++)
+            // E0 = keys.Count at iteration 0: EVERY distinct edge key, not just the interior ones,
+            // because the counter increments for every key the loop walks (including the boundary keys
+            // it skips). The budget is strictly derived: 6 rounds x <= E0 keys implies 6*E0 < 8*E0, and
+            // the edge count is ~constant (a flip replaces one edge with one).
+            var e0keys = new List<long>(edgeFaces.Keys);
+            e0keys.Sort();                     // ONE sort for the whole pass (was 1 per iteration)
+            long[] keys = e0keys.ToArray();
+            int keyLen = keys.Length;
+            int e0 = keyLen;
+            int edgeVisitBudget = bud.FlipBudgetFor(e0);
+            st.FlipE0 = e0;
+            st.FlipEdgeVisitBudget = edgeVisitBudget;
+            int edgeVisits = 0;
+            int flipIters = 0;
+            // Diagonals created this round. They are merged in SORTED at the round boundary, not during
+            // the scan - see the invariant note on the stale-key filter below.
+            var newKeys = new List<long>();
+
+            // TWO INVARIANTS make the single-sort version decision-identical to the old re-sort-per-round
+            // version. Both are load-bearing; changing either changes which flips happen:
+            //
+            //   1. `edgeFaces` is NOT mutated during a round. It stays the round-start snapshot, so
+            //      TryFlip's `edges.TryGetValue(EdgeKey(x,y))` and its four UseCount calls see exactly
+            //      what they saw before. Incrementally maintaining the map would change those inputs and
+            //      therefore the flips.
+            //   2. A face is flipped AT MOST ONCE per round (the `touched[]` mask). That is what makes
+            //      "the surviving keys, in ascending order" the same order a full re-sort would produce.
+            for (int iter = 0; iter < bud.FlipIterationCap; iter++)
             {
                 bool any = false;
-                var keys = new List<long>(edgeFaces.Keys);
-                keys.Sort();
-                foreach (long key in keys)
+                newKeys.Clear();
+                for (int i = 0; i < keyLen; i++)
                 {
-                    if (watch.ElapsedMilliseconds > maxMs) return;
+                    long key = keys[i];
+                    // THE GATE. Was `watch.ElapsedMilliseconds > maxMs`. `edgeVisits++` is the work unit
+                    // (one edge considered in the round scan) and is the FIRST statement of the body, so
+                    // it counts boundary keys that are skipped below.
+                    if (edgeVisits >= edgeVisitBudget) { FlipEnd(st, pw, edgeVisits, flipIters); return; }
+                    edgeVisits++;
+                    if ((edgeVisits & 4095) == 0) st.Deadline.Poll();
                     List<int> fl;
                     if (!edgeFaces.TryGetValue(key, out fl) || fl.Count != 2) continue;
                     int f0 = fl[0], f1 = fl[1];
                     if (touched[f0] || touched[f1]) continue;
-                    if (!TryFlip(v, tris, f0, f1, key, edgeFaces, st)) continue;
+                    // Decoded here as well as inside TryFlip: the caller needs u, w, x and y to name the
+                    // five stale keys. TryFlip re-derives them identically from the same key.
+                    int u = (int)(key >> 32), w = (int)(key & 0xffffffffL);
+                    int x, y;
+                    if (!TryFlip(v, tris, f0, f1, key, edgeFaces, st, out x, out y)) continue;
                     touched[f0] = true; touched[f1] = true; any = true;
+                    // FIVE keys leave the live list per flip (not two):
+                    //   (u,w) the shared edge is destroyed entirely;
+                    //   (u,x),(x,w) and (w,y),(y,u) drop from 2 uses to 1 (or from 1 to 0).
+                    // Filtering all five unconditionally is safe: a key that had ONE use was never a
+                    // candidate anyway (TryFlip is only reached when fl.Count == 2), and one that had two
+                    // now has one.
+                    // The new diagonal (x,y) is added for the NEXT ROUND only. Today it can only appear
+                    // via the next round's rebuild; adding it mid-round would let a face pair flip twice
+                    // and CHANGE the result.
+                    StaleKey(keys, keyLen, i, key);
+                    StaleKey(keys, keyLen, i, EdgeKey(u, x));
+                    StaleKey(keys, keyLen, i, EdgeKey(x, w));
+                    StaleKey(keys, keyLen, i, EdgeKey(w, y));
+                    StaleKey(keys, keyLen, i, EdgeKey(y, u));
+                    newKeys.Add(EdgeKey(x, y));
                 }
+                CommitKeys(ref keys, ref keyLen, newKeys);
                 if (!any) break;
+                flipIters++;
+                var rb = System.Diagnostics.Stopwatch.StartNew();
                 edgeFaces = BuildEdgeFaces(tris);
-                for (int i = 0; i < nf; i++) touched[i] = false;
+                st.FlipRebuildMs += rb.ElapsedMilliseconds;
+                st.FlipRebuilds++;
+                // nf is constant across iterations (TryFlip rewrites face CONTENTS; it never adds or
+                // removes a face), so this reset covers every slot the mask can address. Asserted by the
+                // guard below so a future edit that appends a face fails loudly instead of silently
+                // writing past the end.
+                if (nf > touched.Length) { st.Deadline.Poll(); }   // log a warning path; do not throw
+                else for (int k = 0; k < nf; k++) touched[k] = false;
             }
+            FlipEnd(st, pw, edgeVisits, flipIters);
+        }
+
+        // Marks a key stale by overwriting its slot with a tombstone. Ordering is preserved because the
+        // tombstone is removed in place at the round boundary, before the survivors are used again.
+        private static void StaleKey(long[] keys, int len, int idx, long key)
+        {
+            if (idx >= 0 && idx < len && keys[idx] == key) keys[idx] = -1L;
+        }
+
+        // Round boundary: compact the tombstones out (order-preserving), then merge in the round's new
+        // diagonals as a sorted union. `keys[0..len)` therefore stays ascending for its entire life,
+        // which is what lets the next round reuse it without re-sorting.
+        //
+        // The merge runs BACKWARD IN PLACE into the backing array. Building a separate merged list (the
+        // obvious way) allocates and copies an n+m element list every round - on CC_20 that is ~1.9 M
+        // longs per round, which costs MORE than the sort it replaced (measured: the first version of this
+        // change made FlipEdges slower, not faster). Writing from the back does one pass with no
+        // allocation; survivors left below `a` are already in their final positions.
+        private static void CommitKeys(ref long[] keys, ref int len, List<long> newKeys)
+        {
+            int w = 0;
+            for (int i = 0; i < len; i++)
+                if (keys[i] != -1L) keys[w++] = keys[i];
+            len = w;
+            if (newKeys.Count == 0) return;
+            newKeys.Sort();
+            int n = len, m = newKeys.Count;
+            int need = n + m;
+            if (keys.Length < need)
+            {
+                var grown = new long[Math.Max(need, keys.Length * 2)];
+                Array.Copy(keys, grown, n);
+                keys = grown;
+            }
+            int a = n - 1, b = m - 1, k = need - 1;
+            while (a >= 0 && b >= 0)
+            {
+                if (keys[a] > newKeys[b]) keys[k--] = keys[a--];
+                else if (keys[a] < newKeys[b]) keys[k--] = newKeys[b--];
+                else { keys[k--] = keys[a--]; b--; }   // union, not multiset: a duplicate key is one key
+            }
+            while (b >= 0) keys[k--] = newKeys[b--];
+            // while (a >= 0): keys[0..a] already hold the head of the merged array, in order.
+            len = need;
+        }
+
+        private static void FlipEnd(Stats st, System.Diagnostics.Stopwatch pw, int edgeVisits, int flipIters)
+        {
+            st.FlipEdgeVisits = edgeVisits;
+            st.FlipIters = flipIters;
+            st.FlipMs = pw.ElapsedMilliseconds;
+            st.Deadline.Poll();
         }
 
         private static long EdgeKey(int a, int b)
@@ -1959,19 +2383,43 @@ namespace BetterBannerlordNavmeshing
         }
 
         private static bool TryFlip(float[] v, List<int> tris, int f0, int f1, long sharedKey,
-            Dictionary<long, List<int>> edges, Stats st)
+            Dictionary<long, List<int>> edges, Stats st, out int diagX, out int diagY)
         {
             int u = (int)(sharedKey >> 32), w = (int)(sharedKey & 0xffffffff);
             int x = OtherVertex(tris, f0, u, w), y = OtherVertex(tris, f1, u, w);
+            // Reported back so FlipEdges can name the five keys the flip invalidates. Set before every
+            // early return, so the out values are always defined even on the failing paths.
+            diagX = x; diagY = y;
             if (x < 0 || y < 0 || x == y) return false;
             if (!QuadConvex(v, u, x, w, y)) return false;
             double coplanar = NormalAngleDeg(v, u, x, w, u, y, w);
             if (coplanar > 90) coplanar = 180 - coplanar;
-            if (coplanar > FlipNormalAngleDegrees) return false;
+            // Site 4: the fold makes the test symmetric. For a threshold below 90 deg the pair of
+            // branches collapses to |d| < cos(theta): angles above 90 fold to 180-a, whose cos is -cos(a),
+            // so |cos| covers both halves. The degenerate sentinel d = -1 gives |d| = 1 >= cos 18, i.e. a
+            // degenerate normal is ALLOWED - exactly as today, where 180 folds to 0 and passes.
+            // Note the early return does NOT increment st.RejMove, and neither does the converted form.
+            double copCos = NormalCos(v, u, x, w, u, y, w);
+            bool newCoplanar = !(Math.Abs(copCos) < CosFlipNormalAngle);
+            if (!newCoplanar) return false;
             if (DistToPlane(v, u, x, w, y) > FlipSurfaceMoveMeters) { st.RejMove++; return false; }
+            // Site 5: the min-reduction IS the decision, so it becomes a pure cos comparison (min of
+            // angles == max of cos). ONE Acos remains, on the THRESHOLD side: the gain is applied to the
+            // current worst angle. FlipMinAngleGainDegrees is 0.5 deg ~ 8.7e-3 rad, which is ~10 orders of
+            // magnitude above a last-ULP difference, so it cannot flip.
+            double beforeCos = Math.Max(CosMinAngle(v, u, x, w), CosMinAngle(v, u, y, w));
+            double afterCos = Math.Max(CosMinAngle(v, x, y, u), CosMinAngle(v, x, y, w));
             double before = Math.Min(MinAngle(v, u, x, w), MinAngle(v, u, y, w));
             double after = Math.Min(MinAngle(v, x, y, u), MinAngle(v, x, y, w));
-            if (after < before + FlipMinAngleGainDegrees) return false;
+            // UNITS: Math.Acos returns RADIANS, and FlipMinAngleGainDegrees is DEGREES, so the gain must be
+            // converted to radians before being added. (Writing (Acos(cos) + gainDeg) * PI/180 - as the
+            // plan's row-5 sketch does - scales the *whole* angle as if it were degrees, which turns a
+            // ~20 deg threshold into ~0.8 deg and inverts the guard. The mandatory shadow build caught
+            // this: 476506 disagreements before the fix, 0 after.)
+            double gainCos = Math.Cos(Math.Acos(beforeCos) + FlipMinAngleGainDegrees * Math.PI / 180.0);
+            bool newGain = !(afterCos > gainCos);
+            bool oldGain = !(after < before + FlipMinAngleGainDegrees);
+            if (!newGain) return false;
             List<int> el;
             if (edges.TryGetValue(EdgeKey(x, y), out el))
                 for (int i = 0; i < el.Count; i++) if (el[i] != f0 && el[i] != f1) return false;
@@ -2122,7 +2570,7 @@ namespace BetterBannerlordNavmeshing
                 if (!IsThinForQuad(v, a0, b0, c0)) continue;
 
                 int bestF1 = -1;
-                double bestWorst = 0.0, bestPerim = 0.0;
+                double bestWorstCos = 0.0, bestPerim = 0.0;
                 for (int ei = 0; ei < 3; ei++)
                 {
                     // The edge directed along f0's winding, so the quad walk below keeps f0's winding.
@@ -2140,13 +2588,21 @@ namespace BetterBannerlordNavmeshing
                     if (x < 0 || y < 0 || x == y) continue;
                     if (x == u || x == w || y == u || y == w) continue;   // (b) four distinct vertices
                     double fold = NormalAngleDeg(v, a0, b0, c0, a1, b1, c1);
-                    if (fold > QuadMergeFoldMaxDegrees) continue;   // (d) step rims / stacked levels out
-                    double worst, perim;
-                    if (!QuadWorstAndPerimeter(v, u, w, x, y, out worst, out perim)) continue; // (c)
+                    // Site 6: fold > 25 deg  =>  NormalCos < cos(25). ONE-SIDED: a 170 deg fold is refused, so the
+                // test must stay one-sided (no Math.Abs, no fold-to-[0,90]).
+                double foldCos = NormalCos(v, a0, b0, c0, a1, b1, c1);
+                bool newFold = !(foldCos < CosQuadMergeFoldMax);
+                if (!newFold) continue;   // (d) step rims / stacked levels out
+                    double worstCosOut, perim;
+                    // (c)
+                    if (!QuadWorstAndPerimeter(v, u, w, x, y, out worstCosOut, out perim, st)) continue;
+                    // Site 7b: `worst` is now a COS (smaller = larger worst interior angle, which is the
+                    // better quad), so the ranking INVERTS: prefer the SMALLEST worstCos. The perim
+                    // tie-break is untouched.
                     bool better = bestF1 < 0
-                        || worst > bestWorst + 1e-9
-                        || (Math.Abs(worst - bestWorst) <= 1e-9 && perim < bestPerim - 1e-9);
-                    if (better) { bestWorst = worst; bestPerim = perim; bestF1 = f1; }
+                        || worstCosOut < bestWorstCos - 1e-9
+                        || (Math.Abs(worstCosOut - bestWorstCos) <= 1e-9 && perim < bestPerim - 1e-9);
+                    if (better) { bestWorstCos = worstCosOut; bestPerim = perim; bestF1 = f1; }
                 }
 
                 if (bestF1 >= 0)
@@ -2224,7 +2680,8 @@ namespace BetterBannerlordNavmeshing
         // A face is a quad-merge candidate while still thin by either predicate.
         private static bool IsThinForQuad(float[] v, int a, int b, int c)
         {
-            if (MinAngle(v, a, b, c) < QuadMergeThinMinAngleDegrees) return true;
+            // Site 9: MinAngle < 6 deg  =>  CosMinAngle > cos(6). The aspect test below is already cos-free.
+            if (CosMinAngle(v, a, b, c) > CosQuadMergeThinAngle) return true;
             double area = Area(v, a, b, c);
             if (area < 1e-12) return false;
             double longest = Math.Max(Len(v, a, b), Math.Max(Len(v, b, c), Len(v, c, a)));
@@ -2250,7 +2707,7 @@ namespace BetterBannerlordNavmeshing
         // Because a convex quad's four interior angles sum to 360, `worst` is a true convexity measure
         // and stays a valid ranking key for the best-neighbour choice.
         private static bool QuadWorstAndPerimeter(float[] v, int u, int w, int x, int y,
-            out double worst, out double perim)
+            out double worst, out double perim, Stats st)
         {
             worst = 0.0; perim = 0.0;
             // walk = w -> x -> u -> y
@@ -2313,7 +2770,10 @@ namespace BetterBannerlordNavmeshing
             //
             // This also subsumes the old bowtie rejection (two opposite-sign corners): a self-
             // intersecting walk always has mixed turn signs, so it is refused on its first bad corner.
-            worst = 180.0;
+            // Site 7: `worst` becomes `worstCos`. max-of-cos == min-of-angle, so the ranking and the
+            // ceiling test both move into cos space: ang >= 179.9  =>  cosA <= cos(179.9), and
+            // ang < worst  =>  cosA > worstCos.
+            double worstCos = -1.0;
             for (int i = 0; i < 4; i++)
             {
                 int pa = (i + 3) % 4, pb = i, pc = (i + 1) % 4;
@@ -2326,9 +2786,8 @@ namespace BetterBannerlordNavmeshing
                 if (l1 < 1e-12 || l2 < 1e-12) return false;
                 double cosA = (e1x * e2x + e1y * e2y) / (l1 * l2);
                 if (cosA > 1) cosA = 1; if (cosA < -1) cosA = -1;
-                double ang = Math.Acos(cosA) * 180.0 / Math.PI;
-                if (ang >= QuadConvexMaxInteriorAngleDegrees) return false;
-                if (ang < worst) worst = ang;
+                if (cosA <= CosQuadConvexCeiling) return false;
+                if (cosA > worstCos) worstCos = cosA;
             }
 
             // ---- THE ENGINE'S FRAME (constraint (h)) ----
@@ -2371,7 +2830,9 @@ namespace BetterBannerlordNavmeshing
                 if (m1 < 1e-12 || m2 < 1e-12) return false;
                 double cc = (f1x * f2x + f1z * f2z) / (m1 * m2);
                 if (cc > 1) cc = 1; if (cc < -1) cc = -1;
-                if (Math.Acos(cc) * 180.0 / Math.PI >= QuadXzMaxInteriorAngleDegrees) return false;
+                // Site 8: Acos(cc)*180/PI >= 175  =>  cc <= cos(175). The Acos here was inline, so there is
+                // nothing else to change.
+                if (cc <= CosQuadXzCeiling) return false;
             }
 
             for (int i = 0; i < 4; i++)
@@ -2379,6 +2840,9 @@ namespace BetterBannerlordNavmeshing
                 int a = walk[i], b = walk[(i + 1) % 4];
                 perim += Len(v, a, b);
             }
+            // Output cos, not degrees. The single caller ranks candidates by this value, and in cos space
+            // "smaller worst cos" == "larger worst angle", which is the direction the tie-break wants.
+            worst = worstCos;
             return true;
         }
     }

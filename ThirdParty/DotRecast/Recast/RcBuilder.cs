@@ -80,6 +80,20 @@ namespace DotRecast.Recast
             return results;
         }
         
+        // DEAD CODE - NOT FOR PRODUCT BUILD. BuildMultiThread collects into a ConcurrentQueue and returns
+        // results.ToList(), i.e. COMPLETION order, which depends on thread scheduling. Wiring this into
+        // the product would make the build machine-dependent again - exactly the class of bug the
+        // deterministic cleanup was written to remove.
+        //
+        // It is dead today: the only product reference to RcBuilder is the static RcConfig.CalcBorder
+        // call (TiledNavMeshBuilder.cs ~line 859); the tiled builder uses Parallel.For with per-index
+        // slots instead, so its output order is fixed by the index, not by who finished first.
+        //
+        // DO NOT call this without adding a canonical sort (e.g. by tile index) before the results are
+        // consumed.
+        [Obsolete("BuildMultiThread returns results in nondeterministic completion order. Do not use in the "
+            + "product build; use the Parallel.For + per-index-slot path in TiledNavMeshBuilder, or sort the "
+            + "results by tile index before consuming them.")]
         private List<RcBuilderResult> BuildMultiThread(IRcInputGeomProvider geom, RcConfig cfg, RcVec3f bmin, RcVec3f bmax, int tw, int th,
             int threads, TaskFactory taskFactory, CancellationToken cancellation,
             bool keepInterResults, bool buildAll)
