@@ -378,7 +378,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelAgentClimbMeters` | `0` | Agent max climb (m) for the v2 core. `0` = auto-derive so `NavMeshMaxSlopeDegrees` is actually traversable (Recast needs `walkableClimb >= 2*cs*tan(slope)/ch`). See the Voxel core section. |
 | `NavMeshVoxelDetailMesh` | `true` | v2 detail mesh. Adds interior vertices so faces follow the terrain instead of chording under knolls (bounded by `NavMeshMaxErrorMeters`). Off = leaner bin, but faces cut through hills. See the Voxel core section. |
 | `NavMeshVoxelDetailSampleDist` | `2` | v2 detail-mesh sampling distance (m). `0` = auto (`max(0.9, cellSize)`). The default cuts the tight/sliver faces Recast's detail edge tessellation makes along walkable boundaries. Lower = more surface detail (more faces). |
-| `NavMeshVoxelContourMaxError` | `1.3` | v2 contour simplification error (voxels). `0` = auto (`NavMeshMaxErrorMeters / cellSize`, i.e. 0.5). A simpler walkable boundary removes most remaining boundary slivers on boundary-rich maps, with no change to the surface-error budget. |
+| `NavMeshVoxelContourMaxError` | `2.0` | v2 contour simplification error (voxels). `0` = auto (`NavMeshMaxErrorMeters / cellSize`, i.e. 0.5). Raised from 1.3 to 2.0 in V3.64: the sliver census measured the post-cleanup sliver population falling -43% / -24% / -34% (CC_20 / Birtu / Basamu), and the 0.50 m boundary budget at cs 0.25 m equals the cleanup's own `SurfaceToleranceMeters`. No change to the surface-error budget. |
 | `NavMeshVoxelIncludeAssets` | `true` | v2: ingest static asset collision geometry (interiors, stairs, decks, bridges) into the voxel soup so structures are navigable. Terrain-only when false. See *Assets (structures)*. |
 | `NavMeshVoxelIncludeDynamic` | `true` | v2 assets: include movable/dynamic physics props (e.g. Birtu's merlons) at their placed pose. Set false to build only from static geometry. |
 | `NavMeshVoxelIncludeFlora` | `false` | v2 assets: include flora collision (trees/bushes). Off by default - flora is usually visual and its many small shapes add faces without being reliably navigable. |
@@ -425,7 +425,7 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
 - **Settings:** `NavMeshVoxelCellSize` (default 0.25 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
   (0.25 m -> detail-mesh tolerance), `NavMeshCoarsestSpacing` (tile size), `NavMeshHeightOffsetMeters`,
   `NavMeshVoxelAgentClimbMeters` (0 = auto), `NavMeshVoxelDetailMesh` (default true),
-  `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 1.3 vox),
+  `NavMeshVoxelDetailSampleDist` (default 2 m), `NavMeshVoxelContourMaxError` (default 2.0 vox),
   `NavMeshVoxelAgentRadius` (default 0.25 m), `NavMeshVoxelLedgeFilter` (default true),
   `NavMeshVoxelGapFillCells` (default 2), `NavMeshVoxelStitchMaxGapCells` (default 6),
   `NavMeshVoxelPruneIsolatedIslands` / `NavMeshVoxelPruneMaxIslandFaces` (default true / 400),
@@ -712,7 +712,8 @@ keeps the mesh on the ground. Detail vertices are seam-welded across tiles/polys
 which historically produced a large population of very thin (sliver) faces concentrated along walkable-area
 boundaries and terrain breaks. Two knobs cut that population by ~5-30x with no fidelity change:
 `NavMeshVoxelDetailSampleDist` (default 2 m) coarsens the edge/interior sampling, and
-`NavMeshVoxelContourMaxError` (default 1.3 vox) simplifies the walkable boundary (fewer boundary vertices ->
+`NavMeshVoxelContourMaxError` (default 2.0 vox; raised from 1.3 in V3.64, which the census measured as
+another -43%/-24%/-34% on CC_20/Birtu/Basamu) simplifies the walkable boundary (fewer boundary vertices ->
 fewer boundary slivers). On the harness hill scene the tight-face count (min edge < 0.25 m) and slivers
 (min angle < 5 deg) fall from 0/31 to 0/1, and on a boundary-rich box scene from 56/244 to 0/31, with the
 fidelity budget unchanged. Raise `NavMeshVoxelDetailSampleDist` up to ~2x the smallest polygon extent for

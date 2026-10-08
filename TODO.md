@@ -260,6 +260,19 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   better without a load-bearing semantic change (`--radius 0.5`/`--slope 45` alter agent semantics;
   `tile 8 + 2.0 vox` is -60% but aggressive). Report: `SliverPlanValidation.md`; the refinements are
   folded into `SliverReductionPlan.md` (v2, appendix section 11).
+- IMPLEMENTED (2026-10-08, V3.64): `contourMaxError` default 1.3 -> 2.0 vox in the exporter
+  (`SceneNavMeshExporter.cs`), the builder settings default, the in-repo harness SnapshotSettings, and the
+  README (3 spots). Deployed for the user's in-engine boundary-fidelity check. The golden hashes are being
+  re-captured (the mesh changed by design; capture running). Tile 12 m remains optional after the user's
+  in-engine validation. Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs or turn detail off.
+
+## 11. Crisscross / X artifacts (user request 2026-10-08 - handle later)
+
+- From the 3.54 feedback (`Feedback\3.54\criscros that bannerlord seems to accept like the doorway
+  before.PNG`): the navmesh crisscrosses/overlaps itself like an X; two examples known. The doorway
+  variant is engine-accepted, so severity varies - not yet investigated. Related machinery when the round
+  comes: `MarkSelfOverlaps` / `RepairFaceQuality` (the V3.46 same-level overlap repairs) and the `--scan`
+  self-overlap report. Later, per the user.
 
 ## 7. Persist the acceptance suite in the repo (accepted; queued - no repo changes yet)
 

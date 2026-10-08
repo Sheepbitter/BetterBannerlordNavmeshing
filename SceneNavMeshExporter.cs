@@ -135,9 +135,11 @@ namespace BetterBannerlordNavmeshing
         public float NavMeshVoxelDetailSampleDist = 2.0f;
 
         // v2 contour simplification error (voxels). 0 = auto (NavMeshMaxErrorMeters / cellSize).
-        // Default 1.3 vox (the plan's value): a simpler walkable boundary removes most of the
-        // remaining boundary slivers on boundary-rich maps at no fidelity cost.
-        public float NavMeshVoxelContourMaxError = 1.3f;
+        // Default 2.0 vox (V3.64): the sliver census measured the post-cleanup sliver population
+        // falling -43% / -24% / -34% on CC_20 / Birtu / Basamu versus 1.3 vox, and the 0.50 m
+        // boundary budget at cs 0.25 m equals the cleanup's own SurfaceToleranceMeters. 1.3 vox was
+        // the pre-census default.
+        public float NavMeshVoxelContourMaxError = 2.0f;
 
         // Phase 3: ingest static asset collision geometry (interiors, stairs, decks, bridges over
         // terrain) into the v2 voxel core. NavMeshHeightOffsetMeters lifts the whole merged mesh

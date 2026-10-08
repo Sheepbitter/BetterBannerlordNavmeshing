@@ -412,7 +412,7 @@ namespace BetterBannerlordNavmeshing
             // a simpler walkable boundary removes the tight/sliver faces that Recast's detail edge
             // tessellation makes at every boundary vertex on boundary-rich maps, with no fidelity
             // change (contour error is separate from the surface error budget).
-            public float ContourMaxErrorVoxels = 1.3f;
+            public float ContourMaxErrorVoxels = 2.0f;
         }
 
         public sealed class VoxelTileResult
