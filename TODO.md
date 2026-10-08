@@ -249,7 +249,7 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   0.50 m boundary budget at cs 0.25 equals the cleanup's own `SurfaceToleranceMeters`; all invariants
   PASS). Tile 12 m optional after in-engine validation. Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs
   or turn detail off.
-- Open: in-engine boundary-fidelity validation at 2.0/3.0 vox and tile 12; why tile <= 12 zeroes CC_20's
+- Open: in-engine boundary-fidelity validation of tile 12; why tile <= 12 zeroes CC_20's
   merge-stitch pairs (808 -> 0); the `edgelen 20` anomaly; the afterPrune terrain-probe discrepancy.
 - VALIDATED (2026-10-07): independent validation (LongCat 2.5) CONFIRMED all four claims with exact number
   reproduction (its `afterCleanup` count equals the cleanup's own logged `thin after`; every lever
@@ -262,9 +262,21 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   folded into `SliverReductionPlan.md` (v2, appendix section 11).
 - IMPLEMENTED (2026-10-08, V3.64): `contourMaxError` default 1.3 -> 2.0 vox in the exporter
   (`SceneNavMeshExporter.cs`), the builder settings default, the in-repo harness SnapshotSettings, and the
-  README (3 spots). Deployed for the user's in-engine boundary-fidelity check. The golden hashes are being
-  re-captured (the mesh changed by design; capture running). Tile 12 m remains optional after the user's
-  in-engine validation. Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs or turn detail off.
+  README (3 spots). Golden hashes re-captured and verified PASS. USER-VALIDATED in-engine (2026-10-08):
+  "does look an improvement"; small staircase regressions noted, same style as the existing CC_20
+  staircase issues (fold into the staircase round). Note: the editor keeps the script's settings per
+  scene, so scenes whose script predates the change still read 1.3 until the value is set to 2.0 in the
+  panel (explains the earlier no-change runs). Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs or
+  turn detail off.
+- MEASURED (2026-10-08): tile 12 m vs the shipped 16 m on Na'ilu / Tasksatu / Birtu (current code,
+  contour 2.0 vox, harness whole-map replay). Tile 12 is faster on all three (buildMs 42832 -> 34944 =
+  -18.4% Na'ilu, 5975 -> 5641 = -5.6% Tasksatu, 4516 -> 4420 = -2.1% Birtu), long-thin aspect>4 down
+  9-13% (aspect>8 down 18-24%), meanQuality up ~0.004 on all, tiny=0, invariants PASS everywhere.
+  Mechanism: sliver births drop (Na'ilu needles before 787 -> 428, thin before 17976 -> 12511) so cleanup
+  refine work drops (17.0 s -> 10.7 s). Na'ilu islands 3 -> 2 (two small islands merge). Tasksatu needles
+  7 -> 14 (0.015% of faces - negligible). Independent re-runs reproduce every mesh metric
+  byte-identically. Report: `Tile12MeasurementReport.md`. Tile 12 remains optional pending in-engine
+  validation (set coarsest=12m, rebuild, compare visually).
 
 ## 11. Crisscross / X artifacts (user request 2026-10-08 - handle later)
 

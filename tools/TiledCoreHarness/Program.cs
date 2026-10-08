@@ -976,6 +976,8 @@ internal static class Program
                         quiet = true; break;
                     case "--cs":
                         s.VoxelCellSizeMeters = ParseFloat(v); i++; break;
+                    case "--tile":
+                        s.TileWorldSizeMeters = ParseFloat(v); i++; break;
                     case "--radius":
                         s.AgentRadiusMeters = ParseFloat(v); i++; break;
                     case "--climb":
