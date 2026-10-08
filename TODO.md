@@ -219,6 +219,10 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
 ## 4. Staircase restore round (queued)
 
 - Restore the staircase work last, with the gate ramp folded in; deploy a testable build before it.
+- USER-CONFIRMED (2026-10-08): the staircase regressions seen after the recent default changes (2.0 vox /
+  10 m tile) are real ("The stairs regression is real") and are to be handled by THIS round together with
+  the pre-existing V3.52 gate-plate staircase issue (section 9). Do not chase them separately. Attribution
+  (2.0 vs 10 m vs both) can be bisected with the harness levers `--conterr` / `--tile` when the round starts.
 
 ## 5. Fixture refresh (queued/partially done)
 
