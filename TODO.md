@@ -249,8 +249,9 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   0.50 m boundary budget at cs 0.25 equals the cleanup's own `SurfaceToleranceMeters`; all invariants
   PASS). Tile 12 m optional after in-engine validation. Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs
   or turn detail off.
-- Open: in-engine boundary-fidelity validation of tile 12; why tile <= 12 zeroes CC_20's
-  merge-stitch pairs (808 -> 0); the `edgelen 20` anomaly; the afterPrune terrain-probe discrepancy.
+- Open: in-engine boundary-fidelity validation of the tile choice (candidates 10/12 m; 8 m aggressive); why
+  tile <= 12 zeroes CC_20's merge-stitch pairs (808 -> 0); the `edgelen 20` anomaly; the afterPrune
+  terrain-probe discrepancy.
 - VALIDATED (2026-10-07): independent validation (LongCat 2.5) CONFIRMED all four claims with exact number
   reproduction (its `afterCleanup` count equals the cleanup's own logged `thin after`; every lever
   magnitude matched; invariants PASS). Refinements: `MaxCleanupSlopeDegrees`/`FaceSlopeDeg` are dead code
@@ -277,6 +278,15 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   7 -> 14 (0.015% of faces - negligible). Independent re-runs reproduce every mesh metric
   byte-identically. Report: `Tile12MeasurementReport.md`. Tile 12 remains optional pending in-engine
   validation (set coarsest=12m, rebuild, compare visually).
+- SWEPT (2026-10-08): tile 16/14/12/10/8/6 on all five fixtures (Na'ilu, Tasksatu, Birtu, Basamu, CC_20 v2).
+  Build time falls with the tile, bottoming around 8-10 m (Na'ilu -41.4% at 6 m; Basamu -30.0% at 8 m;
+  CC_20 -26.3% at 6 m; Birtu -4.1% at 10 m); faces stay flat at 12 m and inflate from 10 m down (CC_20
+  +14.9% at 8, +35.0% at 6; Birtu +21.8% at 6); long-thin aspect>4 down 30-36% by 6 m; meanQuality improves
+  monotonically; needles near-flat except Basamu t6=82 and Tasksatu t14=18 (both reproduced). 14 m adds
+  nothing; 6 m overshoots (time reversals on Birtu/Basamu). Read: 12 m nearly free, 10 m modest step,
+  8 m aggressive. Verification: 10 of 24 new configs re-run byte-identically; fixture identity
+  cross-checked via golden F (CC_20 v2 235660, Basamu 482993). Report + CSV: `TileSweepReport.md` /
+  `TileSweepTable.csv`. In-engine validation still pending.
 
 ## 11. Crisscross / X artifacts (user request 2026-10-08 - handle later)
 

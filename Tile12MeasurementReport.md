@@ -1,5 +1,7 @@
 # Tile-12 Measurement Report
 
+> Superseded for the full tile curve by `TileSweepReport.md` (16-6 m across five maps, 2026-10-08).
+
 Date: 2026-10-08. Harness: `tools/TiledCoreHarness` (whole-map replay; the walk-area border clamp is not
 applied offline). Fixtures: Na'ilu (dump 2026-10-08 14:07), Tasksatu (dump 2026-10-08 14:07), Birtu
 (2026-09-30 fixture, control). Command: `TiledCoreHarness --snapshot <fixture-base> --quality --cleanup on`
