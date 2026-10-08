@@ -280,6 +280,7 @@ namespace BetterBannerlordNavmeshing
             public int[] AssetTris;
             public bool[] AssetForceWalkable;
             public bool[] AssetLedgeExempt;
+            public bool[] AssetGate;
             public bool[] TerrainHoleMask;
             public TiledNavMeshBuilder.BorderPolygon Border;
             public VoxelNavMeshGenerator.SoupCapture SoupCapture;
@@ -715,7 +716,7 @@ namespace BetterBannerlordNavmeshing
                 {
                     SceneCollisionGeometry.AssetEntityRecord src = assets.Entities[i];
                     records.Add(SceneSnapshot.Expand(src.Name, unchecked((int)src.Flags), src.Mobility,
-                        src.Capped, src.VertsXyz, src.Tris));
+                        src.Capped, src.VertsXyz, src.Tris, src.Gate));
                 }
                 string assetsPath = System.IO.Path.Combine(folder, prefabName + "_snapshot_assets.bin");
                 SceneSnapshot.WriteAssetsBin(assetsPath, records);
@@ -1119,6 +1120,7 @@ namespace BetterBannerlordNavmeshing
                     int[] assetTris = null;
                     bool[] assetForceWalkable = null;
                     bool[] assetLedgeExempt = null;
+                    bool[] assetGate = null;
                     TiledNavMeshBuilder.BarrierWalls assetBarriersSync = null;
                     if (voxelIncludeAssets)
                     {
@@ -1130,6 +1132,7 @@ namespace BetterBannerlordNavmeshing
                         assetTris = assets.Tris;
                         assetForceWalkable = assets.ForceWalkableTris;
                         assetLedgeExempt = assets.LedgeExemptTris;
+                        assetGate = assets.GateTris;
                         assetBarriersSync = assets.Barriers;
                         assetsMs = assets.ScanMs;
                     }
@@ -1143,7 +1146,7 @@ namespace BetterBannerlordNavmeshing
                     TerrainNavMeshBuilder.Result voxelMesh = VoxelNavMeshGenerator.BuildExportMesh(
                         grid.Heights, grid.Width, grid.Height, grid.Spacing, settings.SampleStride,
                         voxel, settings.WriteObj, voxelAgentClimbMeters, Environment.ProcessorCount,
-                        assetVerts, assetTris, assetForceWalkable, assetLedgeExempt, grid.HoleMask,
+                        assetVerts, assetTris, assetForceWalkable, assetLedgeExempt, assetGate, grid.HoleMask,
                         soupCapture, RunLog(log), out voxelBuildMs, border);
                     if (voxelMesh == null)
                     {
@@ -1331,6 +1334,7 @@ namespace BetterBannerlordNavmeshing
                 int[] assetTris = null;
                 bool[] assetForceWalkable = null;
                     bool[] assetLedgeExempt = null;
+                    bool[] assetGate = null;
                     TiledNavMeshBuilder.BarrierWalls assetBarriers = null;
                 if (NavMeshVoxelIncludeAssets)
                 {
@@ -1344,6 +1348,7 @@ namespace BetterBannerlordNavmeshing
                     assetTris = assets.Tris;
                     assetForceWalkable = assets.ForceWalkableTris;
                     assetLedgeExempt = assets.LedgeExemptTris;
+                    assetGate = assets.GateTris;
                     assetBarriers = assets.Barriers;
                     assetsMs = assetsWatch.ElapsedMilliseconds;
                 }
@@ -1385,6 +1390,7 @@ namespace BetterBannerlordNavmeshing
                 req.AssetTris = assetTris;
                 req.AssetForceWalkable = assetForceWalkable;
                 req.AssetLedgeExempt = assetLedgeExempt;
+                req.AssetGate = assetGate;
                 req.TerrainHoleMask = grid.HoleMask;
                 req.Border = border;
                 req.SoupCapture = NavMeshVoxelWriteSoupObj ? new VoxelNavMeshGenerator.SoupCapture() : null;
@@ -1432,7 +1438,7 @@ namespace BetterBannerlordNavmeshing
                     req.GridHeights, req.GridWidth, req.GridHeight, req.GridSpacing, req.Settings.SampleStride,
                     req.Voxel, req.Settings.WriteObj, req.AgentClimbMeters, Environment.ProcessorCount,
                     req.AssetVertsEngineXyz, req.AssetTris, req.AssetForceWalkable,
-                    req.AssetLedgeExempt, req.TerrainHoleMask,
+                    req.AssetLedgeExempt, req.AssetGate, req.TerrainHoleMask,
                     req.SoupCapture, req.Log, out buildMs, req.Border);
                 req.BuildMs = buildMs;
             }

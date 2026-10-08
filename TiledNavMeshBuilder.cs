@@ -765,7 +765,8 @@ namespace BetterBannerlordNavmeshing
         // keeps the input byte-for-byte identical to the pre-ramp behaviour.
         public static VoxelMeshResult Build(float[] vertsXyz, int[] tris, TiledNavMeshSettings s,
             int maxWorkers, Action<string> log, bool[] forceWalkableTriangles = null,
-            bool[] ledgeExemptTriangles = null, BorderPolygon borderPoly = null)
+            bool[] ledgeExemptTriangles = null, BorderPolygon borderPoly = null,
+            bool[] gateTriangles = null)
         {
             if (vertsXyz == null)
                 throw new ArgumentNullException("vertsXyz");
@@ -784,6 +785,8 @@ namespace BetterBannerlordNavmeshing
                 throw new ArgumentException("forceWalkableTriangles length must match the triangle count.");
             if (ledgeExemptTriangles != null && ledgeExemptTriangles.Length != inputTris)
                 throw new ArgumentException("ledgeExemptTriangles length must match the triangle count.");
+            if (gateTriangles != null && gateTriangles.Length != inputTris)
+                throw new ArgumentException("gateTriangles length must match the triangle count.");
 
             float cs = s.VoxelCellSizeMeters;
             float ch = s.CellHeightMeters;
@@ -1303,8 +1306,22 @@ namespace BetterBannerlordNavmeshing
             int gatePlateFaces = 0;
             if (s.GatePlateBlend && merged.Tris.Count >= 3)
             {
+                // fixE: the gate/door provenance cells. The blend may only rotate a plate a real
+                // gate/usable-door projects; the editor collector labels that collision from the scene
+                // tag `gate` (see SceneCollisionGeometry). Rasterise the labelled triangles' XZ
+                // footprint so a plate can be tested by where it sits, exactly as forcedRampCells is.
+                HashSet<long> gateCells = null;
+                if (gateTriangles != null)
+                {
+                    gateCells = new HashSet<long>(LongKeyComparer.Instance);
+                    for (int t = 0; t < inputTris; t++)
+                    {
+                        if (!gateTriangles[t]) continue;
+                        RasterizeTriCellsXz(vertsXyz, tris, t, s.VoxelCellSizeMeters, gateCells);
+                    }
+                }
                 gatePlateFaces = BlendGatePlates(merged, s.VoxelCellSizeMeters, s.CellHeightMeters,
-                    s.AgentMaxClimbMeters, s.MaxSlopeDegrees, forcedRampCells, log);
+                    s.AgentMaxClimbMeters, s.MaxSlopeDegrees, forcedRampCells, gateCells, log);
             }
 
             // The coarse soup grid is built ONCE here and shared with the cross-tile stitch below: the stitch
@@ -1335,17 +1352,65 @@ namespace BetterBannerlordNavmeshing
                     + " (cap=" + s.StitchMaxGapCells + " cells)");
             }
 
-            // STEEP-FACE REPAIR, and it must run BEFORE the prune so any fragment a component that cannot be
-            // made whole leaves behind is judged by the island cap rather than shipped. Unlike the reverted
-            // V3.47 the drops are minimally connectivity-restored (see RepairSteepFaces): the rule is
-            // unchanged, but only the faces actually needed to hold the island count are put back - which is
-            // what stops the pass from costing CC_20 two islands AND what lets it clear the staircase.
-            RepairSteepFaces(merged, forcedRampCells, s.VoxelCellSizeMeters,
-                s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
-                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), log);
-
             // Prune small isolated islands (sealed-void lids / stray fragments) before the gate, so an
             // unreachable fragment never reaches the engine. Never touches the big networks.
+            // The provenance set and cell size live out here because the cap runs a SECOND time after the
+            // steep-face repair (see there): a fragment the repair's drops leave behind must be judged by
+            // the cap too, and the second pass must reuse the same exemption set so an island is never
+            // judged by different rules in the two passes.
+            // V3.63 (fixC): the staircase-top regression fixB introduced.  fixB moved the steep-face
+            // pass AFTER the cleanup to stop the cleanup creating under-roof faces; but the cleanup then
+            // retriangulates the reported contour-spike fan (the eight faces that all share
+            // (1120.500,115.700,1078.500)) into a SINGLE 81.6 deg face spanning the whole wall, where
+            // V3.50's cleanup - running on the fan-REMOVED mesh - produced the accepted ~71 deg pair.
+            // Re-running the pass here, at V3.50's own position before the prune, restores V3.50's wall.
+            // The drops are deliberately narrowed to the contour-spike fans that are genuinely tall: the
+            // pre-cleanup drops that break the roof are the short (2.0-3.0 m) steep faces under the
+            // collision roof, not the fan.
+            {
+                int _nf = merged.Tris.Count / 3;
+                if (_nf >= 3)
+                {
+                    var _preDrop = new bool[_nf];
+                    var _preSpike = new bool[_nf];
+                    string _preDetail;
+                    MarkSteepFaces(merged, _preDrop, _preSpike, forcedRampCells, s.VoxelCellSizeMeters,
+                        s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
+                        SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), out _preDetail);
+                    int _fanDropped = 0;
+                    // V3.50's own guard first, on the full marked set: restore the minimum needed to
+                    // keep the island count (measured: the pristine V3.50 drop set keeps 15).  Only
+                    // THEN narrow to the tall contour-spike fans - a subset of V3.50's drops, so it can
+                    // only coarsen the components V3.50 already kept, and it leaves the short (2.0-3.0 m)
+                    // steep faces under the collision roof in place (dropping those is the roof bug).
+                    {
+                        var _restorable = (bool[])_preDrop.Clone();
+                        int _restored = RestoreSplitComponents(merged, _preDrop, _restorable, _preSpike);
+                        for (int _f = 0; _f < _nf; _f++)
+                        {
+                            if (!_preDrop[_f]) continue;
+                            float _ylo = Math.Min(merged.Y[merged.Tris[_f * 3]],
+                                Math.Min(merged.Y[merged.Tris[_f * 3 + 1]], merged.Y[merged.Tris[_f * 3 + 2]]));
+                            float _yhi = Math.Max(merged.Y[merged.Tris[_f * 3]],
+                                Math.Max(merged.Y[merged.Tris[_f * 3 + 1]], merged.Y[merged.Tris[_f * 3 + 2]]));
+                            if (_preSpike[_f] && (_yhi - _ylo) > SteepFanMinHeightMeters) _fanDropped++;
+                            else _preDrop[_f] = false;
+                        }
+                        if (_fanDropped > 0)
+                        {
+                            CompactFaces(merged, _preDrop);
+                            Log(log, "v2: steep faces (pre-cleanup fan drop): dropped " + _fanDropped
+                                + " tall contour-spike face(s) > " + F(SteepFanMinHeightMeters)
+                                + "m from V3.50's restored set (" + _restored
+                                + " restored to keep the island count), so the cleanup"
+                                + " retriangulates the fan-removed wall (the fixC staircase-top repair)");
+                        }
+                    }
+                }
+            }
+
+            HashSet<long> steppedCells = null;
+            float qcs = s.VoxelCellSizeMeters;
             if (s.PruneIsolatedIslands && s.PruneMaxIslandFaces > 0 && merged.Tris.Count >= 3)
             {
                 // Per-face provenance for the exemption: the cells whose walkable span only exists because
@@ -1353,8 +1418,6 @@ namespace BetterBannerlordNavmeshing
                 // merged stepped-prop leftover rather than a walkable network, and is pruned whatever its
                 // size; an island that merely contains some restored faces (the castle network with its
                 // flights) stays mixed provenance and is kept.
-                HashSet<long> steppedCells = null;
-                float qcs = s.VoxelCellSizeMeters;
                 for (int i = 0; i < results.Length; i++)
                 {
                     List<float> cellXz = results[i] != null ? results[i].SteppedRestoredCellXz : null;
@@ -1440,11 +1503,61 @@ namespace BetterBannerlordNavmeshing
                 if (cln.DecimDiag != null) Log(log, "cleanup: " + cln.DecimDiag);
             }
 
+            // V3.62: the steep-face repair runs HERE - after the sliver cleanup and before the face-quality
+            // repairs. Measured reason (CC_20): the cleanup is time-budgeted and its sliver/decimate work
+            // competes for that budget, so ANY change to the mesh ahead of it - this pass included, which
+            // is where V3.50 put it - leaves under-roof faces the pre-V3.50 builds did not have; running
+            // the repair after it restores the pre-V3.50 roof exactly. The cleanup has already recorded
+            // the quad pairs by now, so the repair is quad-aware (see RepairSteepFaces): its drops carry
+            // the pairs across the compaction the same way the face-quality repairs do. The component
+            // labels (and their pre-drop face counts) captured here are carried through both
+            // compactions so the island cap below can tell damage the post-prune passes made from
+            // an island the first prune already kept.
+            int[] preSteepComponents = FaceComponentsOf(merged.Tris, merged.Tris.Count / 3);
+            // FaceComponentsOf returns the raw union-find parents: faces of one component can carry
+            // different intermediate parents, so compress first - every face must carry the SAME
+            // component root, or the island cap below cannot match a face to its pre-drop component.
+            for (int i = 0; i < preSteepComponents.Length; i++)
+                preSteepComponents[i] = FaceFind(preSteepComponents, i);
+            var preSteepSizes = new Dictionary<int, int>();   // pre-drop component -> its face count
+            foreach (int r in preSteepComponents)
+            {
+                int c;
+                preSteepSizes.TryGetValue(r, out c);
+                preSteepSizes[r] = c + 1;
+            }
+            quadPairs = RepairSteepFaces(merged, forcedRampCells, s.VoxelCellSizeMeters,
+                s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
+                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), quadPairs,
+                ref preSteepComponents, log);
+
             // V3.46: the last pass that rewrites faces, so the face-quality repairs run HERE - after the
             // sliver cleanup has finished and BEFORE the result arrays are built, and the recorded quad
             // pairs are remapped through the same compaction (a pair whose face was dropped goes with
             // it, so the writer can never emit a quad over a hole).
-            quadPairs = RepairFaceQuality(merged, quadPairs, log);
+            quadPairs = RepairFaceQuality(merged, quadPairs, ref preSteepComponents, log);
+
+            // V3.62: the island cap runs a SECOND time (the exemption set is hoisted above the first pass).
+            // The steep-face repair and the face-quality repairs now both run after the first prune - the
+            // repair must, so the cleanup sees the same mesh the pre-V3.50 builds saw - so the damage
+            // their drops leave behind would otherwise ship unjudged. The export gate saw exactly that:
+            // a one-face island in the written mesh. The cap here judges ONLY islands whose pre-drop
+            // component lost faces to those drops - split into fragments OR shrunk to a remnant (see
+            // PruneSmallIslands): an island the drops never touched is never re-judged, because the
+            // sliver cleanup's decimation shrinks island face counts after the first prune - exactly
+            // where V3.50 ran its prune too - so the accepted V3.50 mesh ships those islands below the
+            // cap as well.
+            if (s.PruneIsolatedIslands && s.PruneMaxIslandFaces > 0 && merged.Tris.Count >= 3)
+            {
+                var pst2 = new PruneStats();
+                quadPairs = PruneSmallIslands(merged, s.PruneMaxIslandFaces, steppedCells, qcs, pst2, barrierTriCount > 0 ? obstructions : null, quadPairs, preSteepComponents, preSteepSizes);
+                Log(log, "v2: prune (post steep): removed " + pst2.RemovedIslands + " islands, "
+                    + pst2.RemovedFaces + " faces (<=" + s.PruneMaxIslandFaces + " faces each, split or"
+                    + " reduced islands only); largest removed=" + pst2.LargestRemoved + " at (" + F(pst2.LargestX) + ","
+                    + F(pst2.LargestY) + "," + F(pst2.LargestZ) + "); kept=" + pst2.KeptIslands + " islands"
+                    + (pst2.QuadPairsLost > 0 ? "; quad pairs kept " + pst2.QuadPairsKept + "/"
+                        + (pst2.QuadPairsKept + pst2.QuadPairsLost) : ""));
+            }
 
             int mergedVertices = merged.X.Count;
             var result = new VoxelMeshResult();
@@ -1694,6 +1807,37 @@ namespace BetterBannerlordNavmeshing
                 y = (float)(sy / n);
                 z = (float)(sz / n);
             }
+        }
+
+        // fixE: mark every voxel cell whose centre lies inside the XZ projection of triangle t.
+        private static void RasterizeTriCellsXz(float[] v, int[] tris, int t, float cs,
+            HashSet<long> cells)
+        {
+            int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+            float ax = v[a * 3], ay = v[a * 3 + 1];
+            float bx = v[b * 3], by = v[b * 3 + 1];
+            float cx = v[c * 3], cy = v[c * 3 + 1];
+            float minX = Math.Min(ax, Math.Min(bx, cx)), maxX = Math.Max(ax, Math.Max(bx, cx));
+            float minY = Math.Min(ay, Math.Min(by, cy)), maxY = Math.Max(ay, Math.Max(by, cy));
+            int ix0 = (int)Math.Floor(minX / cs), ix1 = (int)Math.Floor(maxX / cs);
+            int iy0 = (int)Math.Floor(minY / cs), iy1 = (int)Math.Floor(maxY / cs);
+            float dd = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+            if (dd > -1e-9f && dd < 1e-9f)
+            {
+                cells.Add(CellKey((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, cs));
+                return;
+            }
+            float inv = 1f / dd;
+            for (int iy = iy0; iy <= iy1; iy++)
+                for (int ix = ix0; ix <= ix1; ix++)
+                {
+                    float px = (ix + 0.5f) * cs, py = (iy + 0.5f) * cs;
+                    float w1 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) * inv;
+                    float w2 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) * inv;
+                    float w3 = 1f - w1 - w2;
+                    if (w1 >= -1e-4f && w2 >= -1e-4f && w3 >= -1e-4f)
+                        cells.Add(CellKey(px, py, cs));
+                }
         }
 
         private static long CellKey(float x, float z, float cs)
@@ -2051,7 +2195,7 @@ namespace BetterBannerlordNavmeshing
 
         private sealed class PruneStats
         {
-            public int RemovedIslands, RemovedFaces, LargestRemoved, KeptIslands;
+            public int RemovedIslands, RemovedFaces, LargestRemoved, KeptIslands, QuadPairsKept, QuadPairsLost;
             public float LargestX, LargestY, LargestZ;
             public int ExemptIslands, ExemptFaces, ExemptLargest;
             public float ExemptX, ExemptY, ExemptZ;
@@ -2066,8 +2210,9 @@ namespace BetterBannerlordNavmeshing
             public int BarrierPrunedIslands, BarrierPrunedFaces, BarrierPrunedLargest;
         }
 
-        private static void PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,
-            float cs, PruneStats st, ObstructionCells obstructions)
+        private static int[] PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,
+            float cs, PruneStats st, ObstructionCells obstructions, int[] quadPairs = null,
+            int[] preDropComponents = null, Dictionary<int, int> preDropSizes = null)
         {
             st.RemovedIslands = 0;
             st.RemovedFaces = 0;
@@ -2093,7 +2238,7 @@ namespace BetterBannerlordNavmeshing
 
             int nf = o.Tris.Count / 3;
             if (nf == 0)
-                return;
+                return quadPairs;
 
             var fp = new int[nf];
             var fpCore = new int[nf];
@@ -2158,6 +2303,35 @@ namespace BetterBannerlordNavmeshing
                 if (cs2 > cur) islandCoreMax[ir] = cs2;
             }
 
+            // Which islands did the post-prune drops TOUCH (split into fragments OR shrink to a
+            // remnant)? The pre-drop component roots (captured after the sliver cleanup and carried
+            // across both compactions) and their pre-drop face counts say so: a component whose
+            // surviving faces now total fewer faces than it had when the drops started lost faces to
+            // the steep-face repair or the face-quality repairs - those both run after the first prune,
+            // so their damage was never judged by the cap. Only such islands are judged by the cap in
+            // THIS pass; an island the drops never touched is never re-judged, because the sliver
+            // cleanup's decimation shrinks island face counts after the first prune (exactly where
+            // V3.50 ran its prune too), so the accepted V3.50 mesh ships those islands below the cap as
+            // well - re-judging them here would cull three real CC_20 islands (356-400 faces each).
+            var islandTouched = new Dictionary<int, bool>();
+            if (preDropComponents != null && preDropSizes != null && preDropComponents.Length == nf)
+            {
+                var totalNow = new Dictionary<int, int>();   // pre-drop component -> surviving faces
+                for (int f = 0; f < nf; f++)
+                {
+                    int c;
+                    totalNow.TryGetValue(preDropComponents[f], out c);
+                    totalNow[preDropComponents[f]] = c + 1;
+                }
+                for (int f = 0; f < nf; f++)
+                {
+                    int now, was;
+                    totalNow.TryGetValue(preDropComponents[f], out now);
+                    preDropSizes.TryGetValue(preDropComponents[f], out was);
+                    islandTouched[FaceFind(fp, f)] = now < was;
+                }
+            }
+
             var dropped = new Dictionary<int, bool>();
             int largestRoot = -1;
             int exemptRoot = -1;
@@ -2199,7 +2373,15 @@ namespace BetterBannerlordNavmeshing
                 int coreMax;
                 islandCoreMax.TryGetValue(kv.Key, out coreMax);
                 bool coalition = kv.Value >= 3 && coreMax <= maxFaces;
-                if (kv.Value <= maxFaces || coalition)
+                bool touched;
+                // Without a pre-drop reference (the first prune) the cap judges EVERY island, exactly as
+                // it always has; with one (the second, post-steep pass) an island is judged only when its
+                // pre-drop component lost faces to the post-prune drops - split into fragments OR shrunk
+                // to a remnant. Those drops ran after the first prune, so V3.50's own prune - which ran
+                // after its drops too - judged them the same way.
+                bool judged = islandTouched.Count == 0
+                    || (islandTouched.TryGetValue(kv.Key, out touched) && touched);
+                if (judged && (kv.Value <= maxFaces || coalition))
                 {
                     dropped[kv.Key] = true;
                     st.RemovedIslands++;
@@ -2249,7 +2431,7 @@ namespace BetterBannerlordNavmeshing
                 }
             }
             if (st.RemovedIslands == 0)
-                return;
+                return quadPairs;
 
             if (exemptRoot >= 0)
                 IslandCentroid(o, fp, nf, exemptRoot, ref st.ExemptX, ref st.ExemptY, ref st.ExemptZ);
@@ -2262,11 +2444,17 @@ namespace BetterBannerlordNavmeshing
             var newY = new List<float>();
             var newZ = new List<float>();
             var newTris = new List<int>(o.Tris.Count);
+            // Per-face drop mask: the second pass (post steep) carries the recorded quad pairs across this
+            // compaction the way the face-quality repairs do, and this mask is what that remap reads.
+            var faceDropped = new bool[nf];
             for (int f = 0; f < nf; f++)
             {
                 bool drop;
                 if (dropped.TryGetValue(FaceFind(fp, f), out drop) && drop)
+                {
+                    faceDropped[f] = true;
                     continue;
+                }
                 for (int k = 0; k < 3; k++)
                 {
                     int v = o.Tris[f * 3 + k];
@@ -2292,6 +2480,11 @@ namespace BetterBannerlordNavmeshing
                 if (o.Y[i] < o.MinY) o.MinY = o.Y[i];
                 if (o.Y[i] > o.MaxY) o.MaxY = o.Y[i];
             }
+            int qk, ql;
+            quadPairs = RemapQuadPairsAfterCompaction(quadPairs, faceDropped, nf, out qk, out ql);
+            st.QuadPairsKept = qk;
+            st.QuadPairsLost = ql;
+            return quadPairs;
         }
 
         // ================================================================ merge-level stitch
@@ -2595,7 +2788,7 @@ namespace BetterBannerlordNavmeshing
         }
 
         private static int BlendGatePlates(MergeOutput o, float cs, float ch, float climb,
-            float maxSlopeDegrees, HashSet<long> forcedRampCells,
+            float maxSlopeDegrees, HashSet<long> forcedRampCells, HashSet<long> gateCells,
             Action<string> log)
         {
             int faceCount = o.Tris.Count / 3;
@@ -2686,7 +2879,7 @@ namespace BetterBannerlordNavmeshing
             var sampleX = new List<float>();
             var sampleZ = new List<float>();
             var sampleW = new List<float>();
-            int rejSize = 0, rejLevel = 0, rejSamples = 0, rejProud = 0, rejFit = 0, rejBetter = 0;
+            int rejSize = 0, rejLevel = 0, rejSamples = 0, rejProud = 0, rejFit = 0, rejBetter = 0, rejNoGate = 0;
             for (int gi = 0; gi < groupOrder.Count; gi++)
             {
                 List<int> g = groups[groupOrder[gi]];
@@ -2729,6 +2922,34 @@ namespace BetterBannerlordNavmeshing
                 for (int vi = 0; vi < verts.Count; vi++)
                     if (Math.Abs(o.Y[verts[vi]] - h) > dyTol) { levelOk = false; break; }
                 if (!levelOk) { rejLevel++; ResetPlate(isPlate, g); continue; }
+                // fixE: a plate may only be rotated when it carries GATE/DOOR provenance - a real gate
+                // or usable door projects it. Without that label nothing is blended, so a wall deck or
+                // a stair landing is left exactly as built. Measured: the CC_20 wall-gate plate sits on
+                // gate cells; the user's stairs landing and the castle_wall_9_corner_b deck do not.
+                if (gateCells == null || gateCells.Count == 0)
+                {
+                    rejNoGate++;
+                    ResetPlate(isPlate, g);
+                    continue;
+                }
+                {
+                    int _gateOwn = 0;
+                    for (int _fi = 0; _fi < g.Count; _fi++)
+                    {
+                        int _f = g[_fi];
+                        float _fx = (o.X[o.Tris[_f * 3]] + o.X[o.Tris[_f * 3 + 1]] + o.X[o.Tris[_f * 3 + 2]]) / 3f;
+                        float _fz = (o.Z[o.Tris[_f * 3]] + o.Z[o.Tris[_f * 3 + 1]] + o.Z[o.Tris[_f * 3 + 2]]) / 3f;
+                        if (gateCells.Contains(CellKey(_fx, _fz, cs))) _gateOwn++;
+                    }
+                    if (_gateOwn * 2 < g.Count)
+                    {
+                        rejNoGate++;
+                        TracePlate(log, "no-gate " + _gateOwn + "/" + g.Count,
+                            minX, minZ, maxX, maxZ, h, g.Count, area);
+                        ResetPlate(isPlate, g);
+                        continue;
+                    }
+                }
                 candidates++;
 
                 // --- neighbour samples: non-plate faces in the ring, one per face, area weighted ----
@@ -2922,7 +3143,7 @@ namespace BetterBannerlordNavmeshing
                 Log(log, "v2: gate plates: examined=" + candidates + " blended=0"
                     + " rejected[tooBig=" + rejSize + " notOneLevel=" + rejLevel + " tooFewNeighbours="
                     + rejSamples + " notProud=" + rejProud + " notFittable=" + rejFit + " notBetter="
-                    + rejBetter + "] (needs > " + F(climb) + "m proud, <= " + F(GatePlateProudMaxMeters)
+                    + rejBetter + " notGate=" + rejNoGate + "] (needs > " + F(climb) + "m proud, <= " + F(GatePlateProudMaxMeters)
                     + "m, and a plane that beats the flat plate)");
                 return 0;
             }
@@ -2979,7 +3200,7 @@ namespace BetterBannerlordNavmeshing
                 + " vertices added, no face added or removed, no edge touched)"
                 + " rejected[tooBig=" + rejSize + " notOneLevel=" + rejLevel + " tooFewNeighbours="
                 + rejSamples + " notProud=" + rejProud + " notFittable=" + rejFit + " notBetter="
-                + rejBetter + "] in " + watch.ElapsedMilliseconds + "ms (climb=" + F(climb)
+                + rejBetter + " notGate=" + rejNoGate + "] in " + watch.ElapsedMilliseconds + "ms (climb=" + F(climb)
                 + "m proudMax=" + F(GatePlateProudMaxMeters) + "m flatDeg=" + F(GatePlateFlatDegrees)
                 + " ring=" + F(ring) + "m)");
             return blendedFaces;
@@ -4958,7 +5179,78 @@ namespace BetterBannerlordNavmeshing
         // A pair whose face was dropped goes with it (the writer must never emit a quad over a hole), so the
         // quad count moves by a handful of faces at most - measured on CC_20: 1 dropped quad for 2 dropped
         // faces. quadPairs may be null (cleanup off, or nothing merged).
-        private static int[] RepairFaceQuality(MergeOutput o, int[] quadPairs, Action<string> log)
+        // Carries the recorded quad pairs across a face compaction, shared by every pass that drops faces
+        // AFTER the sliver cleanup has recorded the pairs: the face-quality repairs, and (V3.62) the
+        // steep-face repair and the post-steep island prune. A pair whose face was dropped goes with it -
+        // marked -1 and trimmed out - so the writer can never emit a quad over a hole and the invariants
+        // gate never sees a quad walk that no longer corresponds to two real faces. This is the V3.46
+        // "lost pairs mark -1" machinery, extracted so every drop after the cleanup gets it.
+        private static int[] RemapQuadPairsAfterCompaction(int[] quadPairs, bool[] droppedFace, int faceCount0,
+            out int keptQuads, out int lostQuads)
+        {
+            keptQuads = 0;
+            lostQuads = 0;
+            if (quadPairs == null || quadPairs.Length < 2) return quadPairs;
+
+            // Old face index -> new face index for the faces that survive (the compaction keeps their order).
+            var map = new int[faceCount0];
+            int kept = 0;
+            for (int i = 0; i < faceCount0; i++) map[i] = droppedFace[i] ? -1 : kept++;
+
+            for (int k = 0; k + 1 < quadPairs.Length; k += 2)
+            {
+                int f0 = quadPairs[k], f1 = quadPairs[k + 1];
+                // A pair that cannot be carried over must be MARKED (-1), not merely skipped: the trim
+                // below recognises a dead pair by quadPairs[k] < 0. Leaving the original face index in
+                // place makes the trim copy it as if it were live and overrun the trimmed array.
+                if (f0 < 0 || f1 < 0 || f0 >= faceCount0 || f1 >= faceCount0)
+                {
+                    if (f0 >= 0 && f1 >= 0) lostQuads++;
+                    quadPairs[k] = -1;
+                    continue;
+                }
+                int n0 = map[f0], n1 = map[f1];
+                if (n0 < 0 || n1 < 0 || n0 == n1)
+                {
+                    lostQuads++;
+                    quadPairs[k] = -1;
+                    continue;
+                }
+                quadPairs[k] = n0;
+                quadPairs[k + 1] = n1;
+                keptQuads++;
+            }
+            if (keptQuads * 2 < quadPairs.Length)
+            {
+                var trimmed = new int[keptQuads * 2];
+                int w = 0;
+                for (int k = 0; k + 1 < quadPairs.Length; k += 2)
+                {
+                    if (quadPairs[k] < 0) continue;
+                    if (w + 1 >= trimmed.Length) break;   // belt and braces: never overrun
+                    trimmed[w++] = quadPairs[k];
+                    trimmed[w++] = quadPairs[k + 1];
+                }
+                quadPairs = trimmed;
+            }
+            return quadPairs;
+        }
+
+        // Carries a per-face label array (one entry per face - the pre-drop component roots) across a face
+        // compaction: dropped faces lose their entry and the survivors keep their order, exactly as
+        // CompactFaces renumbers the faces they belong to.
+        private static int[] CompactPerFace(int[] perFace, bool[] drop, int faceCount0)
+        {
+            if (perFace == null) return null;
+            var map = new int[faceCount0];
+            int kept = 0;
+            for (int i = 0; i < faceCount0; i++) map[i] = drop[i] ? -1 : kept++;
+            var next = new int[kept];
+            for (int i = 0; i < faceCount0; i++) if (map[i] >= 0) next[map[i]] = perFace[i];
+            return next;
+        }
+
+        private static int[] RepairFaceQuality(MergeOutput o, int[] quadPairs, ref int[] preDropComponents, Action<string> log)
         {
             var repairWatch = System.Diagnostics.Stopwatch.StartNew();
             int faceCount0 = o.Tris.Count / 3;
@@ -4973,54 +5265,10 @@ namespace BetterBannerlordNavmeshing
             if (badFacings == 0 && overlaps == 0)
                 return quadPairs;   // nothing dropped: the mesh and its quad pairs are untouched
 
-            // Old face index -> new face index for the faces that survive (the compaction keeps their order).
-            var map = new int[faceCount0];
-            int kept = 0;
-            for (int i = 0; i < faceCount0; i++) map[i] = drop[i] ? -1 : kept++;
             CompactFaces(o, drop);
-
-            int keptQuads = 0, lostQuads = 0;
-            if (quadPairs != null && quadPairs.Length >= 2)
-            {
-                for (int k = 0; k + 1 < quadPairs.Length; k += 2)
-                {
-                    int f0 = quadPairs[k], f1 = quadPairs[k + 1];
-                    // A pair that cannot be carried over must be MARKED (-1), not merely skipped: the trim
-                    // below recognises a dead pair by quadPairs[k] < 0. Leaving the original face index in
-                    // place makes the trim copy it as if it were live and overrun the trimmed array.
-                    // V3.46 shipped with that hole - it never fired because until now no face drop had ever
-                    // cost a quad pair.
-                    if (f0 < 0 || f1 < 0 || f0 >= faceCount0 || f1 >= faceCount0)
-                    {
-                        if (f0 >= 0 && f1 >= 0) lostQuads++;
-                        quadPairs[k] = -1;
-                        continue;
-                    }
-                    int n0 = map[f0], n1 = map[f1];
-                    if (n0 < 0 || n1 < 0 || n0 == n1)
-                    {
-                        lostQuads++;
-                        quadPairs[k] = -1;
-                        continue;
-                    }
-                    quadPairs[k] = n0;
-                    quadPairs[k + 1] = n1;
-                    keptQuads++;
-                }
-                if (keptQuads * 2 < quadPairs.Length)
-                {
-                    var trimmed = new int[keptQuads * 2];
-                    int w = 0;
-                    for (int k = 0; k + 1 < quadPairs.Length; k += 2)
-                    {
-                        if (quadPairs[k] < 0) continue;
-                        if (w + 1 >= trimmed.Length) break;   // belt and braces: never overrun
-                        trimmed[w++] = quadPairs[k];
-                        trimmed[w++] = quadPairs[k + 1];
-                    }
-                    quadPairs = trimmed;
-                }
-            }
+            preDropComponents = CompactPerFace(preDropComponents, drop, faceCount0);
+            int keptQuads, lostQuads;
+            quadPairs = RemapQuadPairsAfterCompaction(quadPairs, drop, faceCount0, out keptQuads, out lostQuads);
 
             string msg = badFacings + " bad facing(s) (" + facingsLog + "), same-level overlaps dropped "
                 + overlaps + " (" + overlapsLog
@@ -5148,6 +5396,12 @@ namespace BetterBannerlordNavmeshing
             return 2f * agentClimbMeters + cellHeightMeters;
         }
 
+        // fixC: only contour-spike fan faces taller than this are dropped before the cleanup.  The
+        // reported staircase fan is 3.2-8.4 m tall; the steep faces under the collision roof that must
+        // NOT be dropped ahead of the cleanup are 2.0-3.0 m.  Two-and-a-half times the vertical-jump
+        // class (2*climb + cell = 1.4 m) sits between them.
+        public const float SteepFanMinHeightMeters = 3.5f;
+
         public static float SteepFaceThresholdDegrees(float maxSlopeDegrees, float marginDegrees)
         {
             if (marginDegrees < 0f) marginDegrees = SteepFaceMarginDegreesDefault;
@@ -5159,12 +5413,13 @@ namespace BetterBannerlordNavmeshing
         // Its own pass, so it can run BEFORE the prune (see the call site in Build). The quad pairs do not
         // exist yet at that point, which is fine: a face this steep is never a quad (the quad merge only
         // combines near-coplanar, thin faces).
-        private static int RepairSteepFaces(MergeOutput o, HashSet<long> forcedRampCells, float cellSize,
-            float maxSlopeDegrees, float marginDegrees, float minHeightMeters, Action<string> log)
+        private static int[] RepairSteepFaces(MergeOutput o, HashSet<long> forcedRampCells, float cellSize,
+            float maxSlopeDegrees, float marginDegrees, float minHeightMeters, int[] quadPairs,
+            ref int[] preDropComponents, Action<string> log)
         {
             int faceCount = o.Tris.Count / 3;
-            if (faceCount == 0) return 0;
-            if (SteepFaceThresholdDegrees(maxSlopeDegrees, marginDegrees) >= 89.9f) return 0;
+            if (faceCount == 0) return quadPairs;
+            if (SteepFaceThresholdDegrees(maxSlopeDegrees, marginDegrees) >= 89.9f) return quadPairs;
             var watch = System.Diagnostics.Stopwatch.StartNew();
             var drop = new bool[faceCount];
             var steepDrop = new bool[faceCount];
@@ -5172,7 +5427,7 @@ namespace BetterBannerlordNavmeshing
             string detail;
             int marked = MarkSteepFaces(o, drop, spike, forcedRampCells, cellSize, maxSlopeDegrees,
                 marginDegrees, minHeightMeters, out detail);
-            if (marked == 0) return 0;
+            if (marked == 0) return quadPairs;
             // Every steep drop is RESTORABLE: unlike a bad FACING (a face with no ground footprint, which is
             // malformed whatever it costs), this class is a plausible surface that is merely too steep to
             // walk, so the island count gets a vote - but only for the faces it actually needs.
@@ -5186,15 +5441,23 @@ namespace BetterBannerlordNavmeshing
                 Log(log, "v2: steep faces: marked " + marked + " face(s) " + detail
                     + " - all " + marked + " restored to keep the island count, none dropped, in "
                     + watch.ElapsedMilliseconds + "ms");
-                return 0;
+                return quadPairs;
             }
             CompactFaces(o, drop);
+            preDropComponents = CompactPerFace(preDropComponents, drop, faceCount);
+            // The sliver cleanup has already recorded the quad pairs by now (this pass runs after it), so
+            // the drops here must carry the pairs across the compaction the way the face-quality repairs
+            // do: a pair whose face was dropped is marked -1 and trimmed, never left pointing at a face
+            // index the compaction has reassigned.
+            int rqKept, rqLost;
+            quadPairs = RemapQuadPairsAfterCompaction(quadPairs, drop, faceCount, out rqKept, out rqLost);
             Log(log, "v2: steep faces: dropped " + removed + " of " + marked + " marked face(s) " + detail
                 + (restored > 0 ? ", " + restored + " restored as the minimum needed to keep the island count"
                     : "")
-                + " in " + watch.ElapsedMilliseconds + "ms (before the prune, so any fragment it leaves"
-                + " is judged by the island cap)");
-            return removed;
+                + " in " + watch.ElapsedMilliseconds + "ms (followed by the island prune, which judges any"
+                + " fragment it leaves by the island cap)"
+                + (rqLost > 0 ? "; quad pairs kept " + rqKept + "/" + (rqKept + rqLost) : ""));
+            return quadPairs;
         }
 
         private static int MarkSteepFaces(MergeOutput o, bool[] drop, bool[] spike, HashSet<long> forcedRampCells,

@@ -32,7 +32,7 @@ namespace BetterBannerlordNavmeshing
             TiledNavMeshBuilder.TiledNavMeshSettings voxelSettings, bool writeObj,
             float agentClimbOverrideMeters, int maxWorkers,
             float[] assetVertsEngineXyz, int[] assetTris, bool[] assetForceWalkable,
-            bool[] assetLedgeExempt, bool[] terrainHoleMask, SoupCapture soupCapture,
+            bool[] assetLedgeExempt, bool[] assetGate, bool[] terrainHoleMask, SoupCapture soupCapture,
             System.Action<string> log, out long buildMs,
             TiledNavMeshBuilder.BorderPolygon border = null)
         {
@@ -129,7 +129,8 @@ namespace BetterBannerlordNavmeshing
                 TiledNavMeshBuilder.Build(vertsXyz, tris, voxelSettings, maxWorkers, log,
                     BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetForceWalkable),
                     BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetLedgeExempt),
-                    border);
+                    border,
+                    BuildCombinedForceMask(terrainSoupTris, assetTriCount, assetGate));
 
             watch.Stop();
             buildMs = watch.ElapsedMilliseconds;

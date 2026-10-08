@@ -41,6 +41,11 @@ namespace BetterBannerlordNavmeshing
         // still BodyFlags.Barrier / Barrier3D - the suffix is a convenience, never the test.
         public const string BarrierRecordSuffix = "#barrier";
 
+        // fixE: the scene TAG every gate / usable door puts on a child entity (name-free). An entity
+        // whose own or ancestral tags include it is gate/door provenance - the tagged child plus its
+        // collider children. Read from the scene exactly like the border probes' tags.
+        public const string GateTag = "gate";
+
         // Emit a cheap progress line every N entities during the triangle-read pass.
         private const int ProgressEvery = 250;
 
@@ -59,6 +64,10 @@ namespace BetterBannerlordNavmeshing
             // Same length as Tris/3 when any HasSteps/Ladder prop was seen; null otherwise. True =
             // that triangle belongs to a stepped prop, so the builder keeps it off the ledge trim.
             public bool[] LedgeExemptTris;
+            // fixE: same length as Tris/3 when any gate/usable-door prop was seen; null otherwise. True =
+            // that triangle belongs to a gate/door prop (scene tag `gate`), the only provenance the
+            // gate-plate blend may rotate.
+            public bool[] GateTris;
             // Honour-able barrier bodies, in the same engine Z-up world space. NEVER mixed into
             // VertsXyz/Tris: the builder rasterises these separately as solid spans (see
             // TiledNavMeshBuilder.CutBarriersIntoHeightfield), so they must not also enter the
@@ -75,6 +84,7 @@ namespace BetterBannerlordNavmeshing
             public int Mobility;
             public int TriCount;       // triangles actually read (capped)
             public bool Capped;
+            public int Gate;           // fixE: 1 when this entity is gate/usable-door provenance
             public float[] VertsXyz;   // engine Z-up, 3 per vertex, entity-local indexing
             public int[] Tris;         // 0-based into VertsXyz
         }
@@ -107,6 +117,7 @@ namespace BetterBannerlordNavmeshing
             // Synthesized stair/ladder ramp triangles (SteppedPropRamps); null when none/disabled.
             public bool[] ForceWalkableTris;
             public bool[] LedgeExemptTris;
+            public bool[] GateTris;
             public int RampQuads, RampStairs, RampLadders, RampHoles, RampNoHoles, RampSkippedFlat,
                 RampSkippedSteep, RampSkippedLong, RampCapped;
         }
@@ -122,6 +133,8 @@ namespace BetterBannerlordNavmeshing
             public GameEntity.Mobility Mobility;
             public bool IsDynamic;
             public bool IsStairs;
+            // fixE: this entity's own or ancestral tags include `gate`.
+            public bool IsGate;
             // A barrier body whose mask blocks agents. Such a candidate is read into the Barriers
             // list instead of the walkable soup.
             public bool IsBarrier;
@@ -143,6 +156,7 @@ namespace BetterBannerlordNavmeshing
             r.ScanMs = g.ScanMs;
             r.ForceWalkableTris = g.ForceWalkableTris;
             r.LedgeExemptTris = g.LedgeExemptTris;
+            r.GateTris = g.GateTris;
             r.Barriers = g.Barriers;
             r.BarriersMeshed = g.BarriersMeshed;
             r.BarriersSkipped = g.BarriersSkipped;
@@ -216,6 +230,7 @@ namespace BetterBannerlordNavmeshing
                     BodyFlags all = SafeFlags(() => e.BodyFlag) | SafeFlags(() => e.PhysicsDescBodyFlag);
                     GameEntity.Mobility mobility = SafeMobility(e);
                     bool hasDynamic = SafeBool(() => e.HasDynamicRigidBody());
+                    bool isGate = SafeGateTag(e);
 
                     bool isTerrain = (all & BodyFlags.BodyOwnerTerrain) != 0;
                     bool isFlora = (all & BodyFlags.BodyOwnerFlora) != 0;
@@ -292,6 +307,7 @@ namespace BetterBannerlordNavmeshing
                     c.Mobility = mobility;
                     c.IsDynamic = isDynamic;
                     c.IsStairs = isStairs;
+                    c.IsGate = isGate;
                     c.IsBarrier = isBarrierForCarve;
                     // A barrier never enters the walkable soup, so it goes into its own list and is
                     // preloaded with everything else (bo_barrier is a real physics shape and GetTriangle
@@ -346,6 +362,7 @@ namespace BetterBannerlordNavmeshing
             // naming the entity, so a crash log's last line identifies the culprit.
             var verts = new List<float>();
             var ledgeExempt = new List<bool>();   // one entry per real triangle (stepped props)
+            var gateTris = new List<bool>();      // one entry per real triangle (gate/door props)
             var tris = new List<int>();
             var largestTris = new List<int>();
             var largestName = new List<string>();
@@ -422,6 +439,7 @@ namespace BetterBannerlordNavmeshing
                             tris.Add(b + 1);
                             tris.Add(b + 2);
                             ledgeExempt.Add(isSteppedProp);
+                            gateTris.Add(c.IsGate);
                             wrote++;
                         }
                     }
@@ -445,6 +463,7 @@ namespace BetterBannerlordNavmeshing
                         rec.Mobility = (int)c.Mobility;
                         rec.TriCount = wrote;
                         rec.Capped = capped;
+                        rec.Gate = c.IsGate ? 1 : 0;
                         rec.VertsXyz = new float[wrote * 9];
                         int vCount = verts.Count / 3 - firstVert;
                         for (int v = 0; v < vCount; v++)
@@ -526,6 +545,7 @@ namespace BetterBannerlordNavmeshing
                                 rr.Mobility = (int)c.Mobility;
                                 rr.TriCount = ramps.Tris.Count / 3;
                                 rr.Capped = false;
+                                rr.Gate = 0;
                                 rr.VertsXyz = ramps.VertsXyz.ToArray();
                                 rr.Tris = ramps.Tris.ToArray();
                                 result.Entities.Add(rr);
@@ -646,6 +666,7 @@ namespace BetterBannerlordNavmeshing
                         rec.Mobility = (int)c.Mobility;
                         rec.TriCount = wrote;
                         rec.Capped = capped;
+                        rec.Gate = 0;
                         rec.VertsXyz = wall.VertsXyz;
                         rec.Tris = wall.Tris;
                         result.Entities.Add(rec);
@@ -689,6 +710,17 @@ namespace BetterBannerlordNavmeshing
                 for (int k = 0; k < realTris && k < ledgeExempt.Count; k++)
                     exemptMask[k] = ledgeExempt[k];
                 result.LedgeExemptTris = exemptMask;
+            }
+            bool anyGate = false;
+            for (int k = 0; k < gateTris.Count; k++)
+                if (gateTris[k]) { anyGate = true; break; }
+            if (anyGate)
+            {
+                // fixE: a gate/door prop's own triangles, carried so the builder can scope the plate blend.
+                var gateMask = new bool[realTris + rampTriCount];
+                for (int k = 0; k < realTris && k < gateTris.Count; k++)
+                    gateMask[k] = gateTris[k];
+                result.GateTris = gateMask;
             }
             result.VertsXyz = verts.ToArray();
             result.Tris = tris.ToArray();
@@ -938,6 +970,24 @@ namespace BetterBannerlordNavmeshing
             {
             }
             return fallback ?? "";
+        }
+
+        // fixE: gate/usable-door provenance. Every gate/door has a child entity carrying the scene tag
+        // `gate`; an entity whose own or ancestral tags include it belongs to that prop (the tagged child
+        // plus its collider children). Same tag API the border probes use.
+        private static bool SafeGateTag(GameEntity e)
+        {
+            try
+            {
+                GameEntity cur = e;
+                for (int d = 0; cur != null && d < 16; d++)
+                {
+                    if (cur.HasTag(GateTag)) return true;
+                    cur = cur.Parent;
+                }
+            }
+            catch (Exception) { }
+            return false;
         }
 
         private static BodyFlags SafeFlags(Func<BodyFlags> getter)

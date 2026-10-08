@@ -49,9 +49,11 @@ namespace BetterBannerlordNavmeshing
         // reports no border, which is the structural no-op path.
         private const int VersionNoBorder = 1;
 
-        // ASSETS version. The per-entity triangle format did NOT change in V3.59, so it stays at 1 and a
-        // v1 assets file keeps reading; bumping it would have invalidated every snapshot on disk.
-        private const int AssetsVersion = 1;
+        // ASSETS version. 1 = the original per-entity layout. 2 = fixE: one extra int per entity,
+        // `Gate` (1 when the entity is gate/usable-door provenance, from the scene tag `gate`). A v1
+        // file still reads (Gate defaults to 0) so old fixtures keep replaying.
+        private const int AssetsVersion = 2;
+        private const int AssetsVersionNoGate = 1;
 
         public sealed class EntityRecord
         {
@@ -62,6 +64,9 @@ namespace BetterBannerlordNavmeshing
             public bool Capped;
             public float[] VertsXyz;   // 3 per vertex, engine Z-up
             public int[] Tris;         // 3 per triangle, 0-based into VertsXyz
+            // fixE: gate/usable-door provenance (scene tag `gate` on this entity or an ancestor).
+            // 0 on a v1 assets file (no gate information recorded).
+            public int Gate;
             // In-memory only (never serialized): how many of TriCount's triangles are synthesized
             // SteppedPropRamps ramp quads (always the LAST ones). Set by the snapshot dump path via
             // SceneCollisionGeometry, and by the harness when it synthesizes ramps itself.
@@ -165,6 +170,7 @@ namespace BetterBannerlordNavmeshing
                     w.Write(e.Mobility);
                     w.Write(e.TriCount);
                     w.Write(e.Capped ? 1 : 0);
+                    w.Write(e.Gate);
                     for (int k = 0; k < e.VertsXyz.Length; k++)
                         w.Write(e.VertsXyz[k]);
                     for (int k = 0; k < e.Tris.Length; k++)
@@ -179,8 +185,9 @@ namespace BetterBannerlordNavmeshing
             using (var r = new BinaryReader(File.OpenRead(path), Encoding.UTF8))
             {
                 int version = r.ReadInt32();
-                if (version != AssetsVersion)
-                    throw new InvalidDataException("assets snapshot version " + version + " != " + AssetsVersion);
+                if (version != AssetsVersion && version != AssetsVersionNoGate)
+                    throw new InvalidDataException("assets snapshot version " + version + " not in {"
+                        + AssetsVersionNoGate + "," + AssetsVersion + "}");
                 int count = r.ReadInt32();
                 for (int i = 0; i < count; i++)
                 {
@@ -191,6 +198,7 @@ namespace BetterBannerlordNavmeshing
                     e.Mobility = r.ReadInt32();
                     e.TriCount = r.ReadInt32();
                     e.Capped = r.ReadInt32() != 0;
+                    e.Gate = version >= 2 ? r.ReadInt32() : 0;
                     e.VertsXyz = new float[e.TriCount * 9];
                     for (int k = 0; k < e.VertsXyz.Length; k++)
                         e.VertsXyz[k] = r.ReadSingle();
@@ -206,7 +214,7 @@ namespace BetterBannerlordNavmeshing
         // Expands an indexed mesh (shared vertices) into the file's per-triangle layout: 3 unique
         // vertices per triangle (9 floats each) and trivial 0-based indices.
         public static EntityRecord Expand(string name, int flags, int mobility, bool capped,
-            float[] vertsXyz, int[] tris)
+            float[] vertsXyz, int[] tris, int gate = 0)
         {
             int triCount = tris != null ? tris.Length / 3 : 0;
             var rec = new EntityRecord();
@@ -214,6 +222,7 @@ namespace BetterBannerlordNavmeshing
             rec.Flags = flags;
             rec.Mobility = mobility;
             rec.Capped = capped;
+            rec.Gate = gate;
             rec.TriCount = triCount;
             rec.VertsXyz = new float[triCount * 9];
             rec.Tris = new int[triCount * 3];
