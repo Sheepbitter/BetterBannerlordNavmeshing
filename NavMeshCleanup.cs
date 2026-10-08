@@ -20,8 +20,8 @@ namespace BetterBannerlordNavmeshing
     // preserved, only vertices whose removal moves the surface by <= a small tolerance are removed, and
     // steep fans (steps / corners / connector rims) are skipped. Deterministic, flat arrays, chiefly
     // linear. The tolerance is justified by the mesh's OWN promise: detail max error is 0.25 m
-    // (NavMeshMaxErrorMeters) and contour simplification allows 1.3 vox = 0.325 m at cs 0.25 m, so the
-    // 0.05 m cleanup tolerance is 5-6x tighter than what the mesh already promises. Stacked levels are
+    // (NavMeshMaxErrorMeters) and contour simplification allows 2.0 vox = 0.50 m at cs 0.25 m; the
+    // cleanup tolerances (0.50 m surface / 0.35 m boundary) stay within that allowance. Stacked levels are
     // protected by the planarity/step guard (a fan whose normals spread more than MaxFanNormalSpread is
     // never touched, so two levels over the same XZ are never joined).
     public static class NavMeshCleanup
@@ -29,7 +29,7 @@ namespace BetterBannerlordNavmeshing
         public const float WeldEpsilonMeters = 1e-3f;
         // Surface-move tolerance for an interior vertex removal. This is the knob that decides how much of
         // the thin fan population can fold away: at 0.20 m the guard refused ~240k candidate folds on
-        // Birtu alone. 0.30 m equals the contour simplification's own budget (1.3 vox at cs 0.25 m), i.e.
+        // Birtu alone. 0.50 m equals the contour simplification's own budget (2.0 vox at cs 0.25 m), i.e.
         // the surface may be re-shaped by no more than the mesher itself already promises.
         public const float SurfaceToleranceMeters = 0.50f;
         // Outline-move tolerance for a boundary vertex removal.

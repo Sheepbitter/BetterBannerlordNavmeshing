@@ -247,8 +247,8 @@ namespace BetterBannerlordNavmeshing
 
         public sealed class TiledNavMeshSettings
         {
-            // Tile world size (m). Comes from NavMeshCoarsestSpacing (16 m).
-            public float TileWorldSizeMeters = 16f;
+            // Tile world size (m). Comes from NavMeshCoarsestSpacing (10 m since V3.65).
+            public float TileWorldSizeMeters = 10f;
 
             // Voxel cell size (m). New NavMeshVoxelCellSize setting (default 0.5 m).
             // Regular voxel stage; tile span is rounded to a whole number of cells.
@@ -408,7 +408,7 @@ namespace BetterBannerlordNavmeshing
             public float DetailSampleDistMeters = 2.0f;
 
             // Contour simplification error (voxels). >0 is used directly; 0 falls back to
-            // MaxErrorMeters / cs (0.5 vox at the defaults). Default 1.3 vox (the plan's value):
+            // MaxErrorMeters / cs (0.5 vox at the defaults). Default 2.0 vox (raised from 1.3 in V3.64):
             // a simpler walkable boundary removes the tight/sliver faces that Recast's detail edge
             // tessellation makes at every boundary vertex on boundary-rich maps, with no fidelity
             // change (contour error is separate from the surface error budget).

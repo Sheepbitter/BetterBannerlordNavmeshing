@@ -364,7 +364,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshSnapshotAssertPoints` | `""` | Extra assert points for the snapshot header, format `"x,y;x,y;..."`. The two Birtu probe spots are always included; the harness asserts each point is covered by a face on the largest island. |
 | `NavMeshSampleStride` | `2` | Terrain sampling decimation: 1 = every vertex, 2 = every other (the default; halves sample count with no practical fidelity loss). |
 | `NavMeshMaxErrorMeters` | `0.25` | Fidelity guarantee: mesh surface stays within this of the ground. |
-| `NavMeshCoarsestSpacing` | `16` | Largest cell size (m). Smaller = tighter bound, more faces. |
+| `NavMeshCoarsestSpacing` | `10` | Largest cell size (m) - the v2 tile size. Smaller = tighter bound, more faces. Lowered from 16 to 10 in V3.65: the five-map tile sweep (`TileSweepReport.md`) measured -20..30% build time on the heavy maps (Na'ilu/Basamu/CC_20) at +2..4% faces. |
 | `NavMeshMaxSlopeDegrees` | `50` | Faces steeper than this are dropped; the v2 core auto-derives the agent climb so the configured slope is actually traversable. |
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
 | `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the whole emitted mesh (terrain **and** structures), so it does not intersect either. 0 = as flush as the voxel lattice allows. |
@@ -419,7 +419,7 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
 - **Terrain + static assets.** It voxelizes one triangle soup built from the terrain heightfield *and*
   (by default) every physics entity's collision geometry, so interiors, stairs, decks and bridges over
   terrain become navigable. See *Assets (structures)* below.
-- **Tiled + parallel.** The world is split into 16 m tiles (`NavMeshCoarsestSpacing`) with a Recast border,
+- **Tiled + parallel.** The world is split into 10 m tiles (`NavMeshCoarsestSpacing`) with a Recast border,
   built on a bounded worker pool (`Parallel.For`, `MaxDegreeOfParallelism = #processors`), then merged in
   sorted tile order. Adjacent tiles weld exactly on the shared voxel lattice (no cracks).
 - **Settings:** `NavMeshVoxelCellSize` (default 0.25 m), `NavMeshMaxSlopeDegrees`, `NavMeshMaxErrorMeters`
@@ -1976,7 +1976,7 @@ centroid and Y range. A pruning rule can be chosen from it (small area, isolated
 Every run also logs the terrain read (see above), then the voxel core:
 
 ```
-NavMesh: v2: core engaged (tiled voxel). cellSize=0.25m tile=16m
+NavMesh: v2: core engaged (tiled voxel). cellSize=0.25m tile=10m
 NavMesh: terrain hole audit: verts=<n> holes=<n> (tol 1m, auditMs=<n>)   <- only when NavMeshVoxelTerrainHoleAudit=true
 NavMesh: terrain hole audit: <n> stored vertices disagree with GetTerrainHeight(checkHoles=true); their cells are dropped from the terrain soup
 NavMesh: assets: preloading <M> unique physics bodies by name
@@ -1999,10 +1999,10 @@ NavMesh: assets: largest shapes: '..'=.. '..'=.. ... (top 20 by triangle count)
 NavMesh: v2: terrain hole mask applied: cells touching a hole are dropped from the soup   <- only when holes were found
 NavMesh: v2: soup terrain=..v/..t + assets=..v/..t -> ..v/..t (merged; lifted uniformly by +0.5m)
 NavMesh: v2: soup verts=... tris=... (terrain only) stride=... spacing=...m      <- only when NavMeshVoxelIncludeAssets=false or no assets found
-NavMesh: v2: settings cs=...m ch=0.2m tile=16m cellsPerTile=32 tiles=10x10 border=4 hf=40x40 origin=(..) bminY=.. bmaxY=..
+NavMesh: v2: settings cs=...m ch=0.2m tile=10m cellsPerTile=40 tiles=10x10 border=4 hf=48x48 origin=(..) bminY=.. bmaxY=..
 NavMesh: v2: agentClimb=0.6m (auto) walkableClimb=3 voxels effectiveMaxSlope=atan(walkableClimb*ch/(2*cs))=50.194deg (setting=50deg)
-NavMesh: v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 gapFill=2 stitch=6 prune=400 ledgeFilter=True detail=True detSampleDist=2m contourSimpErr=1.3vox
-NavMesh: v2: contour maxError=1.3vox (= 0.325m at cs=0.25m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
+NavMesh: v2: params slope=50deg radius=0.25m height=1.8m climb=0.6m walkable(r,h,c)=1/9/3 edgeLen=12vox vpp=6 regionMin=8 regionMerge=20 gapFill=2 stitch=6 prune=400 ledgeFilter=True detail=True detSampleDist=2m contourSimpErr=2vox
+NavMesh: v2: contour maxError=2vox (= 0.5m at cs=0.25m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)
 NavMesh: v2: workers=12 (requested 12, tileCount=100)
 NavMesh: v2: tris input=... culledByAabb=... rasterized=... (rasterized counts per-tile border duplicates)
 NavMesh: v2: forced-walkable tris=<n>/<m> (synthesized stair/ladder ramps; marked walkable regardless of slope)   <- only when ramps exist

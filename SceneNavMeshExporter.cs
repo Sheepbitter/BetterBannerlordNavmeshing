@@ -33,7 +33,7 @@ namespace BetterBannerlordNavmeshing
         public SimpleButton DumpSceneSnapshot;
         public int NavMeshSampleStride = 2;
         public float NavMeshMaxErrorMeters = 0.25f;
-        public float NavMeshCoarsestSpacing = 16f;
+        public float NavMeshCoarsestSpacing = 10f;
         public float NavMeshMaxSlopeDegrees = 50f;
         public bool NavMeshCullBelowHeight = false;
         public float NavMeshMinHeight = 0f;

@@ -243,7 +243,7 @@ private static int RunSnapshot(string prefix, TiledNavMeshBuilder.BarrierWalls w
 
         var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
         s.VoxelCellSizeMeters = 0.25f;
-        s.TileWorldSizeMeters = 16f;
+        s.TileWorldSizeMeters = 10f;
         s.AgentRadiusMeters = 0.25f;
         s.AgentHeightMeters = 1.8f;
         s.MaxSlopeDegrees = 50f;
@@ -9475,17 +9475,17 @@ private static double WorstQuadAngle(TiledNavMeshBuilder.VoxelMeshResult r)
         new Dictionary<string, GoldenEntry>(StringComparer.Ordinal)
     {
         { GoldenCtx("mp_tdm_Birtu_navmesh_snapshot_terrain.bin", 592920, 639263973584410258L),
-          new GoldenEntry { Vars = unchecked((long)0xa8b5eb5c2d764480UL), Tris = unchecked((long)0x4465a13fed68088cUL), Quads = unchecked((long)0x2d1c2c9d3ea705a6UL),
-                            Note = "Birtu; quadPairs=838 F=42283" } },
+          new GoldenEntry { Vars = unchecked((long)0xb17450554723fc69UL), Tris = unchecked((long)0x4090f55eb95abdedUL), Quads = unchecked((long)0x96708a7dfa90d58eUL),
+                            Note = "Birtu; tile 10; quadPairs=736 F=43656" } },
         { GoldenCtx("CC_20_siege_navmesh_snapshot_terrain.bin", 6563864, 639264301284916775L),
-          new GoldenEntry { Vars = unchecked((long)0xba3a05d7b3cd7d32UL), Tris = unchecked((long)0x845c6d22a8bcc878UL), Quads = unchecked((long)0x98373ec14085ea28UL),
-                            Note = "CC_20 v1 (caves, stale fixture); quadPairs=2182 F=235699" } },
+          new GoldenEntry { Vars = unchecked((long)0xc10f245dfef9da9bUL), Tris = unchecked((long)0x507584c6a9f673ddUL), Quads = unchecked((long)0x0f520c5ea985fde6UL),
+                            Note = "CC_20 v1 (caves, stale fixture); tile 10; quadPairs=1882 F=246095" } },
         { GoldenCtx("snapshot_v2_terrain.bin", 6563920, 639269148326352812L),
-          new GoldenEntry { Vars = unchecked((long)0x5c378f90519de35fUL), Tris = unchecked((long)0x688dc3abd3e4fd42UL), Quads = unchecked((long)0xd47ea4bf40291c68UL),
-                            Note = "CC_20 v2 (current fixture, walk-area border block); quadPairs=2186 F=235660" } },
+          new GoldenEntry { Vars = unchecked((long)0x81619b5b95d61db1UL), Tris = unchecked((long)0xaa4db11656c56fefUL), Quads = unchecked((long)0x7730ab5d82a72307UL),
+                            Note = "CC_20 v2 (current fixture, walk-area border block); tile 10; quadPairs=1878 F=246028" } },
         { GoldenCtx("mp_battle_Basamu_village_navmesh_snapshot_terrain.bin", 16793624, 639264258666049675L),
-          new GoldenEntry { Vars = unchecked((long)0xecb44f859800fd19UL), Tris = unchecked((long)0xdad1ecb490240b69UL), Quads = unchecked((long)0xcaccffb6cd956942UL),
-                            Note = "Basamu; quadPairs=3438 F=482993" } },
+          new GoldenEntry { Vars = unchecked((long)0x4a262382d29a3e58UL), Tris = unchecked((long)0x0a2eee71ebebf0ccUL), Quads = unchecked((long)0xe9276b611bb343eeUL),
+                            Note = "Basamu; tile 10; quadPairs=2920 F=491641" } },
     };
 
     private static string GoldenCtx(string name, long len, long ticks)

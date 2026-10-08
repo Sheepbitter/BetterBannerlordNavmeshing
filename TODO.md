@@ -269,6 +269,21 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   scene, so scenes whose script predates the change still read 1.3 until the value is set to 2.0 in the
   panel (explains the earlier no-change runs). Do NOT touch edgelen/regmin/regmerge/weldtol/vpp/cs or
   turn detail off.
+- IMPLEMENTED (2026-10-08, V3.65): navmesh tile (coarsest spacing) default 16 -> 10 m in the exporter
+  (`SceneNavMeshExporter.cs`), the builder settings default (`TiledNavMeshBuilder.cs`), the in-repo
+  harness SnapshotSettings, and the README (settings table + tiled-core section + v2 log examples).
+  Golden hashes re-captured at 10 m on all four fixtures and verified PASS. Based on `TileSweepReport.md`
+  (five-map sweep): 10 m measures -20..30% build time on the heavy maps (Na'ilu -29.7%, Basamu -22.9%,
+  CC_20 -19.6%) at +2..4% faces, with meanQuality and long-thin aspect improving on every map. Note:
+  the editor keeps the script's settings per scene, so scenes whose script predates the change still
+  read 16 until the value is set to 10 in the panel.
+- SUITE NOTE (2026-10-08, V3.65): the harness suite at the 10 m default passes 11/13 groups. Test 25
+  (LADDER-CAP) fails identically on unmodified HEAD (pre-existing, unrelated). Test 11 (ASSET TEST) is NEW
+  at 10 m: its synthetic gully/stairs scene grows a 74.6 deg fan poly face vs the 52 deg assert (24.7 deg
+  at 16 m). Real maps are unaffected in the aggregate - steep>60 counts are LOWER at 10 m on all five
+  (Na'ilu 4964 -> 3743, Basamu 2705 -> 2251, Birtu 341 -> 291, Tasksatu 1010 -> 840, CC_20 771 -> 713) -
+  so it is a scene-partitioning artifact of the small synthetic scene; triage later (vs a real steep-face
+  class on small scenes).
 - MEASURED (2026-10-08): tile 12 m vs the shipped 16 m on Na'ilu / Tasksatu / Birtu (current code,
   contour 2.0 vox, harness whole-map replay). Tile 12 is faster on all three (buildMs 42832 -> 34944 =
   -18.4% Na'ilu, 5975 -> 5641 = -5.6% Tasksatu, 4516 -> 4420 = -2.1% Birtu), long-thin aspect>4 down
