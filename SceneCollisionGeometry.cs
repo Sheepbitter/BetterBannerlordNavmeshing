@@ -142,10 +142,10 @@ namespace BetterBannerlordNavmeshing
 
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
             bool propRamps, System.Action<string> log, float rampCellSize = 0.25f, float rampClimb = 0.6f,
-            bool rampLedge = true)
+            bool rampLedge = true, bool gateConnectors = false)
         {
             AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, propRamps, log,
-                rampCellSize, rampClimb, rampLedge);
+                rampCellSize, rampClimb, rampLedge, gateConnectors);
             var r = new AssetTriangles();
             r.VertsXyz = g.VertsXyz;
             r.Tris = g.Tris;
@@ -168,7 +168,8 @@ namespace BetterBannerlordNavmeshing
         // propRamps: synthesize a walkable ramp for HasSteps/Ladder props (SteppedPropRamps).
         public static AssetGeometry CollectDetailed(Scene scene, bool includeDynamic, bool includeFlora,
             bool trace, bool recordEntities, bool propRamps, System.Action<string> log,
-            float rampCellSize = 0.25f, float rampClimb = 0.6f, bool rampLedge = true)
+            float rampCellSize = 0.25f, float rampClimb = 0.6f, bool rampLedge = true,
+            bool gateConnectors = false)
         {
             var result = new AssetGeometry();
             result.VertsXyz = new float[0];
@@ -377,6 +378,9 @@ namespace BetterBannerlordNavmeshing
             int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
             var rampSkips = new List<SteppedPropRamps.Skip>();
             var rampConnectorInfos = new List<SteppedPropRamps.RampInfo>();
+            // Gate / door passage-floor candidates (fixE gate provenance, thin-slab geometry). Collected
+            // across all candidates, then synthesized once at the end (the synthesis clusters them).
+            var gateProps = new List<GateBridgeStrips.Prop>();
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -553,6 +557,26 @@ namespace BetterBannerlordNavmeshing
                         }
                     }
 
+                    // -------- gate / door passage-floor candidate (thin-slab gate-flagged prop)
+                    if (gateConnectors && wrote > 0 && c.IsGate)
+                    {
+                        var gp = new GateBridgeStrips.Prop();
+                        gp.Name = c.Name;
+                        gp.Flags = unchecked((int)c.Flags);
+                        int pv = verts.Count / 3 - firstVert;
+                        gp.VertsXyz = new float[pv * 3];
+                        for (int v = 0; v < pv; v++)
+                        {
+                            gp.VertsXyz[v * 3 + 0] = verts[(firstVert + v) * 3 + 0];
+                            gp.VertsXyz[v * 3 + 1] = verts[(firstVert + v) * 3 + 1];
+                            gp.VertsXyz[v * 3 + 2] = verts[(firstVert + v) * 3 + 2];
+                        }
+                        gp.Tris = new int[wrote * 3];
+                        for (int t = 0; t < wrote * 3; t++)
+                            gp.Tris[t] = tris[firstTri * 3 + t] - firstVert;
+                        if (GateBridgeStrips.IsThinSlab(gp)) gateProps.Add(gp);
+                    }
+
                     if (c.IsStairs) cStairs++;
                     else if (IsWall(c.Name)) cWall++;
                     else if (IsFloor(c.Name)) cFloor++;
@@ -687,6 +711,54 @@ namespace BetterBannerlordNavmeshing
             }
 
             watch.Stop();
+            // -------- gate / door bridge strips (GateBridgeStrips). Synthesized from the gate-flagged
+            // thin-slab passage-floor colliders and appended to the same force-walkable tail as the ramps.
+            int gateStripCount = 0;
+            int gateStripTris = 0;
+            if (gateConnectors && gateProps.Count > 0)
+            {
+                Func<float, float, float> terrainAt = null;
+                try
+                {
+                    terrainAt = delegate (float tx, float tz)
+                    {
+                        try { return scene.GetTerrainHeight(new Vec2(tx, tz), true); }
+                        catch (Exception) { return float.NaN; }
+                    };
+                }
+                catch (Exception) { terrainAt = null; }
+                GateBridgeStrips.Result gr = GateBridgeStrips.Synthesize(gateProps, verts.ToArray(),
+                    tris.ToArray(), terrainAt, rampCellSize, rampClimb, rampLedge);
+                gateStripCount = gr.Strips;
+                gateStripTris = gr.Tris.Count / 3;
+                if (gr.Tris.Count > 0)
+                {
+                    int gBase = rampVerts.Count / 3;
+                    for (int k = 0; k < gr.VertsXyz.Count; k++) rampVerts.Add(gr.VertsXyz[k]);
+                    for (int k = 0; k < gr.Tris.Count; k++) rampTris.Add(gr.Tris[k] + gBase);
+                    if (recordEntities)
+                    {
+                        var gr2 = new AssetEntityRecord();
+                        gr2.Name = (gateProps.Count > 0 ? gateProps[0].Name : "gate")
+                            + GateBridgeStrips.GateNameSuffix;
+                        gr2.Flags = (BodyFlags)0;
+                        gr2.Mobility = 0;
+                        gr2.TriCount = gr.Tris.Count / 3;
+                        gr2.Capped = false;
+                        gr2.Gate = 1;
+                        gr2.VertsXyz = gr.VertsXyz.ToArray();
+                        gr2.Tris = gr.Tris.ToArray();
+                        result.Entities.Add(gr2);
+                    }
+                }
+                if (log != null)
+                {
+                    log("assets: gate: plates=" + gr.Plates + " strips=" + gr.Strips + " skipped=" + gr.Skips
+                        + " (" + GateBridgeStrips.Describe() + ")");
+                    for (int k = 0; k < gr.Infos.Count && k < 20; k++)
+                        log("assets: " + GateBridgeStrips.DescribeInfo(gr.Infos[k]));
+                }
+            }
             // Ramps are appended after every real triangle, so the mask is a true-tail and a build with
             // no ramps leaves ForceWalkableTris null (the builder then takes its unchanged path).
             int realTris = tris.Count / 3;
@@ -703,12 +775,18 @@ namespace BetterBannerlordNavmeshing
             bool anyExempt = false;
             for (int k = 0; k < ledgeExempt.Count; k++)
                 if (ledgeExempt[k]) { anyExempt = true; break; }
-            if (anyExempt)
+            if (anyExempt || gateStripCount > 0)
             {
-                // A stepped prop's own triangles: the builder keeps their spans off the ledge trim.
+                // A stepped prop's own triangles: the builder keeps their spans off the ledge trim. The
+                // synthesized gate bridge strips are marked too (forced AND exempt = a "connector"), so
+                // the builder also exempts them from the clearance filter - a bridge that descends to a
+                // floor below it would otherwise be treated as a ceiling.
                 var exemptMask = new bool[realTris + rampTriCount];
                 for (int k = 0; k < realTris && k < ledgeExempt.Count; k++)
                     exemptMask[k] = ledgeExempt[k];
+                int gateTriCount = gateStripTris;
+                for (int k = exemptMask.Length - gateTriCount; k < exemptMask.Length; k++)
+                    if (k >= 0) exemptMask[k] = true;
                 result.LedgeExemptTris = exemptMask;
             }
             bool anyGate = false;

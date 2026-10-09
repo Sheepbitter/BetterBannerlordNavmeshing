@@ -281,6 +281,13 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   CC_20 -19.6%) at +2..4% faces, with meanQuality and long-thin aspect improving on every map. Note:
   the editor keeps the script's settings per scene, so scenes whose script predates the change still
   read 16 until the value is set to 10 in the panel.
+- IMPLEMENTED (2026-10-08, V3.66): gate connector - synthesized bridge strips at gate plates
+  (`GateBridgeStrips.cs`; gate-bit detection via the fixE `gate` tag; force-walkable + ledge-exempt
+  strips; editor path + harness mirror `--gate on|off`; `NavMeshVoxelGateConnectors` default true).
+  Fixes the CC_20 gate crossing hole (C) at gate level on tile 16 and tile 10; base/Birtu/Basamu
+  unchanged; goldens unchanged. Honest deviation: t5 rides the ramp at ~86.0 vs the base ground ~85.0
+  (per-run ramp lengths would be needed to match exactly). Report: `GateConnectorReport.md`. Supersedes
+  the marking approach (`GateProjectionFixPlan.md` - dead: nothing to mark at the defect).
 - SUITE NOTE (2026-10-08, V3.65): the harness suite at the 10 m default passes 11/13 groups. Test 25
   (LADDER-CAP) fails identically on unmodified HEAD (pre-existing, unrelated). Test 11 (ASSET TEST) is NEW
   at 10 m: its synthetic gully/stairs scene grows a 74.6 deg fan poly face vs the 52 deg assert (24.7 deg

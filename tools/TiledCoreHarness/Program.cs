@@ -717,7 +717,9 @@ private static int RunSnapshot(string prefix, TiledNavMeshBuilder.BarrierWalls w
             for (int k = 0; k < e.VertsXyz.Length; k++) av.Add(e.VertsXyz[k]);
             for (int k = 0; k < e.Tris.Length; k++) at.Add(e.Tris[k] + baseIndex);
             int rampTris = e.RampTris;
-            if (rampTris <= 0 && e.Name != null && e.Name.EndsWith("#ramp", StringComparison.Ordinal))
+            if (rampTris <= 0 && e.Name != null
+                && (e.Name.EndsWith("#ramp", StringComparison.Ordinal)
+                    || e.Name.EndsWith(GateBridgeStrips.GateNameSuffix, StringComparison.Ordinal)))
                 rampTris = e.TriCount;
             if (rampTris > e.TriCount) rampTris = e.TriCount;
             bool steppedEntity = (e.Flags & (SteppedPropRamps.FlagHasSteps | SteppedPropRamps.FlagLadder)) != 0;
@@ -869,6 +871,7 @@ internal static class Program
             string coverageSpec = null;
             int holesMinCells = 0;
             bool propRamps = false;   // mirrors the shipped NavMeshVoxelPropRamps default
+            bool gateConnectors = false;   // mirrors the shipped NavMeshVoxelGateConnectors (harness default off)
             bool steppedPropsOff = false;
             var probeSpecs = new List<string>();
             var pairSpecs = new List<string>();
@@ -909,6 +912,8 @@ internal static class Program
                         holesMinCells = (int)ParseFloat(v); i++; break;
                     case "--ramps":
                         propRamps = ParseOnOff(v); i++; break;
+                    case "--gate":
+                        gateConnectors = ParseOnOff(v); i++; break;
                     case "--probe":
                         probeSpecs.Add(v); i++; break;
                     case "--propdump":
@@ -1185,12 +1190,23 @@ internal static class Program
                 steppedPropsOff = true;
             }
 
+            if (gateConnectors)
+            {
+                ApplyGateConnectors(assets, terrain, log, s.VoxelCellSizeMeters, s.AgentMaxClimbMeters,
+                    s.UseLedgeFilter);
+            }
+            else
+            {
+                Console.WriteLine("gate: disabled (--gate off)");
+            }
+
             float[] soupVerts;
             bool[] soupExempt;
             int[] soupTris;
             bool[] soupForce;
+            SoupSteppedExempt = propRamps;
             BuildSnapshotSoup(terrain, assets, out soupVerts, out soupTris, out soupForce, out soupExempt);
-            if (steppedPropsOff) soupExempt = null;
+            if (steppedPropsOff && !gateConnectors) soupExempt = null;
             Console.WriteLine("soup: " + (soupVerts.Length / 3) + "v / " + (soupTris.Length / 3) + "t"
                 + (soupForce == null ? "" : " (force-walkable tris=" + CountTrue(soupForce) + ")"));
             Console.WriteLine("settings: cs=" + s.VoxelCellSizeMeters.ToString("0.###")
@@ -3020,18 +3036,22 @@ internal static class Program
             // Ramp triangles are always the record's last ones; a dumped '#ramp' record is all ramp.
             int rampTris = e.RampTris;
             if (rampTris <= 0 && e.Name != null
-                && e.Name.EndsWith(SteppedPropRamps.RampNameSuffix, StringComparison.Ordinal))
+                && (e.Name.EndsWith(SteppedPropRamps.RampNameSuffix, StringComparison.Ordinal)
+                    || e.Name.EndsWith(GateBridgeStrips.GateNameSuffix, StringComparison.Ordinal)))
                 rampTris = e.TriCount;
             if (rampTris > e.TriCount) rampTris = e.TriCount;
             // A stepped prop's own triangles are ledge-trim exempt (the same rule the collector applies
             // from the body flags).
             bool steppedEntity = (e.Flags &
                 (SteppedPropRamps.FlagHasSteps | SteppedPropRamps.FlagLadder)) != 0;
+            if (steppedEntity && !SoupSteppedExempt) steppedEntity = false;
+            bool gateEntity = e.Name != null
+                && e.Name.EndsWith(GateBridgeStrips.GateNameSuffix, StringComparison.Ordinal);
             for (int t = 0; t < e.TriCount; t++)
             {
                 bool isRamp = t >= e.TriCount - rampTris;
                 af.Add(isRamp);
-                ae.Add(!isRamp && steppedEntity);
+                ae.Add(!isRamp && (steppedEntity || gateEntity));
             }
         }
         float[] mx;
@@ -3245,6 +3265,214 @@ internal static class Program
     }
 
     private static bool ApplyRampsVerbose = false;
+
+    // Mirrors SceneCollisionGeometry's gate/door bridge-strip synthesis for the snapshot path. Plate
+    // candidates are the records carrying the fixE gate bit (rec.Gate); a snapshot that predates that
+    // bit falls back to a generic thin flat-slab predicate so the offline path still exercises the fix.
+    // The strip geometry is appended as its own '<plate>#gate' record (all force-walkable).
+    internal static void ApplyGateConnectors(List<SceneSnapshot.EntityRecord> assets,
+        SceneSnapshot.TerrainData terrain, Action<string> log, float cellSize, float climb, bool ledge)
+    {
+        if (assets == null || assets.Count == 0) return;
+        // Already dumped (fresh editor snapshot): never synthesize a second strip on top of this one.
+        var dumped = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < assets.Count; i++)
+        {
+            SceneSnapshot.EntityRecord e = assets[i];
+            if (e.Name != null
+                && e.Name.EndsWith(GateBridgeStrips.GateNameSuffix, StringComparison.Ordinal))
+                dumped.Add(e.Name.Substring(0,
+                    e.Name.Length - GateBridgeStrips.GateNameSuffix.Length));
+        }
+
+        bool anyGate = false;
+        for (int i = 0; i < assets.Count; i++) if (assets[i].Gate != 0) { anyGate = true; break; }
+
+        // Detection is the fixE gate bit (v2 assets). A v1 snapshot carries no provenance, so no plate
+        // is attributed and nothing is emitted - the live editor writes v2, and a stale v1 fixture must
+        // be re-dumped before the connector can fire (a generic thin-slab fallback was tried and fired
+        // too broadly on unrelated village slabs).
+        var plates = new List<GateBridgeStrips.Prop>();
+        for (int i = 0; i < assets.Count; i++)
+        {
+            SceneSnapshot.EntityRecord rec = assets[i];
+            if (rec.Name == null || rec.Tris == null || rec.Tris.Length == 0) continue;
+            if (rec.Name.EndsWith(GateBridgeStrips.GateNameSuffix, StringComparison.Ordinal)) continue;
+            bool isPlate = rec.Gate != 0 && IsSlabPlate(rec);
+            if (!isPlate) continue;
+            if (dumped.Contains(rec.Name)) continue;
+            var p = new GateBridgeStrips.Prop();
+            p.Name = rec.Name; p.Flags = rec.Flags;
+            p.VertsXyz = rec.VertsXyz; p.Tris = rec.Tris;
+            plates.Add(p);
+        }
+        Console.WriteLine("gate: mode=" + (anyGate ? "gate-bit" : "no-gate-bit")
+            + " plateProps=" + plates.Count);
+        if (plates.Count == 0) return;
+
+        // Assets + the terrain soup, both in the engine soup layout (x, z, h). The terrain is the target
+        // for a gate whose far side is open ground; passing it as geometry keeps the target height exactly
+        // the surface the builder will rasterise (a strided-node height probe does not match the built
+        // terrain mesh, which is the detail mesh of those triangles).
+        var av = new List<float>();
+        var at = new List<int>();
+        if (terrain != null && terrain.Heights != null)
+        {
+            float[] tv; int[] tt;
+            TiledNavMeshBuilder.BuildTerrainSoup(terrain.Heights, terrain.Width, terrain.Height,
+                terrain.Spacing, terrain.Stride, out tv, out tt);
+            int tbase = av.Count / 3;
+            for (int v = 0; v < tv.Length / 3; v++)
+            {
+                av.Add(tv[v * 3 + 0]);
+                av.Add(tv[v * 3 + 2]);
+                av.Add(tv[v * 3 + 1]);
+            }
+            for (int t = 0; t < tt.Length / 3; t++)
+            {
+                at.Add(tt[t * 3 + 0] + tbase);
+                at.Add(tt[t * 3 + 2] + tbase);
+                at.Add(tt[t * 3 + 1] + tbase);
+            }
+        }
+        for (int i = 0; i < assets.Count; i++)
+        {
+            SceneSnapshot.EntityRecord rec = assets[i];
+            if (rec.Name != null && rec.Name.EndsWith("#barrier", StringComparison.Ordinal)) continue;
+            if (rec.VertsXyz == null || rec.Tris == null) continue;
+            int baseIndex = av.Count / 3;
+            for (int k = 0; k < rec.VertsXyz.Length; k++) av.Add(rec.VertsXyz[k]);
+            for (int k = 0; k < rec.Tris.Length; k++) at.Add(rec.Tris[k] + baseIndex);
+        }
+        Func<float, float, float> terrainAt = null;
+
+        if (Environment.GetEnvironmentVariable("GATE_TRACE") == "1")
+            GateBridgeStrips.Trace = delegate (string m) { Console.WriteLine("    " + m); };
+        else
+            GateBridgeStrips.Trace = null;
+
+        GateBridgeStrips.Result rr = GateBridgeStrips.Synthesize(plates, av.ToArray(), at.ToArray(),
+            terrainAt, cellSize, climb, ledge);
+        GateBridgeStrips.Trace = null;
+        Console.WriteLine("gate: " + GateBridgeStrips.Describe());
+        Console.WriteLine("gate: plates=" + rr.Plates + " strips=" + rr.Strips + " skipped=" + rr.Skips
+            + " plateTris=" + rr.PlateTris + " cells=" + rr.Cells);
+        for (int k = 0; k < rr.Infos.Count && k < 20; k++)
+            Console.WriteLine("  " + GateBridgeStrips.DescribeInfo(rr.Infos[k]));
+        if (Environment.GetEnvironmentVariable("GATE_TRACE") == "1")
+        {
+            for (int k = 0; k < rr.Infos.Count; k++)
+            {
+                GateBridgeStrips.Info gi = rr.Infos[k];
+                if (gi.Tx > 1130f && gi.Tx < 1135f && gi.Tz > 987f && gi.Tz < 994f)
+                {
+                    Console.WriteLine("    gate-quad " + k + " H=" + Num(gi.Hp) + "->" + Num(gi.Ht)
+                        + " width=" + Num(gi.Width));
+                    for (int v = 0; v < 4 && k * 12 + v * 3 + 2 < rr.VertsXyz.Count; v++)
+                        Console.WriteLine("      v" + v + " (" + Num(rr.VertsXyz[k * 12 + v * 3]) + ","
+                            + Num(rr.VertsXyz[k * 12 + v * 3 + 1]) + ","
+                            + Num(rr.VertsXyz[k * 12 + v * 3 + 2]) + ")");
+                }
+            }
+        }
+        if (rr.Tris.Count == 0) return;
+
+        int triCount = rr.Tris.Count / 3;
+        SceneSnapshot.EntityRecord outRec = SceneSnapshot.Expand(
+            (plates.Count > 0 ? plates[0].Name : "gate") + GateBridgeStrips.GateNameSuffix,
+            0, 0, false, rr.VertsXyz.ToArray(), rr.Tris.ToArray(), 1);
+        outRec.RampTris = triCount;
+        assets.Add(outRec);
+        if (log != null) log("gate: synthesized=" + rr.Strips + " strips (force-walkable)");
+    }
+
+    // Generic name-free fallback for a snapshot that predates the fixE gate bit: a thin, rigid, mostly
+    // up-facing slab with a real footprint (the gate/door passage colliders are exactly that). The
+    // bridge only fires where the slab actually abuts a void, so a false positive cannot add geometry.
+    private static bool IsSlabPlate(SceneSnapshot.EntityRecord rec)
+    {
+        if (rec.VertsXyz == null || rec.Tris == null) return false;
+        int vc = rec.VertsXyz.Length / 3;
+        float hmin = float.MaxValue, hmax = float.MinValue;
+        int up = 0;
+        double area = 0.0;
+        float cosFlat = (float)Math.Cos(20.0 * Math.PI / 180.0);
+        for (int t = 0; t < rec.Tris.Length / 3; t++)
+        {
+            int i0 = rec.Tris[t * 3 + 0], i1 = rec.Tris[t * 3 + 1], i2 = rec.Tris[t * 3 + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vc || i1 >= vc || i2 >= vc) continue;
+            float ax = rec.VertsXyz[i0 * 3], az = rec.VertsXyz[i0 * 3 + 1], ah = rec.VertsXyz[i0 * 3 + 2];
+            float bx = rec.VertsXyz[i1 * 3], bz = rec.VertsXyz[i1 * 3 + 1], bh = rec.VertsXyz[i1 * 3 + 2];
+            float cx = rec.VertsXyz[i2 * 3], cz = rec.VertsXyz[i2 * 3 + 1], ch = rec.VertsXyz[i2 * 3 + 2];
+            if (ah < hmin) hmin = ah; if (ah > hmax) hmax = ah;
+            if (bh < hmin) hmin = bh; if (bh > hmax) hmax = bh;
+            if (ch < hmin) hmin = ch; if (ch > hmax) hmax = ch;
+            float ux = bx - ax, uz = bz - az, uh = bh - ah;
+            float wx = cx - ax, wz = cz - az, wh = ch - ah;
+            float nh = ux * wz - uz * wx;
+            float len = (float)Math.Sqrt((uz * wh - uh * wz) * (uz * wh - uh * wz)
+                + (uh * wx - ux * wh) * (uh * wx - ux * wh) + nh * nh);
+            if (len < 1e-9f || nh / len < cosFlat) continue;
+            up++;
+            area += 0.5 * Math.Abs((bx - ax) * (cz - az) - (bz - az) * (cx - ax));
+        }
+        if (up < 8) return false;
+        if (hmax - hmin > 1.2f) return false;
+        if (area < 2.0) return false;
+        return true;
+    }
+
+    // Bilinear terrain height over the SAME strided nodes BuildTerrainSoup meshes, so the gate strip's
+    // target height is the surface the builder will rasterise.
+    private static Func<float, float, float> MakeTerrainProbe(SceneSnapshot.TerrainData terrain)
+    {
+        if (terrain == null || terrain.Heights == null || terrain.Width < 2 || terrain.Height < 2)
+            return null;
+        float sp = terrain.Spacing > 0f ? terrain.Spacing : 1f;
+        int H = terrain.Height;
+        int stride = terrain.Stride > 0 ? terrain.Stride : 1;
+        float[] hh = terrain.Heights;
+        int[] srcX = SampleAxis(terrain.Width, stride);
+        int[] srcZ = SampleAxis(H, stride);
+        return delegate (float x, float z)
+        {
+            int k = AxisIndex(srcX, x, sp), j = AxisIndex(srcZ, z, sp);
+            float x0 = srcX[k] * sp, x1 = srcX[k + 1] * sp;
+            float z0 = srcZ[j] * sp, z1 = srcZ[j + 1] * sp;
+            float tx = (x1 > x0) ? (x - x0) / (x1 - x0) : 0f;
+            float tz = (z1 > z0) ? (z - z0) / (z1 - z0) : 0f;
+            if (tx < 0f) tx = 0f; if (tx > 1f) tx = 1f;
+            if (tz < 0f) tz = 0f; if (tz > 1f) tz = 1f;
+            float h00 = hh[srcX[k] * H + srcZ[j]];
+            float h10 = hh[srcX[k + 1] * H + srcZ[j]];
+            float h01 = hh[srcX[k] * H + srcZ[j + 1]];
+            float h11 = hh[srcX[k + 1] * H + srcZ[j + 1]];
+            return (1f - tx) * (1f - tz) * h00 + tx * (1f - tz) * h10
+                + (1f - tx) * tz * h01 + tx * tz * h11;
+        };
+    }
+
+    private static int[] SampleAxis(int count, int stride)
+    {
+        int samples = (count - 1) / stride + 1;
+        var s = new int[samples];
+        for (int k = 0; k < samples; k++) s[k] = k * stride;
+        if (samples > 1) s[samples - 1] = count - 1;
+        return s;
+    }
+
+    private static int AxisIndex(int[] src, float world, float sp)
+    {
+        if (src.Length < 2) return 0;
+        int k = (int)((world / sp) / (src[1] - src[0]));
+        if (k < 0) k = 0;
+        if (k > src.Length - 2) k = src.Length - 2;
+        return k;
+    }
+
+    // Mirrors the shipped stepped-props setting for the harness soup: false disables the stepped-prop
+    // ledge exemption (the `--ramps off` behaviour) without disabling the gate strips' exemption.
+    internal static bool SoupSteppedExempt = true;
 
     private static int CountTrue(bool[] v)
     {

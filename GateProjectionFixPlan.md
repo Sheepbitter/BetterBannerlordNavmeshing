@@ -1,4 +1,10 @@
 # CC_20 Castle-Gate Navmesh Projection — Implementation-Ready Plan (v2)
+
+> **SUPERSEDED (2026-10-08):** the marking / ledge-exemption approach in this plan cannot work on the
+> current scene data - there is no geometry to mark at the defect (verified: C's column has no horizontal
+> soup triangle; the plan's ramp premise is absent from the data, and its baselines predate the
+> determinism + 2.0-vox changes). The approach was ripped out. The fix that shipped is the synthesized
+> bridge strip: see `GateConnectorReport.md`.
 Repo: `C:\Users\Sheepbitter\source\repos\BetterBannerlordNavmeshing` (read-only; HEAD `9f7477a` "V3.61").
 All experiments were run in `C:\Users\Sheepbitter\AppData\Local\Temp\opencode\gate_plan\` against a **copy** of `tools\TiledCoreHarness` (built OK, never built in the shared dir).
 Fix constraint honoured: **no scene-wide filter changes** — the fix is local to the gate projection's own boundary.

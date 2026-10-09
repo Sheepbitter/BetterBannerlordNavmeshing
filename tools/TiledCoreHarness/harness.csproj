@@ -24,6 +24,7 @@
     <Compile Include="..\..\ThirdParty\DotRecast\**\*.cs" />
     <Compile Include="..\..\TiledNavMeshBuilder.cs" />
     <Compile Include="..\..\SteppedPropRamps.cs" />
+    <Compile Include="..\..\GateBridgeStrips.cs" />
     <Compile Include="..\..\NavMeshCleanup.cs" />
     <Compile Include="..\..\Nmg8Writer.cs" />
     <Compile Include="..\..\SceneSnapshot.cs" />

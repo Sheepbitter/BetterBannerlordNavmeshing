@@ -166,6 +166,15 @@ namespace BetterBannerlordNavmeshing
         // See SteppedPropRamps and the README "Stairs & ladders".
         public bool NavMeshVoxelSteppedProps = true;
 
+        // Gate / door BRIDGE STRIPS (v2 voxel core, default ON). A gate's passage floor is a stack of
+        // separate rigid collider slabs whose edge stops short of the ground beyond the doorway; the
+        // voxel core projects them as a proud plate and the ledge trim eats the crossing, so the direct
+        // path through the gate is a hole. With this on, GateBridgeStrips finds the gate-flagged
+        // thin-slab passage plate and emits a force-walkable bridge strip from its edge to the first
+        // surface beyond the gap (within the agent climb). Name-free (the fixE gate tag + geometry). See
+        // GateBridgeStrips and the README "Gate bridge strips".
+        public bool NavMeshVoxelGateConnectors = true;
+
         // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
         // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance
         // (terrain soup vs asset triangles) in the editor or Blender.
@@ -710,7 +719,8 @@ namespace BetterBannerlordNavmeshing
                 SceneCollisionGeometry.AssetGeometry assets = SceneCollisionGeometry.CollectDetailed(
                     scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, NavMeshVoxelAssetTrace,
                     true, NavMeshVoxelSteppedProps, log, NavMeshVoxelCellSize,
-                    ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, NavMeshMaxSlopeDegrees), NavMeshVoxelLedgeFilter);
+                    ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, NavMeshMaxSlopeDegrees), NavMeshVoxelLedgeFilter,
+                    NavMeshVoxelGateConnectors);
                 assetsWatch.Stop();
 
                 var records = new System.Collections.Generic.List<SceneSnapshot.EntityRecord>();
@@ -849,7 +859,7 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
-                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge,
+                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelGateConnectors, NavMeshVoxelQuadMerge,
                 NavMeshVoxelBarriers, NavMeshConsoleMessages);
         }
 
@@ -972,7 +982,7 @@ namespace BetterBannerlordNavmeshing
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, true,
+                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, false, true,
                 true, true);
         }
 
@@ -1008,6 +1018,7 @@ namespace BetterBannerlordNavmeshing
             bool voxelPruneIsolatedIslands,
             int voxelPruneMaxIslandFaces,
             bool voxelSteppedProps,
+            bool voxelGateConnectors,
             bool voxelQuadMerge,
             bool voxelBarriers,
             bool consoleMessages)
@@ -1129,7 +1140,8 @@ namespace BetterBannerlordNavmeshing
                         SceneCollisionGeometry.AssetTriangles assets =
                             SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
                                 voxelAssetTrace, voxelSteppedProps, RunLog(log), voxelCellSizeMeters,
-                                ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter);
+                                ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter,
+                                voxelGateConnectors);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
                         assetForceWalkable = assets.ForceWalkableTris;
@@ -1344,7 +1356,8 @@ namespace BetterBannerlordNavmeshing
                     SceneCollisionGeometry.AssetTriangles assets =
                         SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
                             NavMeshVoxelAssetTrace, NavMeshVoxelSteppedProps, RunLog(log), NavMeshVoxelCellSize,
-                            ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter);
+                            ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter,
+                            NavMeshVoxelGateConnectors);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
                     assetTris = assets.Tris;

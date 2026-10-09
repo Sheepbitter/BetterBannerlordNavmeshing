@@ -50,7 +50,7 @@ expanded to `P_snapshot_terrain.bin` / `P_snapshot_assets.bin` / `P_snapshot.txt
 `CC_20_siege_navmesh_snapshot_terrain.bin` is loaded with `--snapshot CC_20_siege_navmesh`.
 
 Setting overrides (`--cs`, `--radius`, `--climb`, `--slope`, `--gapfill`, `--stitch`, `--prune`,
-`--ledge`, `--detail`, `--plate`, `--cleanup`, `--steepguard`, `--steepmargin`) plus the inspection
+`--ledge`, `--detail`, `--plate`, `--ramps`, `--gate`, `--cleanup`, `--steepguard`, `--steepmargin`) plus the inspection
 switches (`--probe`, `--vmesh`, `--vprobe`, `--pinch`, `--flood`, `--walk`, `--soup`, `--scan`,
 `--census`, `--defect`, `--ladders`, `--props`, `--routing`, `--quality`, `--quiet`, `--xzprobe`,
 `--connect`). Run it with a bad prefix to get the one-line usage summary.

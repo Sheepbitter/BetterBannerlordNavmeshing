@@ -393,6 +393,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshVoxelQuadMerge` | `true` | Final **quad merge** (part of the cleanup, after the flip polish). A still-thin face (min angle < 6 deg OR aspect `longest^2/(2*area)` > 8) is combined with a near-coplanar neighbour across a shared edge into ONE emitted 4-vertex face (fold <= 25 deg, four distinct vertices). **The merged quad must be strictly convex in BOTH frames** - in its own plane *and* in the engine's own XZ ground projection (within 175 deg, winding preserved) - because the engine's navmesh validator rejects a concave face ("Concave Navigation Mesh Face Detected" on import), so a reflex-cornered pair is left as two triangles and the emitted `is_concave` is 0 everywhere. **Geometry is unchanged** - the triangle list and every vertex stay put; only the shared interior edge disappears from the emitted perimeter, so there is one fewer face per merge and no geometric risk. Log: `quads=N quadsXZworst=<deg>deg` on the `cleanup:` line. `false` = triangles only (A/B). See *Sliver cleanup*. |
 | `NavMeshVoxelGatePlateBlend` | `true` | Rotates a prop's rigid **dead-flat floor slab** onto the surrounding ground so both ends meet the navmesh inside the agent climb (the reported case: `european_castle_wall_gate_l1` on CC_20 projecting a perfectly level plate at y=86.30 across a passage whose terrain falls 87.1 -> 82.8 m, so the far end met faces 1.20 m below it and the plate's tip was a dead end). Classified generically - a maximal edge-connected group of dead-flat up-facing faces on ONE `ch` level, 3..120 faces, <= 8 m a side, standing more than one agent climb (and at most 2.5 m) above the 10th percentile of the mesh around its own footprint. The plane is least-squares fitted to the **built mesh** in a 2 m ring around that footprint (never to the raw soup, and never to our own synthesized ramp cells), the tilt is clamped to `NavMeshMaxSlopeDegrees` **and** to `2*climb/halfSpan`, and the offset is the median residual clamped to `[-climb, 0]`. **Only the plate's own vertices move**: no face is added or removed, no edge is touched, and no plate that already meets its surroundings inside the climb is touched at all. Measured: CC_20 gate worst neighbour mismatch **1.60 -> 0.495 m**, plate 0.0 -> 13.0 deg, dead-end tip 1.20 -> 0.23 m from its neighbour; islands, `selfOverlap` and `--scan OVERLAPpairs` unchanged on CC_20 / Birtu / Basamu, suite byte-identical. `false` = the pre-pass output byte for byte. See *Gate / door plate blend*. |
 | `NavMeshVoxelSteppedProps` | `true` | **Read *Stairs & ladders* before changing.** Stairs: a `HasSteps`/`Ladder` prop's own triangles are exempt from Recast's ledge trim (a per-tile marker pass restores exactly the spans the trim nulled; `v2: stepped: markedCells=<n> restored=<n>`), which is what a 51-56 deg flight needs - its treads are horizontal and walkable, the trim was the only thing deleting them. Everything else keeps the ordinary 50.19 deg cap. Ladders: with this on, `Ladder`-flagged bodies are **collected** instead of excluded (counted as `laddersIncluded=<n>`), and `SteppedPropRamps` bridges only the *unsupported* stretches of the run (holes <= 1.5 m and taller than the agent climb) with true-level end anchors, so no ramp ever hovers over a tread. A ladder whose collision is a slanted plank (no holes to bridge at all) instead gets one straight 1.2 m-wide ramp chain from its own bottom to its top (V3.18), and every prop that yields no ramp is named in the log with its reason (V3.18). Measured on Birtu: `stairs_bo` 6/6 improve (+9..+20 pts), `european_castle_ladder` 6/6 improve, 4 of 6 `wooden_platform_stairs_a` improve and the other 2 only *appear* to regress (the coverage window is knife-edged at `surface + 1.10 m`; their real gaps go 20->5 and 48->29, see *Stairs & ladders*); islands stay 5. The level-band criterion (faces per 1 m band within +/-10 of the off build) cannot hold while the feature adds the missing stair/ladder faces - 6 bands gain +12..+45, total +174 faces (+0.34%). |
+| `NavMeshVoxelGateConnectors` | `true` | Synthesize a **bridge strip** at gate / door passage plates (`GateBridgeStrips`) so the direct crossing through the doorway is walkable instead of a hole the agent must detour around. Name-free: the fixE `gate` tag (per-entity bit / `Candidate.IsGate`) plus the thin-slab subset for the passage floor (the tag is also on the tall door leaves). Force-walkable + ledge-exempt (a "connector"), one sloped quad per plate edge run. Mirrored in the harness with `--gate on` (default off). See *Gate bridge strips*. |
 | `NavMeshVoxelBarriers` | `true` | Carve every barrier body whose blocking mask stops **agents** out of the navmesh as a solid wall, so an agent can no longer path across it. Masks that stop only missiles/weapons are deliberately **not** carved - the engine excludes `MissileOnly` bodies from every agent raycast, so the game itself lets agents walk through those. Two rules keep it from over-cutting: the cut is applied only where the wall straddles that column's navigable band (a wall 25 m above or below a walkway cuts nothing), and every connectivity repair (gap fill, per-tile stitch, merge stitch) refuses to bridge a barrier cell. One-way (`Flip`) is **not** reproduced - the cut is two-sided, which is stricter than the runtime rule, because a navmesh has no directed edges. `false` restores the pre-barrier output byte for byte. See *Barriers*. |
 | `NavMeshVoxelWriteSoupObj` | `false` | Diagnostic: also write `<prefab>_soup_terrain.obj` and `<prefab>_soup_assets.obj` next to the bin (engine space) and log both paths. Inspect a failing spot with geometry provenance in the editor/Blender. |
 | `NavMeshVoxelTerrainHoleAudit` | `false` | Terrain-hole audit: compare every sampled terrain vertex against the hole-aware point query and drop the cells of any version that disagrees by > 1 m (a false walkable lid over a carve). Costs one native point query per vertex; see *Terrain holes (false lids)*. |
@@ -1485,6 +1486,39 @@ stages ever contributed - and **the island census does not move on any of the th
 the user saw on a cliff prop or a roof was therefore either a connected fragment (which the census never
 counted) or, on a scene not built here, a separate island; this revert cannot claim the island half of the
 report, and the measurement says so plainly rather than asserting a fix.
+
+### Gate bridge strips - `NavMeshVoxelGateConnectors`, **on by default**
+
+A castle gate / usable door usually drops its passage floor as a set of SEPARATE rigid collider props
+(`collider_l/r`, `extra_collider_l/r`, `collider_agent_l/r` on CC_20's wall gate). Those slabs stack a few
+tens of centimetres apart and their edge stops short of the ground beyond the doorway. The voxel core
+represents them as a proud flat plate: the plate's rim and the sub-slabs under it are more than an agent
+climb apart once quantised, so `FilterLedgeSpans` (and the erosion after it) eats the whole crossing and the
+direct path through the gate becomes a hole - the agent has to detour around the doorway.
+
+With this setting on, `GateBridgeStrips` finds the gate/door PASSAGE PLATE and emits a synthesized **bridge
+strip** - the same shape of machinery as the stair/ladder ramps:
+
+- **Detection is name-free.** The gate/door provenance is the fixE scene tag `gate` carried as a per-entity
+  bit in the snapshot (`rec.Gate`) and as `Candidate.IsGate` live; the passage floor is the **thin-slab**
+  subset of those props (`IsThinSlab`: a thin, mostly up-facing slab with a real footprint - the tag is also
+  on the door leaves / frame, which are tall and must not become the plate). A v1 snapshot carries no
+  provenance, so nothing is attributed and nothing is emitted; the live editor writes v2, and a stale v1
+  fixture must be re-dumped before the connector can fire.
+- **Synthesis** rasterises the plate footprint into a cell grid, finds the plate's boundary runs, and for each
+  run marches outward to the first walkable surface beyond the plate that a ramp can reach (within
+  `MaxBridgeRunMeters` = 2 m, `MaxDropMeters` = 1.3 m below, `MaxRiseMeters` = 0.3 m above). It emits one
+  strip per run: a flat plate-level apron (so the plate's own edge cell is not trimmed as a ledge), the ramp,
+  and a flat target-level apron (so it overlaps the target's built span).
+- **Marking** is the same as a ramp: the strip triangles are appended to the soup and FORCED walkable
+  (`RC_WALKABLE_AREA`), and are also ledge-exempt (the "connector" pair), so the builder keeps them off the
+  ledge trim *and* the clearance filter (a strip that descends to a floor below it would otherwise read as a
+  ceiling). Deterministic: fixed scan order, no dictionary iteration reaches the output.
+
+The setting rides the same collector path as `NavMeshVoxelSteppedProps`; the harness mirrors it with
+`--gate on` (default off, so the recorded goldens are unchanged) and logs
+`gate: plates=<n> strips=<n> skipped=<n>` plus one `gate strip '...' gap=... drop=... slope=...` line per
+emitted strip. See `GateBridgeStrips.cs`.
 
 ### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
 
