@@ -38,11 +38,13 @@ namespace BetterBannerlordNavmeshing
         public bool NavMeshCullBelowHeight = false;
         public float NavMeshMinHeight = 0f;
         // Water-level mode (always active; scenes always have a water level, dry maps set it well below
-        // the terrain so this is a natural no-op). ON = CULL: drop every soup triangle whose lifted
-        // lowest corner is below the level. OFF = RAISE (v2 only): clamp every soup vertex whose lifted
-        // height is below the level up to exactly the level, so the mesh never sits under the surface.
-        // The comparison is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher
-        // supports the cull only; a v1 raise is a documented no-op.
+        // the terrain so this is a natural no-op). ON = CULL: drop every FLOOR-LIKE soup triangle whose
+        // lifted lowest corner is below the level. OFF = RAISE (v2 only): clamp every FLOOR-LIKE soup
+        // vertex whose lifted height is below the level up to exactly the level, so the mesh never sits
+        // under the surface. Floor-like = Recast-space upward normal >= cos(NavMeshMaxSlopeDegrees): wall
+        // and obstacle geometry is NEVER culled or clamped, so walls keep standing and keep blocking. The
+        // comparison is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher supports
+        // the cull only; a v1 raise is a documented no-op.
         public bool NavMeshCullBelowWaterLevel = false;
         public float NavMeshHeightOffsetMeters = 0.5f;
         public string NavMeshPrefabName = "";

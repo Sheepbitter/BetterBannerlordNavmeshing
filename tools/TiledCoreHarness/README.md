@@ -57,10 +57,12 @@ switches (`--probe`, `--vmesh`, `--vprobe`, `--pinch`, `--flood`, `--walk`, `--s
 `--connect`). Run it with a bad prefix to get the one-line usage summary.
 
 **Water level** (`--cullwater M` = Mode A cull, `--raisewater M` = Mode B raise): both compare the
-**lifted** height (`soupY + HeightOffsetMeters`). A build with either flag also prints a `shoreline:`
+**lifted** height (`soupY + HeightOffsetMeters`) and act on **floor-like triangles only** (Recast-space
+upward normal >= `cos(MaxSlopeDegrees)`) - wall/obstacle geometry is never culled or clamped. A build
+with either flag also prints a `shoreline:`
 line classifying faces by height around the level (`sheetFaces`, `submergedFaces`, `transitionFaces`,
-`transitionMaxSlope`) so the deep/shallow boundary can be judged. No flag = no water handling
-(byte-identical, the goldens).
+`transitionWalkable`, `transitionMaxSlope`) so the deep/shallow boundary can be judged. No flag = no water
+handling (byte-identical, the goldens).
 
 ## Known documented failure
 

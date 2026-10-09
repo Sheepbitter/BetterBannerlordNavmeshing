@@ -352,6 +352,15 @@ namespace BetterBannerlordNavmeshing
             //       therefore never sits under the surface. `max` is idempotent, so applying it per
             //       triangle during binning is safe.
             //
+            // FLOOR-LIKE GATE (both modes). Only potentially-walkable floor triangles are touched: a
+            // triangle is floor-like when its Recast-space upward normal is at least
+            // cos(MaxSlopeDegrees) - the same walkable-slope threshold MarkWalkableTriangles uses (plus a
+            // small margin so a floor exactly at the cap is kept). Vertical / tapered WALL geometry has a
+            // near-zero upward normal and is NEVER culled or clamped, so a wall that spans from below the
+            // level to above it keeps standing and keeps blocking the navmesh. Without this gate the
+            // min-corner rule deleted whole wall triangles (a wall quad's lowest corner is below the
+            // level), which silently opened up the scene ("walls ignored").
+            //
             // Both false = no water handling (the default; the harness no-flag path is byte-identical).
             // A level well below the terrain makes either mode a natural no-op. If both are set, Mode A
             // wins (the raise block is skipped).
@@ -831,6 +840,12 @@ namespace BetterBannerlordNavmeshing
             return b;
         }
 
+        // Floor-like gate for the water modes. cos(MaxSlopeDegrees) is the walkable-slope normal (the
+        // same s.MaxSlopeDegrees MarkWalkableTriangles uses); the margin keeps a floor exactly at the cap,
+        // and the minimum keeps a vertical wall (upward normal ~ 0) non-floor-like even at a >= 90 deg cap.
+        private const float WaterFloorLikeMargin = 0.02f;
+        private const float WaterFloorLikeMinNormal = 0.05f;
+
         // Mode B helper: clamp one vertex up so its LIFTED height (y + HeightOffsetMeters) is at least
         // the water level. `raiseY` is the pre-lift target (level - offset); `seen` makes the count exact
         // when a shared vertex is reached from several triangles. max() semantics: idempotent.
@@ -1068,6 +1083,12 @@ namespace BetterBannerlordNavmeshing
             float waterRaiseY = s.WaterLevelMeters - s.HeightOffsetMeters;   // pre-lift target for Mode B
             bool[] waterRaisedMask = s.RaiseBelowWaterLevel && !s.CullBelowWaterLevel
                 ? new bool[vertsXyz.Length / 3] : null;
+            // Floor-like gate: the same walkable-slope normal Recast uses (MarkWalkableTriangles is
+            // called with s.MaxSlopeDegrees), minus a small margin so a floor exactly at the cap counts.
+            // The lower clamp guarantees a vertical wall (upward normal ~ 0) is never floor-like even if
+            // the cap is set at/above 90 deg. See the settings comment.
+            float waterFloorLikeThreshold = Math.Max(WaterFloorLikeMinNormal,
+                (float)Math.Cos(s.MaxSlopeDegrees * Math.PI / 180.0) - WaterFloorLikeMargin);
             int rasterizedTris = 0;
             for (int t = 0; t < inputTris; t++)
             {
@@ -1079,35 +1100,54 @@ namespace BetterBannerlordNavmeshing
                 float triMinZ = Math.Min(tz0, Math.Min(tz1, tz2));
                 float triMaxZ = Math.Max(tz0, Math.Max(tz1, tz2));
 
-                // WATER-LEVEL CULL (Mode A, CullBelowWaterLevel). The comparison is on the LIFTED height
-                // (soupY + HeightOffsetMeters) - the height the emitted mesh actually sits at - so ground
-                // shallow enough to wade (at/above the level after the offset) is NOT culled. The soup is
-                // still un-lifted here (the lift is applied after rasterisation), so the offset is added
-                // explicitly. Min-corner rule, matching the v1 mesher: a triangle that dips below at any
-                // corner goes whole. Strict `<`, so a corner exactly on the level is kept.
-                if (s.CullBelowWaterLevel)
+                // WATER-LEVEL CULL / RAISE (Modes A/B). Both act ONLY on floor-like triangles: the gate
+                // is the Recast-space upward normal against cos(MaxSlopeDegrees) (the walkable-slope
+                // threshold), so vertical/tapered wall geometry is never culled or clamped - a wall that
+                // spans from below the level to above it keeps standing and keeps blocking. The comparison
+                // is on the LIFTED height (soupY + HeightOffsetMeters); the soup is still un-lifted here
+                // (the lift is applied after rasterisation), so the offset is added explicitly.
+                if (s.CullBelowWaterLevel || s.RaiseBelowWaterLevel)
                 {
-                    float triMinY = Math.Min(vertsXyz[i0 * 3 + 1], Math.Min(vertsXyz[i1 * 3 + 1],
-                        vertsXyz[i2 * 3 + 1]));
-                    if (triMinY + s.HeightOffsetMeters < s.WaterLevelMeters)
+                    float e0x = vertsXyz[i1 * 3] - vertsXyz[i0 * 3];
+                    float e0y = vertsXyz[i1 * 3 + 1] - vertsXyz[i0 * 3 + 1];
+                    float e0z = vertsXyz[i1 * 3 + 2] - vertsXyz[i0 * 3 + 2];
+                    float e1x = vertsXyz[i2 * 3] - vertsXyz[i0 * 3];
+                    float e1y = vertsXyz[i2 * 3 + 1] - vertsXyz[i0 * 3 + 1];
+                    float e1z = vertsXyz[i2 * 3 + 2] - vertsXyz[i0 * 3 + 2];
+                    float cnx = e0y * e1z - e0z * e1y;
+                    float cny = e0z * e1x - e0x * e1z;
+                    float cnz = e0x * e1y - e0y * e1x;
+                    float clen2 = cnx * cnx + cny * cny + cnz * cnz;
+                    float nyNorm = clen2 > 0f ? cny / (float)Math.Sqrt(clen2) : 0f;
+                    // Synthesized ramps are walkable by design even when steeper than the cap, so they
+                    // count as floor-like too (they are floors, never walls).
+                    bool floorLike = nyNorm >= waterFloorLikeThreshold
+                        || (forceWalkableTriangles != null && forceWalkableTriangles[t]);
+
+                    if (floorLike && s.CullBelowWaterLevel)
                     {
-                        culledByWater++;
-                        float triMaxY = Math.Max(vertsXyz[i0 * 3 + 1], Math.Max(vertsXyz[i1 * 3 + 1],
+                        float triMinY = Math.Min(vertsXyz[i0 * 3 + 1], Math.Min(vertsXyz[i1 * 3 + 1],
                             vertsXyz[i2 * 3 + 1]));
-                        if (triMinY < waterCulledMinCorner) waterCulledMinCorner = triMinY;
-                        if (triMaxY > waterCulledMaxCorner) waterCulledMaxCorner = triMaxY;
-                        continue;
+                        if (triMinY + s.HeightOffsetMeters < s.WaterLevelMeters)
+                        {
+                            culledByWater++;
+                            float triMaxY = Math.Max(vertsXyz[i0 * 3 + 1], Math.Max(vertsXyz[i1 * 3 + 1],
+                                vertsXyz[i2 * 3 + 1]));
+                            if (triMinY < waterCulledMinCorner) waterCulledMinCorner = triMinY;
+                            if (triMaxY > waterCulledMaxCorner) waterCulledMaxCorner = triMaxY;
+                            continue;
+                        }
                     }
-                }
-                // WATER-LEVEL RAISE (Mode B, RaiseBelowWaterLevel). Every vertex whose LIFTED height is
-                // below the level is clamped up to max(y, level - offset), i.e. exactly the level once the
-                // post-rasterisation lift is added. `max` is idempotent, so a shared vertex reached from
-                // several triangles is clamped once and the count stays exact (the mask marks it).
-                else if (s.RaiseBelowWaterLevel)
-                {
-                    raisedByWater += RaiseWaterVertex(vertsXyz, i0, waterRaiseY, waterRaisedMask);
-                    raisedByWater += RaiseWaterVertex(vertsXyz, i1, waterRaiseY, waterRaisedMask);
-                    raisedByWater += RaiseWaterVertex(vertsXyz, i2, waterRaiseY, waterRaisedMask);
+                    // Mode B (RAISE): clamp a floor-like triangle's vertices up to max(y, level - offset),
+                    // i.e. exactly the level once the post-rasterisation lift is added. `max` is
+                    // idempotent, so a shared vertex reached from several triangles is clamped once and
+                    // the count stays exact (the mask marks it). Wall geometry is never touched.
+                    else if (floorLike && s.RaiseBelowWaterLevel)
+                    {
+                        raisedByWater += RaiseWaterVertex(vertsXyz, i0, waterRaiseY, waterRaisedMask);
+                        raisedByWater += RaiseWaterVertex(vertsXyz, i1, waterRaiseY, waterRaisedMask);
+                        raisedByWater += RaiseWaterVertex(vertsXyz, i2, waterRaiseY, waterRaisedMask);
+                    }
                 }
 
                 // BORDER CLAMP, part 2: a triangle whose AABB misses the border's AABB entirely can never
@@ -1160,16 +1200,19 @@ namespace BetterBannerlordNavmeshing
                 + " rasterized=" + rasterizedTris + " (rasterized counts per-tile border duplicates)");
             if (s.CullBelowWaterLevel)
                 Log(log, "v2: water cull: level=" + F(s.WaterLevelMeters) + "m offset=" + F(s.HeightOffsetMeters)
-                    + "m (lifted) minCornerY+offset<level culled="
+                    + "m (lifted) floorLike(ny>=" + F(waterFloorLikeThreshold)
+                    + ") minCornerY+offset<level culled="
                     + culledByWater + "/" + inputTris + " tris (removed corner heights ["
                     + F(culledByWater > 0 ? waterCulledMinCorner : 0f) + ".."
                     + F(culledByWater > 0 ? waterCulledMaxCorner : 0f)
-                    + "]m; true heights, the +" + F(s.HeightOffsetMeters)
-                    + "m lift is applied after rasterisation)");
+                    + "]m; floor-like only - wall/obstacle geometry is never culled; true heights, the +"
+                    + F(s.HeightOffsetMeters) + "m lift is applied after rasterisation)");
             else if (s.RaiseBelowWaterLevel)
                 Log(log, "v2: water raise: level=" + F(s.WaterLevelMeters) + "m offset=" + F(s.HeightOffsetMeters)
-                    + "m target=" + F(waterRaiseY) + "m (pre-lift) raised=" + raisedByWater + "/"
-                    + (vertsXyz.Length / 3) + " verts whose lifted y<level were clamped to the level");
+                    + "m target=" + F(waterRaiseY) + "m (pre-lift) floorLike(ny>=" + F(waterFloorLikeThreshold)
+                    + ") raised=" + raisedByWater + "/"
+                    + (vertsXyz.Length / 3)
+                    + " verts whose lifted y<level were clamped to the level (wall/obstacle geometry untouched)");
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
                 int forced = 0;

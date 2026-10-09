@@ -10038,7 +10038,32 @@ private static double WorstQuadAngle(TiledNavMeshBuilder.VoxelMeshResult r)
         Console.WriteLine("  D min-corner culled=" + rd.CulledByWater + " (expect 1); exact-level culled="
             + re.CulledByWater + " F=" + re.FaceCount + " (expect 0, F>0) -> " + (passD ? "PASS" : "FAIL"));
 
-        Console.WriteLine("  RESULT: WATER " + ((passA && passB && passC && passD) ? "PASS" : "FAIL"));
+        // ---- E: WALL case (the regression) -------------------------------------------------------
+        // A vertical wall at x=10 spans from below the level (y=0) to above it (y=12), between two
+        // y=10 floors. The wall is obstacle geometry: the floor-like gate must keep it out of both modes,
+        // and the navmesh must still be blocked by it (no emitted face crosses x=10).
+        MakeWallSoup(out verts, out tris);
+        TiledNavMeshBuilder.TiledNavMeshSettings ea = WaterSettings();
+        ea.HeightOffsetMeters = 0.5f;
+        ea.CullBelowWaterLevel = true; ea.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult reA =
+            TiledNavMeshBuilder.Build(verts, tris, ea, Environment.ProcessorCount, null);
+        MakeWallSoup(out verts, out tris);   // raise mutates the soup; use a fresh copy
+        TiledNavMeshBuilder.TiledNavMeshSettings eb = WaterSettings();
+        eb.HeightOffsetMeters = 0.5f;
+        eb.RaiseBelowWaterLevel = true; eb.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult reB =
+            TiledNavMeshBuilder.Build(verts, tris, eb, Environment.ProcessorCount, null);
+        int crossA = CountCrossingFaces(reA, 10f);
+        int crossB = CountCrossingFaces(reB, 10f);
+        bool passE = reA.CulledByWater == 0 && reA.FaceCount > 0 && crossA == 0
+            && reB.RaisedByWater == 0 && reB.FaceCount > 0 && crossB == 0;
+        Console.WriteLine("  E wall (y 0..12, level " + level.ToString("F0") + "): cullMode culled="
+            + reA.CulledByWater + " F=" + reA.FaceCount + " crossingFaces=" + crossA
+            + " | raiseMode raised=" + reB.RaisedByWater + " F=" + reB.FaceCount + " crossingFaces=" + crossB
+            + " (expect 0 culled/raised, 0 crossing) -> " + (passE ? "PASS" : "FAIL"));
+
+        Console.WriteLine("  RESULT: WATER " + ((passA && passB && passC && passD && passE) ? "PASS" : "FAIL"));
     }
 
     // A settings object with no detail/prune/region interference, so the cull count is the only variable.
@@ -10090,6 +10115,39 @@ private static double WorstQuadAngle(TiledNavMeshBuilder.VoxelMeshResult r)
         AddTri(v, t, 12f, 0f, yB, 22f, 10f, yB, 22f, 0f, yB);
         verts = v.ToArray();
         tris = t.ToArray();
+    }
+
+    // Two y=10 floors either side of a vertical wall at x=10 that spans from below the level (y=0) to
+    // above it (y=12). The wall is obstacle geometry and must survive both water modes and keep blocking.
+    private static void MakeWallSoup(out float[] verts, out int[] tris)
+    {
+        var v = new List<float>();
+        var t = new List<int>();
+        // left floor x 0..10, right floor x 10..20, both y=10 (above the level)
+        AddTri(v, t, 0f, 0f, 10f, 10f, 10f, 10f, 10f, 0f, 10f);
+        AddTri(v, t, 0f, 0f, 10f, 0f, 10f, 10f, 10f, 10f, 10f);
+        AddTri(v, t, 10f, 0f, 10f, 20f, 10f, 10f, 20f, 0f, 10f);
+        AddTri(v, t, 10f, 0f, 10f, 10f, 10f, 10f, 20f, 10f, 10f);
+        // vertical wall at x=10, z 0..10, y 0..12 (below -> above the level); normal is +-X (ny=0)
+        AddTri(v, t, 10f, 0f, 0f, 10f, 10f, 12f, 10f, 0f, 12f);
+        AddTri(v, t, 10f, 0f, 0f, 10f, 10f, 0f, 10f, 10f, 12f);
+        verts = v.ToArray();
+        tris = t.ToArray();
+    }
+
+    // Number of emitted faces whose XZ footprint straddles the plane x = xPlane (with a small dead band).
+    // A wall that still blocks leaves this at 0; a culled wall lets the mesh bridge across.
+    private static int CountCrossingFaces(TiledNavMeshBuilder.VoxelMeshResult r, float xPlane)
+    {
+        int n = 0;
+        for (int f = 0; f < r.FaceCount; f++)
+        {
+            int a = r.Tris[f * 3 + 0], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+            float minx = Math.Min(r.VertsXyz[a * 3], Math.Min(r.VertsXyz[b * 3], r.VertsXyz[c * 3]));
+            float maxx = Math.Max(r.VertsXyz[a * 3], Math.Max(r.VertsXyz[b * 3], r.VertsXyz[c * 3]));
+            if (minx < xPlane - 0.05f && maxx > xPlane + 0.05f) n++;
+        }
+        return n;
     }
 
     // Appends one triangle with the (p00, p11, p10) winding (upward Recast normal).

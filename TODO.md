@@ -288,6 +288,15 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   unchanged; goldens unchanged. Honest deviation: t5 rides the ramp at ~86.0 vs the base ground ~85.0
   (per-run ramp lengths would be needed to match exactly). Report: `GateConnectorReport.md`. Supersedes
   the marking approach (`GateProjectionFixPlan.md` - dead: nothing to mark at the defect).
+- IMPLEMENTED (2026-10-09, V3.68): FIX - the water modes culled/clamped WALL geometry (user report:
+  "when culling below water level is enabled, it just starts ignoring walls"). The min-corner rule removed
+  whole wall quads (their lowest corner is below the level; pre-fix CC_20 @90 removed triangles reaching
+  23 m above the level). Both modes are now gated on FLOOR-LIKE triangles only: Recast-space upward normal
+  >= `cos(NavMeshMaxSlopeDegrees)` (the `MarkWalkableTriangles` threshold) + a small margin, plus
+  force-walkable ramps. Wall/obstacle geometry is never culled or clamped, so walls keep standing and keep
+  blocking through the raised sheet. Test 29 gains the wall case (a y 0..12 wall at level 5 survives both
+  modes and blocks: 0 crossing faces). A/B re-run: CC_20 @90 cull 385172 -> 261986, Birtu 443445 -> 222358,
+  Basamu 788618 -> 555313; removed corner heights capped (CC_20 113 -> 98.79 m). Report: `WaterCullReport.md`.
 - IMPLEMENTED (2026-10-09, V3.67): water-level navmesh handling - cull OR raise (user request). The
   editor always reads `Scene.GetWaterLevel()` (dry maps set it below the terrain -> natural no-op;
   `SafeWaterLevel` guards). Offset-aware (`NavMeshHeightOffsetMeters`): Mode A (cull ON) drops triangles
