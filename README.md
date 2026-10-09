@@ -367,6 +367,7 @@ masks. The attached entity's X/Y **is** the probed column - move the entity to p
 | `NavMeshCoarsestSpacing` | `10` | Largest cell size (m) - the v2 tile size. Smaller = tighter bound, more faces. Lowered from 16 to 10 in V3.65: the five-map tile sweep (`TileSweepReport.md`) measured -20..30% build time on the heavy maps (Na'ilu/Basamu/CC_20) at +2..4% faces. |
 | `NavMeshMaxSlopeDegrees` | `50` | Faces steeper than this are dropped; the v2 core auto-derives the agent climb so the configured slope is actually traversable. |
 | `NavMeshCullBelowHeight` / `NavMeshMinHeight` | `false` / `0` | Optional floor/water culling (true heights; the offset does not shift the floor). |
+| `NavMeshCullBelowWaterLevel` | `false` | **Water level mode** (always active; scenes always have a water level - dry maps set it well below the terrain, so this is a natural no-op there). The scene level is read (`Scene.GetWaterLevel`) and compared against the **lifted** height (`soupY + NavMeshHeightOffsetMeters`), because that is where the emitted mesh sits. `true` = **cull** (Mode A): drop every soup triangle whose lifted lowest corner is below the level (min-corner rule: a triangle that only dips below at one corner goes whole). `false` = **raise** (Mode B, v2 only): clamp every soup vertex whose lifted height is below the level up to `max(y, level - offset)`, so its lifted height is exactly the level and the mesh never sits under the surface; the v1 mesher has no raise and is left unchanged. Emitted heights land within one voxel cell (`CellHeightMeters`) of the level because Recast quantises to the `ch` lattice. The level is logged (`water: level=...m`), the summary as `v2: water cull/raise: ...`, and recorded in the snapshot header as `water: ...`. See the harness `--cullwater` / `--raisewater`. |
 | `NavMeshHeightOffsetMeters` | `0.5` | Uniform lift applied to the whole emitted mesh (terrain **and** structures), so it does not intersect either. 0 = as flush as the voxel lattice allows. |
 | `NavMeshPrefabName` | `""` | Defaults to `<scene name>_navmesh`. |
 | `NavMeshExportFolder` | `""` | Override for the output folder, and the highest-priority rule in the folder resolution (see *Which module gets the write*). Use it to pin the module when the ranked `SceneObj` search reports `AMBIGUOUS`. It must be the `NavMeshPrefabs` of a **loaded** module (has a `SubModule.xml` **and** is enabled in the launcher) for the in-editor import to find it; the `prefab index:` block reports `loaded=` per module. When the resolved folder's module is not loaded, the bin is additionally copied into this module's `NavMeshPrefabs` (see *Freshly written prefab workflow*). |
@@ -433,7 +434,8 @@ the mesh is built - bin write, OBJ, clear, import, face-count verify - is the *s
   `NavMeshVoxelIncludeAssets` / `NavMeshVoxelIncludeDynamic` / `NavMeshVoxelIncludeFlora` (asset ingestion;
   see *Assets (structures)*), `NavMeshVoxelTerrainHoleAudit` (default false; see *Terrain holes*),
   `NavMeshVoxelWriteSoupObj` (default false; soup dump), `NavMeshVoxelAssetTrace` (default false; crash
-  triage). Agent height is fixed at 1.8 m; **radius is configurable** and **climb is auto-derived** so the
+  triage), `NavMeshCullBelowWaterLevel` (water level mode: true = cull below the level, false = raise up to
+  it; v2 only for the raise, see the settings table). Agent height is fixed at 1.8 m; **radius is configurable** and **climb is auto-derived** so the
   slope setting is actually walkable (see below). The **border clamp** has no setting: it follows the
   scene's own border probes (see *Border clamp* below).
 
@@ -812,8 +814,10 @@ NavMesh: snapshot: wrote 3 files in 1234ms terrainMs=... assetsMs=...
   float32 each = 3 vertices per triangle, engine Z-up world space), then `triCount*3` int32 indices
   (0-based; trivial, the mesh is stored unindexed).
 - `<prefab>_snapshot.txt` - human-readable: scene, date, machine, the settings line, the grid
-  (dims/spacing/stride/fallback), asset counts and the exclusion stats, the 20 largest shapes by name, and an
-  `assert-points:` section (the two Birtu probe spots plus `NavMeshSnapshotAssertPoints`).
+  (dims/spacing/stride/fallback), the scene's `water: <level>m (scene.GetWaterLevel)` level (for the
+  record and so an offline `--cullwater` A/B can reuse it), asset counts and the exclusion stats, the 20
+  largest shapes by name, and an `assert-points:` section (the two Birtu probe spots plus
+  `NavMeshSnapshotAssertPoints`).
 
 **Offline harness mode** (the standalone harness, `--snapshot`):
 
@@ -828,6 +832,9 @@ Optional flags (defaults = the recommended set):
 --pair "x1,z1|x2,z2"      repeatable. Also accepts x1,z1,level1|x2,z2,level2 (explicit floor level per end).
                           Measures whether the straight path between the two spots is bridged (see below).
 --band M  --cs M  --radius M  --climb M  --gapfill N  --stitch N  --prune N  --ledge on|off  --detail on|off  --slope D
+--cullwater M             Mode A: drop every soup triangle whose lifted lowest corner (y + offset) is below M m
+--raisewater M            Mode B: clamp every soup vertex whose lifted height (y + offset) is below M m up to M
+                          (v2 only; the editor's NavMeshCullBelowWaterLevel, default off = no water handling)
 ```
 
 Assert points are reported with **their own island id** (index + face count + area), and each point's

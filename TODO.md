@@ -288,6 +288,14 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   unchanged; goldens unchanged. Honest deviation: t5 rides the ramp at ~86.0 vs the base ground ~85.0
   (per-run ramp lengths would be needed to match exactly). Report: `GateConnectorReport.md`. Supersedes
   the marking approach (`GateProjectionFixPlan.md` - dead: nothing to mark at the defect).
+- IMPLEMENTED (2026-10-09, V3.67): water-level navmesh handling - cull OR raise (user request). The
+  editor always reads `Scene.GetWaterLevel()` (dry maps set it below the terrain -> natural no-op;
+  `SafeWaterLevel` guards). Offset-aware (`NavMeshHeightOffsetMeters`): Mode A (cull ON) drops triangles
+  with lifted-min < level; Mode B (cull OFF, the default) clamps below-level vertices to the water
+  surface (V2 only; V1 cull wired). Harness `--cullwater` / `--raisewater` (default no-op; goldens
+  PASS); snapshot records `water:`. Test 29 covers min-corner/offset/raise-exact/off-inert; Test 1's
+  stale tile expectation fixed. Lattice note: the emitted surface lands within ~1 cell of the level
+  (a `level - offset + ch` knob would guarantee at/above). Report: `WaterCullReport.md`.
 - SUITE NOTE (2026-10-08, V3.65): the harness suite at the 10 m default passes 11/13 groups. Test 25
   (LADDER-CAP) fails identically on unmodified HEAD (pre-existing, unrelated). Test 11 (ASSET TEST) is NEW
   at 10 m: its synthetic gully/stairs scene grows a 74.6 deg fan poly face vs the 52 deg assert (24.7 deg

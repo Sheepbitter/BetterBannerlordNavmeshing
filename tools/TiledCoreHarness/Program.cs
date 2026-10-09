@@ -829,6 +829,8 @@ internal static class Program
         Console.WriteLine();
         Test28_CleanupDeterminism();
         Console.WriteLine();
+        Test29_WaterCull();
+        Console.WriteLine();
         SweepDoorway26();
     }
 
@@ -864,7 +866,7 @@ internal static class Program
             {
                 Console.WriteLine("usage: TiledCoreHarness --snapshot <prefix> [--pair \"x1,y1|x2,y2\"]... "
                     + "[--cs M] [--radius M] [--climb M] [--gapfill N] [--stitch N] [--prune N] "
-                    + "[--ledge on|off] [--detail on|off] [--slope D]");
+                    + "[--ledge on|off] [--detail on|off] [--slope D] [--cullwater M] [--raisewater M]");
                 return 2;
             }
 
@@ -1004,6 +1006,19 @@ internal static class Program
                         s.UseDetailMesh = ParseOnOff(v); i++; break;
                     case "--slope":
                         s.MaxSlopeDegrees = ParseFloat(v); i++; break;
+                    case "--cullwater":
+                        // Mode A mirror of NavMeshCullBelowWaterLevel: drop every soup triangle whose
+                        // LIFTED lowest corner (y + offset) is below this level. Off by default, so
+                        // without this flag the build is unchanged.
+                        s.CullBelowWaterLevel = true;
+                        s.RaiseBelowWaterLevel = false;
+                        s.WaterLevelMeters = ParseFloat(v); i++; break;
+                    case "--raisewater":
+                        // Mode B mirror of NavMeshCullBelowWaterLevel=false: clamp every soup vertex whose
+                        // LIFTED height (y + offset) is below this level up to exactly the level. v2 only.
+                        s.RaiseBelowWaterLevel = true;
+                        s.CullBelowWaterLevel = false;
+                        s.WaterLevelMeters = ParseFloat(v); i++; break;
                     case "--plate":
                         s.GatePlateBlend = ParseOnOff(v); i++; break;
                     case "--platetrace":
@@ -1218,6 +1233,8 @@ internal static class Program
                 + " ramps=" + propRamps
                 + " ledge=" + s.UseLedgeFilter + " detail=" + s.UseDetailMesh
                 + " cleanup=" + cleanupOn
+                + " water=" + (s.CullBelowWaterLevel ? "cull@" + s.WaterLevelMeters.ToString("0.###")
+                    : s.RaiseBelowWaterLevel ? "raise@" + s.WaterLevelMeters.ToString("0.###") : "off")
                 // The effective Budgets, echoed so every captured log is self-describing and a
                 // calibration run cannot be mistaken for the default configuration.
                 + " budgets=[" + TiledNavMeshBuilder.BuildCleanupBudgets(s) + "]");
@@ -1239,6 +1256,8 @@ internal static class Program
                 + " xzReflex=" + xzr.ReflexXZ
                 + " worstXzAngle=" + xzr.WorstAngle.ToString("F4", CultureInfo.InvariantCulture) + "deg"
                 + " invariants=" + (r.InvariantsPassed ? "PASS" : "FAIL") + " ms=" + watch.ElapsedMilliseconds);
+            if (s.CullBelowWaterLevel || s.RaiseBelowWaterLevel)
+                WaterShorelineReport(r, s.WaterLevelMeters, s.MaxSlopeDegrees);
             if (goldenHash)
             {
                 // --goldenhash: build once, print the three hashes in a copy-pasteable form, exit.
@@ -3745,8 +3764,13 @@ internal static class Program
         MakeGrid(160f, 160f, 0.5f, delegate (float x, float z) { return 0f; }, out verts, out tris);
         Console.WriteLine("  soup: verts=" + (verts.Length / 3) + " tris=" + (tris.Length / 3));
 
+        TiledNavMeshBuilder.TiledNavMeshSettings s1 = SettingsAuto(0.5f, 65f);
         TiledNavMeshBuilder.VoxelMeshResult res =
-            TiledNavMeshBuilder.Build(verts, tris, SettingsAuto(0.5f, 65f), Environment.ProcessorCount, Log);
+            TiledNavMeshBuilder.Build(verts, tris, s1, Environment.ProcessorCount, Log);
+        // Tile count is derived from the (now 10 m) tile setting, not hard-coded: a 160 m plane is
+        // ceil(160 / tileSpan) tiles a side. (Was tiles==100 when the tile default was 16 m.)
+        int tilesPerAxis = (int)Math.Ceiling(160.0 / s1.TileWorldSizeMeters);
+        int expectedTiles = tilesPerAxis * tilesPerAxis;
 
         double area = SumArea(res);
         double full = 160.0 * 160.0;
@@ -3759,7 +3783,8 @@ internal static class Program
         double cleanInset = 158.0 * 158.0;
         Console.WriteLine("  effective covered square = " + Math.Sqrt(area).ToString("F3") + " m per side"
             + " (158x158=" + cleanInset.ToString("F0") + ")");
-        Console.WriteLine("  RESULT: faces>0 " + (res.FaceCount > 0) + ", tiles==100 " + (res.TileCount == 100)
+        Console.WriteLine("  RESULT: faces>0 " + (res.FaceCount > 0) + ", tiles==" + expectedTiles + " "
+            + (res.TileCount == expectedTiles)
             + ", noDoubleCoverage " + (area <= full * 1.001)
             + ", noInternalGaps(<=1% of 158^2) " + (Math.Abs(area - cleanInset) <= cleanInset * 0.01));
     }
@@ -3892,6 +3917,51 @@ internal static class Program
             if (slope > max) max = slope;
         }
         return max;
+    }
+
+    // Mode A/B shoreline diagnostic. After a water build, classify faces by height relative to the
+    // level:
+    //   sheet      : every corner within +/-0.3 m of the level (the flat raised sheet, Mode B)
+    //   submerged  : every corner below level-0.3 (should be 0 in BOTH modes: cull drops them, raise
+    //                lifts them)
+    //   transition : touches the level band and rises above it (level+0.3) - the shoreline. Its max
+    //                slope is the "shoreline slope": in Mode B the raised sheet meets the rising
+    //                terrain here. If it exceeds the slope cap the transition is a hole, not a ramp.
+    private static void WaterShorelineReport(TiledNavMeshBuilder.VoxelMeshResult r, float level,
+        float slopeCapDeg)
+    {
+        const float band = 0.3f;
+        int sheet = 0, submerged = 0, transition = 0, transitionWalkable = 0;
+        double transitionMaxSlope = 0.0, allMaxSlope = 0.0;
+        float meshMinY = float.MaxValue, meshMaxY = float.MinValue;
+        for (int f = 0; f < r.FaceCount; f++)
+        {
+            int ia = r.Tris[f * 3 + 0], ib = r.Tris[f * 3 + 1], ic = r.Tris[f * 3 + 2];
+            float ay = r.VertsXyz[ia * 3 + 1], by = r.VertsXyz[ib * 3 + 1], cy = r.VertsXyz[ic * 3 + 1];
+            float lo = Math.Min(ay, Math.Min(by, cy));
+            float hi = Math.Max(ay, Math.Max(by, cy));
+            if (lo < meshMinY) meshMinY = lo;
+            if (hi > meshMaxY) meshMaxY = hi;
+            double[] n = TriNormal(r.VertsXyz, ia, ib, ic);
+            double slope = Math.Atan2(Math.Sqrt(n[0] * n[0] + n[2] * n[2]), Math.Abs(n[1])) * 180.0 / Math.PI;
+            if (slope > allMaxSlope) allMaxSlope = slope;
+            if (hi < level - band) submerged++;
+            if (lo >= level - band && hi <= level + band) sheet++;
+            if (lo < level + band && hi > level + band)
+            {
+                transition++;
+                if (slope <= slopeCapDeg) transitionWalkable++;
+                if (slope > transitionMaxSlope) transitionMaxSlope = slope;
+            }
+        }
+        Console.WriteLine("shoreline: level=" + level.ToString("F2", CultureInfo.InvariantCulture)
+            + "m sheetFaces=" + sheet + " submergedFaces=" + submerged + " transitionFaces=" + transition
+            + " transitionWalkable(<= " + slopeCapDeg.ToString("F0", CultureInfo.InvariantCulture) + "deg)="
+            + transitionWalkable + " transitionMaxSlope="
+            + transitionMaxSlope.ToString("F2", CultureInfo.InvariantCulture) + "deg"
+            + " meshY=[" + meshMinY.ToString("F2", CultureInfo.InvariantCulture) + ".."
+            + meshMaxY.ToString("F2", CultureInfo.InvariantCulture) + "]"
+            + " allFacesMaxSlope=" + allMaxSlope.ToString("F2", CultureInfo.InvariantCulture) + "deg");
     }
 
     private static int CountSlopeAbove(TiledNavMeshBuilder.VoxelMeshResult r, double deg)
@@ -9854,6 +9924,183 @@ private static double WorstQuadAngle(TiledNavMeshBuilder.VoxelMeshResult r)
         }
 
         Console.WriteLine("  RESULT: CLEANUP DETERMINISM " + (ok ? "PASS" : "FAIL"));
+    }
+
+    // ==================================================================== Test 29: water level
+    // The v2 core's water handling has two modes, both offset-aware (the comparison is on the LIFTED
+    // height soupY + HeightOffsetMeters, because that is where the emitted mesh actually sits):
+    //   Mode A (CullBelowWaterLevel): drop a triangle whose lifted lowest corner is below the level.
+    //   Mode B (RaiseBelowWaterLevel): clamp every vertex up to max(y, level - offset), so its lifted
+    //       height is exactly the level.
+    // This pins the min-corner rule, the offset accounting, the raise exactness, and the default no-op.
+    private static void Test29_WaterCull()
+    {
+        Console.WriteLine("== Test 29: water level - Mode A cull / Mode B raise, offset-aware ==");
+        const float level = 5f;
+        float[] verts;
+        int[] tris;
+
+        // ---- A: Mode A min-corner rule (offset 0) ------------------------------------------------
+        // Four 10x10 m triangles: below(1), above(10), mincorner(10,10,1), atlevel(5).
+        MakeWaterSoup(out verts, out tris);
+        TiledNavMeshBuilder.TiledNavMeshSettings on = WaterSettings();   // offset 0
+        on.CullBelowWaterLevel = true; on.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult rc =
+            TiledNavMeshBuilder.Build(verts, tris, on, Environment.ProcessorCount, null);
+        TiledNavMeshBuilder.TiledNavMeshSettings off = WaterSettings();
+        off.CullBelowWaterLevel = false; off.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult ro =
+            TiledNavMeshBuilder.Build(verts, tris, off, Environment.ProcessorCount, null);
+        // The level must be inert when both modes are off: a second off build with a different level
+        // hashes identically, i.e. the default path cannot be perturbed by a stray level.
+        TiledNavMeshBuilder.TiledNavMeshSettings offZero = WaterSettings();
+        offZero.CullBelowWaterLevel = false; offZero.WaterLevelMeters = 0f;
+        TiledNavMeshBuilder.VoxelMeshResult roZero =
+            TiledNavMeshBuilder.Build(verts, tris, offZero, Environment.ProcessorCount, null);
+        bool offInert = Hash(ro.VertsXyz) == Hash(roZero.VertsXyz)
+            && Hash(ro.Tris) == Hash(roZero.Tris) && ro.FaceCount == roZero.FaceCount;
+        float minKeptY = float.MaxValue;
+        for (int i = 0; i < rc.VertexCount; i++)
+            if (rc.VertsXyz[i * 3 + 1] < minKeptY) minKeptY = rc.VertsXyz[i * 3 + 1];
+        bool passA = rc.CulledByWater == 2 && ro.CulledByWater == 0 && rc.FaceCount > 0
+            && ro.FaceCount > rc.FaceCount && Hash(rc.VertsXyz) != Hash(ro.VertsXyz)
+            && minKeptY >= level - 1e-3f && offInert;
+        Console.WriteLine("  A min-corner (offset 0): culled=" + rc.CulledByWater + " keptFaces=" + rc.FaceCount
+            + " minKeptY=" + minKeptY.ToString("F3") + "m | default: culled=" + ro.CulledByWater
+            + " F=" + ro.FaceCount + " offInert=" + offInert + " -> " + (passA ? "PASS" : "FAIL"));
+
+        // ---- B: offset accounting (Mode A) -------------------------------------------------------
+        // Two triangles whose soup y sits 0.01 either side of (level - offset=0.5): 4.51 and 4.49.
+        // With offset 0.5 the lifted heights are 5.01 / 4.99 -> only the lower is culled.
+        // With offset 0   the lifted heights are 4.51 / 4.49 -> both are culled. That is the offset.
+        MakeFlatPair(level - 0.5f + 0.01f, level - 0.5f - 0.01f, out verts, out tris);
+        TiledNavMeshBuilder.TiledNavMeshSettings bo = WaterSettings();
+        bo.HeightOffsetMeters = 0.5f;
+        bo.CullBelowWaterLevel = true; bo.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult rbo =
+            TiledNavMeshBuilder.Build(verts, tris, bo, Environment.ProcessorCount, null);
+        MakeFlatPair(level - 0.5f + 0.01f, level - 0.5f - 0.01f, out verts, out tris);
+        TiledNavMeshBuilder.TiledNavMeshSettings bz = WaterSettings();   // offset 0
+        bz.CullBelowWaterLevel = true; bz.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult rbz =
+            TiledNavMeshBuilder.Build(verts, tris, bz, Environment.ProcessorCount, null);
+        bool passB = rbo.CulledByWater == 1 && rbz.CulledByWater == 2;
+        Console.WriteLine("  B offset accounting: offset0.5 culled=" + rbo.CulledByWater
+            + " (expect 1, the 4.99 one) | offset0 culled=" + rbz.CulledByWater
+            + " (expect 2) -> " + (passB ? "PASS" : "FAIL"));
+
+        // ---- C: Mode B raise ---------------------------------------------------------------------
+        // A low triangle (soup y=1) and a high one (y=10), offset 0.5, level 5 -> target 4.5.
+        MakeFlatPair(1f, 10f, out verts, out tris);
+        TiledNavMeshBuilder.TiledNavMeshSettings rs = WaterSettings();
+        rs.HeightOffsetMeters = 0.5f;
+        rs.RaiseBelowWaterLevel = true; rs.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult rr =
+            TiledNavMeshBuilder.Build(verts, tris, rs, Environment.ProcessorCount, null);
+        // Build clamps the soup in place: the low triangle's three verts are now exactly 4.5, the high
+        // triangle's stay 10. (max() semantics; counted once each.)
+        bool soupExact = true;
+        for (int i = 0; i < 3; i++)
+        {
+            if (verts[i * 3 + 1] != level - 0.5f) soupExact = false;
+            if (verts[(3 + i) * 3 + 1] != 10f) soupExact = false;
+        }
+        float raisedMinY = float.MaxValue, raisedMaxY = float.MinValue;
+        for (int i = 0; i < rr.VertexCount; i++)
+        {
+            float y = rr.VertsXyz[i * 3 + 1];
+            if (y < raisedMinY) raisedMinY = y;
+            if (y > raisedMaxY) raisedMaxY = y;
+        }
+        bool passC = rr.RaisedByWater == 3 && soupExact
+            && raisedMinY >= level - 1e-3f                                  // never under the surface
+            && raisedMinY <= level + rs.CellHeightMeters + 1e-3f            // at the level, within one voxel
+            && raisedMaxY >= 10f + 0.5f - 1e-3f
+            && raisedMaxY <= 10f + 0.5f + rs.CellHeightMeters + 1e-3f;      // above untouched
+        Console.WriteLine("  C raise (offset 0.5, target " + (level - 0.5f).ToString("F2")
+            + "m): raisedVerts=" + rr.RaisedByWater + " soupExact=" + soupExact
+            + " emittedY=[" + raisedMinY.ToString("F3") + ".." + raisedMaxY.ToString("F3") + "]m"
+            + " (level+ch=" + (level + rs.CellHeightMeters).ToString("F3") + ")"
+            + " -> " + (passC ? "PASS" : "FAIL"));
+
+        // ---- D: min-corner + exact level (offset 0) ----------------------------------------------
+        MakeOneTri(out verts, out tris, 0f, 0f, 10f, 10f, 1f);
+        TiledNavMeshBuilder.TiledNavMeshSettings d = WaterSettings();
+        d.CullBelowWaterLevel = true; d.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult rd =
+            TiledNavMeshBuilder.Build(verts, tris, d, Environment.ProcessorCount, null);
+        MakeOneTri(out verts, out tris, 0f, 0f, level, level, level);
+        TiledNavMeshBuilder.TiledNavMeshSettings e = WaterSettings();
+        e.CullBelowWaterLevel = true; e.WaterLevelMeters = level;
+        TiledNavMeshBuilder.VoxelMeshResult re =
+            TiledNavMeshBuilder.Build(verts, tris, e, Environment.ProcessorCount, null);
+        bool passD = rd.CulledByWater == 1 && re.CulledByWater == 0 && re.FaceCount > 0;
+        Console.WriteLine("  D min-corner culled=" + rd.CulledByWater + " (expect 1); exact-level culled="
+            + re.CulledByWater + " F=" + re.FaceCount + " (expect 0, F>0) -> " + (passD ? "PASS" : "FAIL"));
+
+        Console.WriteLine("  RESULT: WATER " + ((passA && passB && passC && passD) ? "PASS" : "FAIL"));
+    }
+
+    // A settings object with no detail/prune/region interference, so the cull count is the only variable.
+    private static TiledNavMeshBuilder.TiledNavMeshSettings WaterSettings()
+    {
+        var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
+        s.VoxelCellSizeMeters = 0.25f;
+        s.AgentRadiusMeters = 0.25f;
+        s.MaxSlopeDegrees = 60f;
+        s.UseDetailMesh = false;
+        s.PruneIsolatedIslands = false;
+        s.RegionMinSize = 1;
+        s.RegionMergeSize = 1;
+        s.HeightOffsetMeters = 0f;   // exact height assertions: no lift
+        s.AgentMaxClimbMeters = TiledNavMeshBuilder.ResolveAgentClimbMeters(0.25f, s.CellHeightMeters, 60f, 0.4f);
+        return s;
+    }
+
+    // Four 10x10 m triangles at x = 0 / 12 / 24 / 36 (z 0..10): below(1), above(10), mincorner(10,10,1),
+    // atlevel(5). Wound (p00, p11, p10) = upward normal.
+    private static void MakeWaterSoup(out float[] verts, out int[] tris)
+    {
+        var v = new List<float>();
+        var t = new List<int>();
+        AddTri(v, t, 0f, 0f, 1f, 10f, 10f, 1f, 10f, 0f, 1f);        // below:  all 1
+        AddTri(v, t, 12f, 0f, 10f, 22f, 10f, 10f, 22f, 0f, 10f);     // above:  all 10
+        AddTri(v, t, 24f, 0f, 10f, 34f, 10f, 10f, 34f, 0f, 1f);      // mincorner: 10,10,1
+        AddTri(v, t, 36f, 0f, 5f, 46f, 10f, 5f, 46f, 0f, 5f);        // atlevel: all 5
+        verts = v.ToArray();
+        tris = t.ToArray();
+    }
+
+    private static void MakeOneTri(out float[] verts, out int[] tris,
+        float x0, float z0, float y00, float y11, float y10)
+    {
+        var v = new List<float>();
+        var t = new List<int>();
+        AddTri(v, t, x0, z0, y00, x0 + 10f, z0 + 10f, y11, x0 + 10f, z0, y10);
+        verts = v.ToArray();
+        tris = t.ToArray();
+    }
+
+    // Two flat 10x10 m triangles at x=0 (yA) and x=12 (yB), for the offset / raise probes.
+    private static void MakeFlatPair(float yA, float yB, out float[] verts, out int[] tris)
+    {
+        var v = new List<float>();
+        var t = new List<int>();
+        AddTri(v, t, 0f, 0f, yA, 10f, 10f, yA, 10f, 0f, yA);
+        AddTri(v, t, 12f, 0f, yB, 22f, 10f, yB, 22f, 0f, yB);
+        verts = v.ToArray();
+        tris = t.ToArray();
+    }
+
+    // Appends one triangle with the (p00, p11, p10) winding (upward Recast normal).
+    private static void AddTri(List<float> v, List<int> t,
+        float x0, float z0, float y0, float x1, float z1, float y1, float x2, float z2, float y2)
+    {
+        int b = v.Count / 3;
+        v.Add(x0); v.Add(y0); v.Add(z0);
+        v.Add(x1); v.Add(y1); v.Add(z1);
+        v.Add(x2); v.Add(y2); v.Add(z2);
+        t.Add(b); t.Add(b + 1); t.Add(b + 2);
     }
 
     private static int[] FieldValues(NavMeshCleanup.Stats s)

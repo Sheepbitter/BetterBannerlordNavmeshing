@@ -1,6 +1,6 @@
 # TiledCoreHarness — standalone acceptance suite for the navmesh core
 
-`Program.cs` is the project's acceptance matrix: 27 tests (plus a final doorway sweep) that exercise
+`Program.cs` is the project's acceptance matrix: 29 tests (plus a final doorway sweep) that exercise
 `TiledNavMeshBuilder`, `SteppedPropRamps`, `NavMeshCleanup`, `Nmg8Writer` and `SceneSnapshot`
 **with zero TaleWorlds references**. That isolation is the design proof — the voxel/recast core is
 plain C# that builds and runs outside the game.
@@ -23,7 +23,7 @@ C# 7.3). The harness has no TaleWorlds dependency, so no `-p:GameDir=` is needed
 Run from the exe's directory (or anywhere — the modes that read snapshot files use relative paths
 against the current directory).
 
-**Full suite** — no arguments. Runs Test 1..27 then the final doorway sweep. ~45 s on a 12-core box,
+**Full suite** — no arguments. Runs Test 1..29 then the final doorway sweep. ~45 s on a 12-core box,
 exit code 0; redirect the output to a file, the suite is verbose (the reference log is ~125 KB).
 
 ```
@@ -32,7 +32,7 @@ TiledCoreHarness.exe > suite.txt
 
 | Mode | What it does |
 | --- | --- |
-| *(no args)* | Full 27-test acceptance suite + doorway sweep |
+| *(no args)* | Full 29-test acceptance suite + doorway sweep |
 | `--quadtest` | Test 27 only (quad merge + NMG8 writer round trip). Seconds; good smoke test |
 | `--barriers` | Barrier honour-mask rule check (`BarrierBlocksAgents` over the four engine masks) |
 | `--barriercase` | The CC_20_siege barrier regression case: builds the snapshot twice, barriers off vs on, and compares the mesh at the user's crossing |
@@ -50,10 +50,17 @@ expanded to `P_snapshot_terrain.bin` / `P_snapshot_assets.bin` / `P_snapshot.txt
 `CC_20_siege_navmesh_snapshot_terrain.bin` is loaded with `--snapshot CC_20_siege_navmesh`.
 
 Setting overrides (`--cs`, `--radius`, `--climb`, `--slope`, `--gapfill`, `--stitch`, `--prune`,
-`--ledge`, `--detail`, `--plate`, `--ramps`, `--gate`, `--cleanup`, `--steepguard`, `--steepmargin`) plus the inspection
+`--ledge`, `--detail`, `--plate`, `--ramps`, `--gate`, `--cleanup`, `--steepguard`, `--steepmargin`,
+`--cullwater`, `--raisewater`) plus the inspection
 switches (`--probe`, `--vmesh`, `--vprobe`, `--pinch`, `--flood`, `--walk`, `--soup`, `--scan`,
 `--census`, `--defect`, `--ladders`, `--props`, `--routing`, `--quality`, `--quiet`, `--xzprobe`,
 `--connect`). Run it with a bad prefix to get the one-line usage summary.
+
+**Water level** (`--cullwater M` = Mode A cull, `--raisewater M` = Mode B raise): both compare the
+**lifted** height (`soupY + HeightOffsetMeters`). A build with either flag also prints a `shoreline:`
+line classifying faces by height around the level (`sheetFaces`, `submergedFaces`, `transitionFaces`,
+`transitionMaxSlope`) so the deep/shallow boundary can be judged. No flag = no water handling
+(byte-identical, the goldens).
 
 ## Known documented failure
 

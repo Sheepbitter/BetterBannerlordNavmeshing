@@ -338,6 +338,27 @@ namespace BetterBannerlordNavmeshing
             // Uniform lift applied to emitted vertices only (m).
             public float HeightOffsetMeters = 0.5f;
 
+            // WATER LEVEL (NavMeshCullBelowWaterLevel). The scene always has a water level, so this is
+            // never "no water": the mode below decides what happens to soup below the level. The
+            // comparison is on the LIFTED height (soupY + HeightOffsetMeters), because that is where the
+            // emitted mesh actually sits; HeightOffsetMeters is applied after rasterisation, so the
+            // pre-rasterisation soup must be compared with the offset added.
+            //
+            //   CullBelowWaterLevel = true  -> Mode A (CULL): drop a triangle when its LOWEST corner's
+            //       lifted height is below the level (triMinY + offset < level). Min-corner rule,
+            //       matching the v1 mesher: a triangle that only dips below at one corner goes whole.
+            //   RaiseBelowWaterLevel = true -> Mode B (RAISE, v2 only): clamp every vertex up to
+            //       max(y, level - offset), so its lifted height is exactly the level. The emitted mesh
+            //       therefore never sits under the surface. `max` is idempotent, so applying it per
+            //       triangle during binning is safe.
+            //
+            // Both false = no water handling (the default; the harness no-flag path is byte-identical).
+            // A level well below the terrain makes either mode a natural no-op. If both are set, Mode A
+            // wins (the raise block is skipped).
+            public bool CullBelowWaterLevel = false;
+            public bool RaiseBelowWaterLevel = false;
+            public float WaterLevelMeters = 0f;
+
             // STEEP-FACE REPAIR (slope margin above MaxSlopeDegrees). Slope alone is not the discriminator
             // (see RepairSteepFaces); this is the margin and SteepFaceMinHeightMeters supplies the height
             // test.   < 0 = use SteepFaceMarginDegreesDefault.   10 = default (60 deg at the shipped 50).
@@ -495,6 +516,11 @@ namespace BetterBannerlordNavmeshing
 
             public int InputTriangles;
             public int CulledByAabb;
+            // Triangles dropped by the optional water-level cull (CullBelowWaterLevel), before binning.
+            public int CulledByWater;
+            // Vertices clamped up to the water level by the raise mode (RaiseBelowWaterLevel), before
+            // binning. Counted once per vertex (a shared vertex reached from several triangles counts once).
+            public int RaisedByWater;
             public int RasterizedTriangles;
             public int SteppedMarkedCells;     // cells covered by forced (ramp) triangles, all tiles
             public int SteppedRestoredSpans;   // ramp spans restored after the ledge trim, all tiles
@@ -805,6 +831,21 @@ namespace BetterBannerlordNavmeshing
             return b;
         }
 
+        // Mode B helper: clamp one vertex up so its LIFTED height (y + HeightOffsetMeters) is at least
+        // the water level. `raiseY` is the pre-lift target (level - offset); `seen` makes the count exact
+        // when a shared vertex is reached from several triangles. max() semantics: idempotent.
+        private static int RaiseWaterVertex(float[] vertsXyz, int vi, float raiseY, bool[] seen)
+        {
+            if (seen[vi]) return 0;
+            seen[vi] = true;
+            if (vertsXyz[vi * 3 + 1] < raiseY)
+            {
+                vertsXyz[vi * 3 + 1] = raiseY;
+                return 1;
+            }
+            return 0;
+        }
+
         public static VoxelMeshResult Build(float[] vertsXyz, int[] tris, TiledNavMeshSettings s,
             int maxWorkers, Action<string> log, bool[] forceWalkableTriangles = null,
             bool[] ledgeExemptTriangles = null, BorderPolygon borderPoly = null,
@@ -853,6 +894,14 @@ namespace BetterBannerlordNavmeshing
                 if (x > maxX) maxX = x;
                 if (y > maxY) maxY = y;
                 if (z > maxZ) maxZ = z;
+            }
+
+            // Mode B (raise) only ever increases Y, so if the whole soup sits below the level the raised
+            // height can exceed the input maxY. Extend the bound so the heightfield is not clipped.
+            if (s.RaiseBelowWaterLevel)
+            {
+                float raiseTargetY = s.WaterLevelMeters - s.HeightOffsetMeters;
+                if (raiseTargetY > maxY) maxY = raiseTargetY;
             }
 
             // BORDER CLAMP (V3.59), part 1 of 3: bound the region we even consider to the playable
@@ -1012,6 +1061,13 @@ namespace BetterBannerlordNavmeshing
             var tileTris = new List<int>[tileCount];
             int culledByAabb = 0;
             int culledByBorder = 0;
+            int culledByWater = 0;
+            float waterCulledMinCorner = float.MaxValue;   // lowest corner over all water-culled tris
+            float waterCulledMaxCorner = float.MinValue;   // highest corner over all water-culled tris
+            int raisedByWater = 0;
+            float waterRaiseY = s.WaterLevelMeters - s.HeightOffsetMeters;   // pre-lift target for Mode B
+            bool[] waterRaisedMask = s.RaiseBelowWaterLevel && !s.CullBelowWaterLevel
+                ? new bool[vertsXyz.Length / 3] : null;
             int rasterizedTris = 0;
             for (int t = 0; t < inputTris; t++)
             {
@@ -1022,6 +1078,37 @@ namespace BetterBannerlordNavmeshing
                 float triMaxX = Math.Max(tx0, Math.Max(tx1, tx2));
                 float triMinZ = Math.Min(tz0, Math.Min(tz1, tz2));
                 float triMaxZ = Math.Max(tz0, Math.Max(tz1, tz2));
+
+                // WATER-LEVEL CULL (Mode A, CullBelowWaterLevel). The comparison is on the LIFTED height
+                // (soupY + HeightOffsetMeters) - the height the emitted mesh actually sits at - so ground
+                // shallow enough to wade (at/above the level after the offset) is NOT culled. The soup is
+                // still un-lifted here (the lift is applied after rasterisation), so the offset is added
+                // explicitly. Min-corner rule, matching the v1 mesher: a triangle that dips below at any
+                // corner goes whole. Strict `<`, so a corner exactly on the level is kept.
+                if (s.CullBelowWaterLevel)
+                {
+                    float triMinY = Math.Min(vertsXyz[i0 * 3 + 1], Math.Min(vertsXyz[i1 * 3 + 1],
+                        vertsXyz[i2 * 3 + 1]));
+                    if (triMinY + s.HeightOffsetMeters < s.WaterLevelMeters)
+                    {
+                        culledByWater++;
+                        float triMaxY = Math.Max(vertsXyz[i0 * 3 + 1], Math.Max(vertsXyz[i1 * 3 + 1],
+                            vertsXyz[i2 * 3 + 1]));
+                        if (triMinY < waterCulledMinCorner) waterCulledMinCorner = triMinY;
+                        if (triMaxY > waterCulledMaxCorner) waterCulledMaxCorner = triMaxY;
+                        continue;
+                    }
+                }
+                // WATER-LEVEL RAISE (Mode B, RaiseBelowWaterLevel). Every vertex whose LIFTED height is
+                // below the level is clamped up to max(y, level - offset), i.e. exactly the level once the
+                // post-rasterisation lift is added. `max` is idempotent, so a shared vertex reached from
+                // several triangles is clamped once and the count stays exact (the mask marks it).
+                else if (s.RaiseBelowWaterLevel)
+                {
+                    raisedByWater += RaiseWaterVertex(vertsXyz, i0, waterRaiseY, waterRaisedMask);
+                    raisedByWater += RaiseWaterVertex(vertsXyz, i1, waterRaiseY, waterRaisedMask);
+                    raisedByWater += RaiseWaterVertex(vertsXyz, i2, waterRaiseY, waterRaisedMask);
+                }
 
                 // BORDER CLAMP, part 2: a triangle whose AABB misses the border's AABB entirely can never
                 // contribute an in-borders cell, so it is dropped before it is binned or rasterised. This
@@ -1071,6 +1158,18 @@ namespace BetterBannerlordNavmeshing
             Log(log, "v2: tris input=" + inputTris + " culledByAabb=" + culledByAabb
                 + (borderPoly != null ? " (of which outside the borderPoly AABB=" + culledByBorder + ")" : "")
                 + " rasterized=" + rasterizedTris + " (rasterized counts per-tile border duplicates)");
+            if (s.CullBelowWaterLevel)
+                Log(log, "v2: water cull: level=" + F(s.WaterLevelMeters) + "m offset=" + F(s.HeightOffsetMeters)
+                    + "m (lifted) minCornerY+offset<level culled="
+                    + culledByWater + "/" + inputTris + " tris (removed corner heights ["
+                    + F(culledByWater > 0 ? waterCulledMinCorner : 0f) + ".."
+                    + F(culledByWater > 0 ? waterCulledMaxCorner : 0f)
+                    + "]m; true heights, the +" + F(s.HeightOffsetMeters)
+                    + "m lift is applied after rasterisation)");
+            else if (s.RaiseBelowWaterLevel)
+                Log(log, "v2: water raise: level=" + F(s.WaterLevelMeters) + "m offset=" + F(s.HeightOffsetMeters)
+                    + "m target=" + F(waterRaiseY) + "m (pre-lift) raised=" + raisedByWater + "/"
+                    + (vertsXyz.Length / 3) + " verts whose lifted y<level were clamped to the level");
             if (forceWalkableTriangles != null || ledgeExemptTriangles != null)
             {
                 int forced = 0;
@@ -1633,6 +1732,8 @@ namespace BetterBannerlordNavmeshing
             result.Workers = workers;
             result.InputTriangles = inputTris;
             result.CulledByAabb = culledByAabb;
+            result.CulledByWater = culledByWater;
+            result.RaisedByWater = raisedByWater;
             result.CulledByBorderTris = culledByBorder;
             result.RasterizedTriangles = rasterizedTris;
             result.SoupAreaM2BeforeClamp = (double)(maxX - minX) * (maxZ - minZ);

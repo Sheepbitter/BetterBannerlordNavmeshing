@@ -37,6 +37,13 @@ namespace BetterBannerlordNavmeshing
         public float NavMeshMaxSlopeDegrees = 50f;
         public bool NavMeshCullBelowHeight = false;
         public float NavMeshMinHeight = 0f;
+        // Water-level mode (always active; scenes always have a water level, dry maps set it well below
+        // the terrain so this is a natural no-op). ON = CULL: drop every soup triangle whose lifted
+        // lowest corner is below the level. OFF = RAISE (v2 only): clamp every soup vertex whose lifted
+        // height is below the level up to exactly the level, so the mesh never sits under the surface.
+        // The comparison is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher
+        // supports the cull only; a v1 raise is a documented no-op.
+        public bool NavMeshCullBelowWaterLevel = false;
         public float NavMeshHeightOffsetMeters = 0.5f;
         public string NavMeshPrefabName = "";
         public string NavMeshExportFolder = "";
@@ -733,6 +740,10 @@ namespace BetterBannerlordNavmeshing
                 string assetsPath = System.IO.Path.Combine(folder, prefabName + "_snapshot_assets.bin");
                 SceneSnapshot.WriteAssetsBin(assetsPath, records);
 
+                // The scene's water level, recorded in the header for the record (and so a later
+                // offline --cullwater / --raisewater A/B can reuse it). Never throws.
+                float snapshotWater = SafeWaterLevel(scene, log);
+
                 // Assert points: the two probe spots reported from Birtu, plus anything the user adds.
                 var points = new System.Collections.Generic.List<string>();
                 points.Add("329.336,285.954");
@@ -772,6 +783,8 @@ namespace BetterBannerlordNavmeshing
                 sb.AppendLine("grid: " + grid.Width + "x" + grid.Height + " spacing=" + F(grid.Spacing)
                     + "m stride=" + NavMeshSampleStride + " fallback=" + grid.UsedPointFallback
                     + " heights=" + grid.Heights.Length);
+                sb.AppendLine("water: " + (float.IsNegativeInfinity(snapshotWater)
+                    ? "unavailable" : F(snapshotWater) + "m (scene.GetWaterLevel)"));
                 sb.AppendLine("border: source=" + TiledNavMeshBuilder.BorderPolygon.SourceName(
                         snapBorder != null ? snapBorder.Source : TiledNavMeshBuilder.BorderPolygon.SourceNone)
                     + " vertices=" + (snapBorder != null ? snapBorder.VertexCount : 0)
@@ -860,7 +873,7 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
                 NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelGateConnectors, NavMeshVoxelQuadMerge,
-                NavMeshVoxelBarriers, NavMeshConsoleMessages);
+                NavMeshVoxelBarriers, NavMeshCullBelowWaterLevel, NavMeshConsoleMessages);
         }
 
         // BORDER POLYGON READ (V3.59). Runs on the MAIN THREAD and is shared by the editor button, the async
@@ -983,7 +996,7 @@ namespace BetterBannerlordNavmeshing
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
                 clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
                 true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, false, true,
-                true, true);
+                true, false, true);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline, and
@@ -1021,6 +1034,7 @@ namespace BetterBannerlordNavmeshing
             bool voxelGateConnectors,
             bool voxelQuadMerge,
             bool voxelBarriers,
+            bool cullBelowWaterLevel,
             bool consoleMessages)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
@@ -1051,12 +1065,45 @@ namespace BetterBannerlordNavmeshing
                     + " machine=" + Environment.MachineName
                     + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
                     + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
+
+                // Water handling is always active: the NavMeshCullBelowWaterLevel toggle picks the MODE
+                // (ON = cull below the level, OFF = raise the navmesh up to it), so there is never navmesh
+                // under the surface either way. Scenes always have a water level (dry maps set it well
+                // below the terrain), so this is a natural no-op on dry maps - no has-water detection.
+                // Read on the MAIN THREAD (the only scene access it needs).
+                float waterLevel = 0f;
+                string waterMode = "off";
+                bool waterCull = cullBelowWaterLevel;
+                float waterReading = SafeWaterLevel(scene, log);
+                if (!float.IsNegativeInfinity(waterReading))
+                {
+                    waterLevel = waterReading;
+                    if (waterCull)
+                    {
+                        waterMode = "cull";
+                        settings.CullBelowHeight = true;   // v1 mechanism: true-height min-corner cull
+                        settings.MinHeight = waterLevel;
+                        log("water: mode=cull (v1 cullBelowHeight=true minHeight=" + F(waterLevel) + "m)");
+                    }
+                    else
+                    {
+                        waterMode = "raise";
+                        // Mode B is v2-only: the v1 mesher has no clamp, so a v1 run is left unchanged.
+                        log("water: mode=raise level=" + F(waterLevel) + "m (v2 only; the v1 mesher has no raise)");
+                    }
+                }
+                else
+                {
+                    waterCull = false;   // the read failed; the feature is disabled for this run
+                }
+
                 log("settings: stride=" + settings.SampleStride
                     + " maxSlope=" + F(settings.MaxSlopeDegrees) + "deg"
                     + " maxError=" + F(settings.MaxErrorMeters) + "m"
                     + " coarsest=" + F(settings.CoarsestSpacingMeters) + "m"
                     + " cullBelowHeight=" + settings.CullBelowHeight
                     + " minHeight=" + F(settings.MinHeight)
+                    + " water=" + waterMode
                     + " heightOffset=" + F(settings.HeightOffsetMeters) + "m"
                     + " prefabName='" + (prefabNameOverride ?? "") + "'"
                     + " exportFolder='" + (folderOverride ?? "") + "'"
@@ -1128,6 +1175,9 @@ namespace BetterBannerlordNavmeshing
                     voxel.PruneIsolatedIslands = voxelPruneIsolatedIslands;
                     voxel.PruneMaxIslandFaces = voxelPruneMaxIslandFaces;
                     voxel.QuadMerge = voxelQuadMerge;
+                    voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
+                    voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
+                    voxel.WaterLevelMeters = waterLevel;
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
@@ -1284,12 +1334,31 @@ namespace BetterBannerlordNavmeshing
                     + " machine=" + Environment.MachineName
                     + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
                     + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
+
+                // Water handling is always active; the toggle picks cull (on) vs raise (off). Read on the
+                // MAIN THREAD before the build is handed to the background worker (the worker never
+                // touches the scene). Carried to the voxel settings.
+                float waterLevel = 0f;
+                string waterMode = "off";
+                bool waterCull = NavMeshCullBelowWaterLevel;
+                float waterReading = SafeWaterLevel(scene, log);
+                if (!float.IsNegativeInfinity(waterReading))
+                {
+                    waterLevel = waterReading;
+                    waterMode = waterCull ? "cull" : "raise";
+                }
+                else
+                {
+                    waterCull = false;
+                }
+
                 log("settings: stride=" + settings.SampleStride
                     + " maxSlope=" + F(settings.MaxSlopeDegrees) + "deg"
                     + " maxError=" + F(settings.MaxErrorMeters) + "m"
                     + " coarsest=" + F(settings.CoarsestSpacingMeters) + "m"
                     + " cullBelowHeight=" + settings.CullBelowHeight
                     + " minHeight=" + F(settings.MinHeight)
+                    + " water=" + waterMode
                     + " heightOffset=" + F(settings.HeightOffsetMeters) + "m"
                     + " prefabName='" + (NavMeshPrefabName ?? "") + "'"
                     + " exportFolder='" + (NavMeshExportFolder ?? "") + "'"
@@ -1390,6 +1459,9 @@ namespace BetterBannerlordNavmeshing
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
                 voxel.QuadMerge = NavMeshVoxelQuadMerge;
                 voxel.GatePlateBlend = NavMeshVoxelGatePlateBlend;
+                voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
+                voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
+                voxel.WaterLevelMeters = waterLevel;
                 voxel.Barriers = NavMeshVoxelBarriers ? assetBarriers : null;
 
                 var req = new AsyncVoxelBuild();
@@ -1642,6 +1714,28 @@ namespace BetterBannerlordNavmeshing
             catch (Exception)
             {
                 return -1;
+            }
+        }
+
+        // The scene's water level: the value the renderer/gameplay use (SpawnPathData's
+        // SnapToWaterLevel, MissionScreen.UpdateCamera). Wrapped like the other scene reads, because the
+        // editor can be an unusual context and a scene that cannot answer must not fail the export: it
+        // logs and returns -infinity, which disables the water handling for this run.
+        private static float SafeWaterLevel(Scene scene, System.Action<string> log)
+        {
+            try
+            {
+                float level = scene.GetWaterLevel();
+                if (log != null)
+                    log("water: level=" + F(level) + "m (scene.GetWaterLevel)");
+                return level;
+            }
+            catch (Exception ex)
+            {
+                if (log != null)
+                    log("water: scene.GetWaterLevel failed (" + Flat(ex.GetType().Name) + ": "
+                        + Flat(ex.Message) + "); water cull disabled this run");
+                return float.NegativeInfinity;
             }
         }
 

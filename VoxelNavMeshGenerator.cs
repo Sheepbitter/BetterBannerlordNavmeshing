@@ -153,7 +153,10 @@ namespace BetterBannerlordNavmeshing
             result.FaceCount = vres.FaceCount;
             result.EdgeCount = vres.EdgeCount;
             result.CulledBySlope = 0;
-            result.CulledByHeight = 0;
+            // The v2 core has no slope cull of its own (Recast rejects non-walkable slopes during
+            // rasterisation); the only pre-rasterisation height cull is the optional water-level one,
+            // reported here so the shared "culled: N slope, M height" summary line carries it.
+            result.CulledByHeight = vres.CulledByWater;
 
             if (vres.VertexCount == 0 || vres.FaceCount == 0)
             {
