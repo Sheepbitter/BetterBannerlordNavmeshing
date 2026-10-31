@@ -7,6 +7,49 @@ using TaleWorlds.MountAndBlade;
 
 namespace BetterBannerlordNavmeshing
 {
+    // The shipped defaults for the pipeline, in ONE place. The exporter fields below, the
+    // 9-argument RunPipeline convenience overload (the in-game mission path) and any other
+    // caller must all start from these values. Before this class existed the overload carried
+    // stale literals (v1 core, contour 1.3, stitch 4, gate connectors off), so the in-game
+    // hotkey silently built a different mesh from the editor button.
+    internal static class NavMeshPipelineDefaults
+    {
+        // v1/v2 shared TerrainNavMeshBuilder.Settings
+        public const int SampleStride = 2;
+        public const float MaxErrorMeters = 0.25f;
+        public const float CoarsestSpacingMeters = 10f;
+        public const float MaxSlopeDegrees = 50f;
+        public const float HeightOffsetMeters = 0.5f;
+
+        // v2 tiled voxel core
+        public const bool UseVoxelCore = true;
+        public const float VoxelCellSizeMeters = 0.25f;
+        public const float VoxelAgentClimbMeters = 0f;
+        public const float VoxelAgentRadiusMeters = 0.25f;
+        public const bool VoxelLedgeFilter = true;
+        public const int VoxelGapFillCells = 2;
+        public const int VoxelStitchMaxGapCells = 6;
+        public const bool VoxelPruneIsolatedIslands = true;
+        public const int VoxelPruneMaxIslandFaces = 400;
+        public const bool VoxelCleanup = true;
+        public const bool VoxelQuadMerge = true;
+        public const bool VoxelGatePlateBlend = true;
+        public const bool VoxelBarriers = true;
+        public const bool VoxelDetailMesh = true;
+        public const float VoxelDetailSampleDistMeters = 2f;
+        public const float VoxelContourMaxErrorVoxels = 2f;
+        public const bool VoxelIncludeAssets = true;
+        public const bool VoxelIncludeDynamic = true;
+        public const bool VoxelIncludeFlora = false;
+        public const bool VoxelAssetTrace = false;
+        public const bool VoxelSteppedProps = true;
+        public const bool VoxelGateConnectors = true;
+        public const bool VoxelWriteSoupObj = false;
+        public const bool VoxelTerrainHoleAudit = false;
+        public const bool CullBelowWaterLevel = false;
+        public const bool ConsoleMessages = true;
+    }
+
     // Editor entry point (primary). Attach to any entity in a scene that has
     // terrain; the "Export NavMesh" button reads the scene's live in-memory
     // terrain, builds a navmesh prefab and imports its faces into the scene.
@@ -31,10 +74,10 @@ namespace BetterBannerlordNavmeshing
         // triangles) plus a human-readable header, so the standalone harness can rebuild the exact soup
         // for this scene without the editor. See SceneSnapshot / README.
         public SimpleButton DumpSceneSnapshot;
-        public int NavMeshSampleStride = 2;
-        public float NavMeshMaxErrorMeters = 0.25f;
-        public float NavMeshCoarsestSpacing = 10f;
-        public float NavMeshMaxSlopeDegrees = 50f;
+        public int NavMeshSampleStride = NavMeshPipelineDefaults.SampleStride;
+        public float NavMeshMaxErrorMeters = NavMeshPipelineDefaults.MaxErrorMeters;
+        public float NavMeshCoarsestSpacing = NavMeshPipelineDefaults.CoarsestSpacingMeters;
+        public float NavMeshMaxSlopeDegrees = NavMeshPipelineDefaults.MaxSlopeDegrees;
         public bool NavMeshCullBelowHeight = false;
         public float NavMeshMinHeight = 0f;
         // Water-level mode (always active; scenes always have a water level, dry maps set it well below
@@ -45,8 +88,8 @@ namespace BetterBannerlordNavmeshing
         // and obstacle geometry is NEVER culled or clamped, so walls keep standing and keep blocking. The
         // comparison is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher supports
         // the cull only; a v1 raise is a documented no-op.
-        public bool NavMeshCullBelowWaterLevel = false;
-        public float NavMeshHeightOffsetMeters = 0.5f;
+        public bool NavMeshCullBelowWaterLevel = NavMeshPipelineDefaults.CullBelowWaterLevel;
+        public float NavMeshHeightOffsetMeters = NavMeshPipelineDefaults.HeightOffsetMeters;
         public string NavMeshPrefabName = "";
         public string NavMeshExportFolder = "";
         public bool NavMeshClearExistingFaces = true;
@@ -56,53 +99,53 @@ namespace BetterBannerlordNavmeshing
         // Voxel core (navmesh v2, the default since 2026-09-29). The Export button runs the tiled
         // voxel pipeline (TiledNavMeshBuilder) instead of the v1 adaptive terrain mesher.
         // Terrain-only for now; set false to use the v1 mesher.
-        public bool NavMeshUseVoxelCore = true;
+        public bool NavMeshUseVoxelCore = NavMeshPipelineDefaults.UseVoxelCore;
         // Voxel cell size (m). Default 0.25 m since 2026-09-29: the connectivity lab shows 1.0-1.2 m
         // doorways, walkways and stair treads systematically vanish at 0.5 m (erosion + quantization
         // leave 0 cells regardless of the radius setting). 0.25 costs ~4x build time and ~2-4x faces;
         // raise it to 0.5 for fast iteration on open terrain.
-        public float NavMeshVoxelCellSize = 0.25f;
+        public float NavMeshVoxelCellSize = NavMeshPipelineDefaults.VoxelCellSizeMeters;
 
         // Agent max climb (m) for the v2 voxel core. 0 = auto-derive so that
         // NavMeshMaxSlopeDegrees is actually traversable (Recast's ledge filter
         // needs walkableClimb >= 2*cs*tan(slope)/ch). See the README.
-        public float NavMeshVoxelAgentClimbMeters = 0f;
+        public float NavMeshVoxelAgentClimbMeters = NavMeshPipelineDefaults.VoxelAgentClimbMeters;
 
         // Agent radius (m) for the v2 voxel core. Erosion = ceil(radius/cellSize) cells each side and
         // the tile border is 3 + ceil(radius/cellSize). Default 0.25 m: at cellSize 0.5 this is still
         // erosion 1, but at cellSize 0.25 it stays 1 instead of 2, which is what keeps 1.0-1.2 m
         // doorways / walkways / stair treads connected. See the connectivity lab in the README.
-        public float NavMeshVoxelAgentRadius = 0.25f;
+        public float NavMeshVoxelAgentRadius = NavMeshPipelineDefaults.VoxelAgentRadiusMeters;
 
         // Recast ledge filter (default true = Recast behaviour). It trims spans within walkableClimb of
         // a drop, which keeps the mesh off real cliff edges but also eats the border cells of narrow
         // walkways/bridges that have drops on both sides. Turn off if narrow structures keep losing
         // their edges (or if a level is connected on one side but not the other).
-        public bool NavMeshVoxelLedgeFilter = true;
+        public bool NavMeshVoxelLedgeFilter = NavMeshPipelineDefaults.VoxelLedgeFilter;
 
         // Gap fill (cells, default 2, 0 = off). Before erosion, fills a column with no walkable span
         // when walkable spans flank it on opposite sides along one axis with an empty run of at most
         // this many cells and a floor difference within the agent climb. Closes abutting-prefab /
         // paved-terrace seams (a hairline collision gap that erosion would widen into a break).
-        public int NavMeshVoxelGapFillCells = 2;
+        public int NavMeshVoxelGapFillCells = NavMeshPipelineDefaults.VoxelGapFillCells;
 
         // Stitch (cells, default 4 = 1.0 m at cellSize 0.25, 0 = off). Per tile: reconnects two mesh
         // components whose nearest boundary edges are within this many cells and within the agent climb,
         // by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings.
-        public int NavMeshVoxelStitchMaxGapCells = 6;
+        public int NavMeshVoxelStitchMaxGapCells = NavMeshPipelineDefaults.VoxelStitchMaxGapCells;
 
         // Prune small isolated islands after the merge (sealed-void lids, stray fragments).
-        public bool NavMeshVoxelPruneIsolatedIslands = true;
-        public int NavMeshVoxelPruneMaxIslandFaces = 400;
+        public bool NavMeshVoxelPruneIsolatedIslands = NavMeshPipelineDefaults.VoxelPruneIsolatedIslands;
+        public int NavMeshVoxelPruneMaxIslandFaces = NavMeshPipelineDefaults.VoxelPruneMaxIslandFaces;
 
         // Final-mesh sliver cleanup (thin/tiny triangles). Default ON, documented in the README.
-        public bool NavMeshVoxelCleanup = true;
+        public bool NavMeshVoxelCleanup = NavMeshPipelineDefaults.VoxelCleanup;
 
         // Final quad merge, part of the cleanup (default ON). Thin faces are combined with a
         // near-coplanar neighbour into one emitted 4-vertex face; geometry is unchanged (only the
         // shared interior edge disappears). Switch OFF instantly if the engine's importer ever
         // dislikes n-gon faces.
-        public bool NavMeshVoxelQuadMerge = true;
+        public bool NavMeshVoxelQuadMerge = NavMeshPipelineDefaults.VoxelQuadMerge;
 
         // Gate / door PLATE BLEND (v2 voxel core, default ON). A prop that carries a rigid, dead-flat
         // floor slab - a castle gate's floor colliders are the reported case - projects into the voxel
@@ -114,7 +157,7 @@ namespace BetterBannerlordNavmeshing
         // least-squares fitted to the built mesh around it, so both ends meet the surroundings inside the
         // agent climb. Only the plate's own vertices move, so no face is added or removed and no edge is
         // touched. See TiledNavMeshBuilder.BlendGatePlates and the README.
-        public bool NavMeshVoxelGatePlateBlend = true;
+        public bool NavMeshVoxelGatePlateBlend = NavMeshPipelineDefaults.VoxelGatePlateBlend;
 
         // BARRIERS (default ON). When on, every barrier body whose blocking mask stops agents is
         // collected and carved out of the navmesh as a solid wall, so an agent can no longer path
@@ -126,7 +169,7 @@ namespace BetterBannerlordNavmeshing
         // One-way is NOT reproduced: the barrier's Flip flag is a physics-normal direction, and a
         // navmesh has no directed edges, so the carved wall blocks both ways. That is strictly more
         // restrictive than the runtime rule and is documented in README.md.
-        public bool NavMeshVoxelBarriers = true;
+        public bool NavMeshVoxelBarriers = NavMeshPipelineDefaults.VoxelBarriers;
 
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
@@ -135,33 +178,33 @@ namespace BetterBannerlordNavmeshing
         // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
         // the terrain surface instead of chording under hills/knolls; bounded by
         // NavMeshMaxErrorMeters. Disable for a leaner bin (flat/plateau scenes only).
-        public bool NavMeshVoxelDetailMesh = true;
+        public bool NavMeshVoxelDetailMesh = NavMeshPipelineDefaults.VoxelDetailMesh;
 
         // v2 detail-mesh sampling distance (m). 0 = auto (max(0.9, cellSize)). Default 2.0 m: the
         // harness sweep shows it removes the tight/sliver faces Recast's detail edge tessellation
         // makes along walkable boundaries, with no fidelity loss. Lower it for more surface detail
         // (more faces); raise it (up to ~2*minPolyExtent) for fewer faces.
-        public float NavMeshVoxelDetailSampleDist = 2.0f;
+        public float NavMeshVoxelDetailSampleDist = NavMeshPipelineDefaults.VoxelDetailSampleDistMeters;
 
         // v2 contour simplification error (voxels). 0 = auto (NavMeshMaxErrorMeters / cellSize).
         // Default 2.0 vox (V3.64): the sliver census measured the post-cleanup sliver population
         // falling -43% / -24% / -34% on CC_20 / Birtu / Basamu versus 1.3 vox, and the 0.50 m
         // boundary budget at cs 0.25 m equals the cleanup's own SurfaceToleranceMeters. 1.3 vox was
         // the pre-census default.
-        public float NavMeshVoxelContourMaxError = 2.0f;
+        public float NavMeshVoxelContourMaxError = NavMeshPipelineDefaults.VoxelContourMaxErrorVoxels;
 
         // Phase 3: ingest static asset collision geometry (interiors, stairs, decks, bridges over
         // terrain) into the v2 voxel core. NavMeshHeightOffsetMeters lifts the whole merged mesh
         // (terrain and structures alike) so it never intersects either. Dynamic props (e.g. merlons)
         // and flora are toggled separately.
-        public bool NavMeshVoxelIncludeAssets = true;
-        public bool NavMeshVoxelIncludeDynamic = true;
-        public bool NavMeshVoxelIncludeFlora = false;
+        public bool NavMeshVoxelIncludeAssets = NavMeshPipelineDefaults.VoxelIncludeAssets;
+        public bool NavMeshVoxelIncludeDynamic = NavMeshPipelineDefaults.VoxelIncludeDynamic;
+        public bool NavMeshVoxelIncludeFlora = NavMeshPipelineDefaults.VoxelIncludeFlora;
 
         // Diagnostic (default off): log one line per included entity immediately before its native
         // PhysicsShape.GetTriangle read. If that native call ever read-AVs the process, the last line
         // in the log names the culprit entity/body. Cheap enough to leave off in normal runs.
-        public bool NavMeshVoxelAssetTrace = false;
+        public bool NavMeshVoxelAssetTrace = NavMeshPipelineDefaults.VoxelAssetTrace;
 
         // Stepped-prop handling (v2 voxel core only, DEFAULT OFF until the acceptance bar holds).
         // Two mechanisms, both keeping the ordinary 50 deg cap for everything else:
@@ -173,7 +216,7 @@ namespace BetterBannerlordNavmeshing
         //    no collision (a hole up to MaxBridgeRunMeters), with true-level end aprons, so a ramp can
         //    never hover above an existing tread.
         // See SteppedPropRamps and the README "Stairs & ladders".
-        public bool NavMeshVoxelSteppedProps = true;
+        public bool NavMeshVoxelSteppedProps = NavMeshPipelineDefaults.VoxelSteppedProps;
 
         // Gate / door BRIDGE STRIPS (v2 voxel core, default ON). A gate's passage floor is a stack of
         // separate rigid collider slabs whose edge stops short of the ground beyond the doorway; the
@@ -182,19 +225,19 @@ namespace BetterBannerlordNavmeshing
         // thin-slab passage plate and emits a force-walkable bridge strip from its edge to the first
         // surface beyond the gap (within the agent climb). Name-free (the fixE gate tag + geometry). See
         // GateBridgeStrips and the README "Gate bridge strips".
-        public bool NavMeshVoxelGateConnectors = true;
+        public bool NavMeshVoxelGateConnectors = NavMeshPipelineDefaults.VoxelGateConnectors;
 
         // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
         // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance
         // (terrain soup vs asset triangles) in the editor or Blender.
-        public bool NavMeshVoxelWriteSoupObj = false;
+        public bool NavMeshVoxelWriteSoupObj = NavMeshPipelineDefaults.VoxelWriteSoupObj;
 
         // Terrain-hole audit (default off). The engine's bulk node arrays carry no hole information, so
         // a carve can become a false walkable lid. When on, every sampled terrain vertex is compared
         // against the hole-aware point query Scene.GetTerrainHeight(pos, checkHoles: true) and any
         // vertex that disagrees by more than 1 m is treated as a hole: its terrain cells are dropped
         // from the soup. Costs one native point query per vertex (see the README for the measured cost).
-        public bool NavMeshVoxelTerrainHoleAudit = false;
+        public bool NavMeshVoxelTerrainHoleAudit = NavMeshPipelineDefaults.VoxelTerrainHoleAudit;
 
         // Run the v2 voxel build on a background thread so the editor UI stays alive during the
         // 3-60 s builds. Only the pure-managed voxel build runs off-thread; the terrain read and the
@@ -209,7 +252,7 @@ namespace BetterBannerlordNavmeshing
         // editor console (Debug.Print) and, in game, to the player (InformationManager). The
         // verbose per-session log FILE is unaffected - it stays exactly as detailed as it was.
         // Without this, a 30 s - 5 min build is a silent wait. See NavMeshVisibleLog + README.
-        public bool NavMeshConsoleMessages = true;
+        public bool NavMeshConsoleMessages = NavMeshPipelineDefaults.ConsoleMessages;
 
         // LIVE build status, shown as its own row in the editor's script-variables
         // panel for this entity - the panel that already carries the Export NavMesh
@@ -996,9 +1039,31 @@ namespace BetterBannerlordNavmeshing
             string logFolder)
         {
             return RunPipeline(scene, trigger, settings, prefabNameOverride, folderOverride,
-                clearExistingFaces, importIntoScene, writeLogFile, logFolder, false, 0.5f, 0f, true, 2.0f, 1.3f,
-                true, true, false, false, 0.25f, true, false, false, 2, 4, true, 400, false, false, true,
-                true, false, true);
+                clearExistingFaces, importIntoScene, writeLogFile, logFolder,
+                NavMeshPipelineDefaults.UseVoxelCore,
+                NavMeshPipelineDefaults.VoxelCellSizeMeters,
+                NavMeshPipelineDefaults.VoxelAgentClimbMeters,
+                NavMeshPipelineDefaults.VoxelDetailMesh,
+                NavMeshPipelineDefaults.VoxelDetailSampleDistMeters,
+                NavMeshPipelineDefaults.VoxelContourMaxErrorVoxels,
+                NavMeshPipelineDefaults.VoxelIncludeAssets,
+                NavMeshPipelineDefaults.VoxelIncludeDynamic,
+                NavMeshPipelineDefaults.VoxelIncludeFlora,
+                NavMeshPipelineDefaults.VoxelAssetTrace,
+                NavMeshPipelineDefaults.VoxelAgentRadiusMeters,
+                NavMeshPipelineDefaults.VoxelLedgeFilter,
+                NavMeshPipelineDefaults.VoxelWriteSoupObj,
+                NavMeshPipelineDefaults.VoxelTerrainHoleAudit,
+                NavMeshPipelineDefaults.VoxelGapFillCells,
+                NavMeshPipelineDefaults.VoxelStitchMaxGapCells,
+                NavMeshPipelineDefaults.VoxelPruneIsolatedIslands,
+                NavMeshPipelineDefaults.VoxelPruneMaxIslandFaces,
+                NavMeshPipelineDefaults.VoxelSteppedProps,
+                NavMeshPipelineDefaults.VoxelGateConnectors,
+                NavMeshPipelineDefaults.VoxelQuadMerge,
+                NavMeshPipelineDefaults.VoxelBarriers,
+                NavMeshPipelineDefaults.CullBelowWaterLevel,
+                NavMeshPipelineDefaults.ConsoleMessages);
         }
 
         // Full signature: useVoxelCore selects the v2 tiled voxel pipeline, and

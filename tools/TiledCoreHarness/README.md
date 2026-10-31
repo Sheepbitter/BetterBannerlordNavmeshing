@@ -33,6 +33,8 @@ TiledCoreHarness.exe > suite.txt
 | Mode | What it does |
 | --- | --- |
 | *(no args)* | Full 29-test acceptance suite + doorway sweep |
+| `--test11` | Test 11 only (multi-level assets). For triage after a tile/contour change |
+| `--test25` | Test 25 only (ladder slope exemption). The suite's one known red - see *Known documented failure* |
 | `--quadtest` | Test 27 only (quad merge + NMG8 writer round trip). Seconds; good smoke test |
 | `--barriers` | Barrier honour-mask rule check (`BarrierBlocksAgents` over the four engine masks) |
 | `--barriercase` | The CC_20_siege barrier regression case: builds the snapshot twice, barriers off vs on, and compares the mesh at the user's crossing |
@@ -56,6 +58,11 @@ switches (`--probe`, `--vmesh`, `--vprobe`, `--pinch`, `--flood`, `--walk`, `--s
 `--census`, `--defect`, `--ladders`, `--props`, `--routing`, `--quality`, `--quiet`, `--xzprobe`,
 `--connect`). Run it with a bad prefix to get the one-line usage summary.
 
+`--ramps`, `--gate` and `--cleanup` take an **optional** `on`/`off` value. A bare flag means on, and
+the next token is consumed only when it is literally `on` or `off`, so `--cleanup --quality` is a
+cleanup build plus the quality report, not a silently swallowed `--quality` (the V3.61 log had the
+latter bug).
+
 **Water level** (`--cullwater M` = Mode A cull, `--raisewater M` = Mode B raise): both compare the
 **lifted** height (`soupY + HeightOffsetMeters`) and act on **floor-like triangles only** (Recast-space
 upward normal >= `cos(MaxSlopeDegrees)`) - wall/obstacle geometry is never culled or clamped. A build
@@ -66,8 +73,26 @@ handling (byte-identical, the goldens).
 
 ## Known documented failure
 
-`LADDER-CAP TEST: FAIL` in Test 25 (ladder flag exempt from the synthesis slope cap) is the one
-**known, accepted** failure. Not a regression.
+`LADDER-CAP TEST: FAIL` in Test 25 is a **real product defect**: the synthesized leaning-ladder chain
+does not become walkable navmesh. The same failure is visible on the shipped ladders. Run the Birtu
+snapshot with the feature on and check coverage:
+
+```
+TiledCoreHarness --snapshot <Birtu> --ramps on --coverage civilian_ladder
+```
+
+Both `civilian_ladder_5m` and `civilian_ladder_6m` report `cov=0.0% ramp=0.0% rampArea=0.31/0.00m2
+rampTris=6`, although the chain is synthesized (6 tris, 5.5 m rise, 62-63 deg). Note that **`--ramps`
+defaults to off**, so a plain snapshot run does not exercise the ladder feature at all - always pass
+`--ramps on` when checking ladders.
+
+Case (c) in Test 25 is the synthetic shape that reproduces the same symptom (rungs plus a slanted
+plank; the chain is emitted on the rung plane and lost). The `european_castle_ladder` asset is an
+unflagged staircase and never enters this path. Mechanism, all rejected experiments (endpoint
+anchoring, connector marking, forcing the ladder surface, excluding the ladder collision, offset
+connector first, real-box/slab fixtures) and the acceptance target are recorded in `TODO.md`
+(ladder-chain item).
+
 
 Other `FAIL` strings in the log are *informational per-scenario* rows, not suite verdicts: Test 13
 prints `FAIL` for each narrow-feature scenario at the shipped `cs=0.5` config and then reports

@@ -58,13 +58,13 @@ namespace BetterBannerlordNavmeshing
             }
 
             var settings = new TerrainNavMeshBuilder.Settings();
-            settings.SampleStride = 1;
-            settings.MaxErrorMeters = 0.25f;
-            settings.CoarsestSpacingMeters = 16f;
-            settings.MaxSlopeDegrees = 65f;
+            settings.SampleStride = NavMeshPipelineDefaults.SampleStride;
+            settings.MaxErrorMeters = NavMeshPipelineDefaults.MaxErrorMeters;
+            settings.CoarsestSpacingMeters = NavMeshPipelineDefaults.CoarsestSpacingMeters;
+            settings.MaxSlopeDegrees = NavMeshPipelineDefaults.MaxSlopeDegrees;
+            settings.HeightOffsetMeters = NavMeshPipelineDefaults.HeightOffsetMeters;
             settings.CullBelowHeight = false;
             settings.MinHeight = 0f;
-            settings.HeightOffsetMeters = 0.5f;
             settings.WriteObj = false;
 
             SceneNavMeshExporter.RunPipeline(scene, "mission-hotkey (~)", settings, "", "", true, true, true, "");

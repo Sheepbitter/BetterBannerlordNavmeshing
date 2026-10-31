@@ -2,6 +2,33 @@
 
 Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
+## 0. Harness/module parity + harness ergonomics (DONE 2026-10-20)
+
+- In-game hotkey vs editor divergence fixed. The 9-argument `SceneNavMeshExporter.RunPipeline` overload
+  (the mission path) still carried stale literals - v1 core, contour 1.3, stitch 4, gate connectors off -
+  so the hotkey silently built a different mesh from the editor button. It now delegates every voxel/core
+  setting through the new `SceneNavMeshExporter.NavMeshPipelineDefaults`; the 31 matching exporter field
+  initializers use those constants, and the mission path resolves to the same v2 defaults (v2 core, cell
+  0.25 m, contour 2.0 vox, stitch 6, gate connectors and plate blend on). No intended output change for the
+  editor.
+- Harness optional-argument parsing fixed. `--cleanup`, `--gate` and `--ramps` consumed the next argv
+  unconditionally, so `--cleanup --quality` silently became a plain build and invalidated older baseline
+  rows. They now take an optional `on|off`: a bare flag means **on** and the next token is consumed only
+  when it is literally `on`/`off`.
+- Harness triage flags added: `--test11` and `--test25` run those tests alone (seconds) instead of the
+  ~45 s suite.
+- Test 11 unblocked as a **stale assertion**, not a code regression. The shipped contract allows a steep
+  face when it is *short* (tall-steep only is a defect). Added `CountTallSteepAbove`; the 74.6 deg face at
+  10 m is 1.2 m tall against a 2.60 m limit (two agent climbs), so it is allowed. `ASSET TEST: PASS`.
+- Docs reconciled: README stairs header now says "on by default", the in-game section documents the shared
+  v2 defaults and the caveat that the editor keeps script settings per scene, harness README gains the new
+  modes plus the optional-argument semantics.
+- Dead/inert cleanup knobs documented with **no behavior change**: `MaxFanNormalSpreadDegrees` (120 deg) is
+  inert because `FanPlanar` folds the angle to <=90 deg first; `FaceSlopeDeg` and
+  `MaxCleanupSlopeDegrees` are dead code (zero callers), so the "steep fans are never touched" rule in
+  their comment is not enforced. Code comments + README say so. Making either load-bearing changes output
+  and gets its own round.
+
 ## 1. Determinism: remove the wall clock (required for the procedural terrain generator pairing)
 
 - Every cleanup pass in `NavMeshCleanup.cs` is bounded by a wall-clock budget (`CleanupMaxMs = 6000` ms,
@@ -338,6 +365,43 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   variant is engine-accepted, so severity varies - not yet investigated. Related machinery when the round
   comes: `MarkSelfOverlaps` / `RepairFaceQuality` (the V3.46 same-level overlap repairs) and the `--scan`
   self-overlap report. Later, per the user.
+
+## 12. Ladder chain on a leaning ladder (REAL product defect - Test 25 case c)
+
+- Failing case: a 60 deg leaning ladder from `(2.6, 3.4, 0.2)` to `(4.332, 3.4, 3.2)` in the Test 25
+  scene. `--test25` prints `c) 60 deg leaning ladder: rampsOn connected=False rampTris=6 F=56`, then
+  `LADDER-CAP TEST: FAIL`. Cases (a) 90 deg and (b) HasSteps control pass.
+- SCOPE: this is about actual `Ladder`-flagged props (`BodyFlags 0x40`), not the `european_castle_ladder`
+  asset on CC_20 (flags `0x0`, an unflagged staircase handled by the staircase round). The real shipped
+  ladders are Birtu's `civilian_ladder_5m` / `civilian_ladder_6m`; with the harness snapshot they are
+  **also broken**: `--snapshot <Birtu> --ramps on --coverage civilian_ladder` reports
+  `cov=0.0% covEroded=0.0% ramp=0.0% walkArea=0.3m2 rampArea=0.31/0.00m2 rampTris=6` for both.
+  (A `--ramps off` run looks connected only because the ladder feature is not exercised - the default
+  snapshot mode is ramps off, which is why the first scope check was misleading.)
+- Mechanism: `TryLadderChain` emits the 3-quad chain (foot pad, ramp, top pad; 6 tris) but almost none of
+  it becomes walkable navmesh. The chain's own footprint is correct (`--propdump civilian_ladder_5m`
+  prints `rampXY=(301.918,313.626)-(303.275,316.199)`, matching the prop bbox, `z=[16.597..21.050]`).
+  Probes along its centreline find no face at the foot, one large face at mid-height whose local height
+  runs 18.10..20.12, one at 20.57 local 21.31, and **no face at the top** - so the poly stage turns the
+  ramp into two mid fragments instead of a continuous climb. A `--ramps off` run looks connected only
+  because the ladder feature is not exercised; always pass `--ramps on`.
+- Experiments run and reverted (all with `--ramps on --coverage civilian_ladder` as the metric):
+  - endpoint anchoring at the prop's true extreme vertices: chain 60.6 deg (was 63.7), still split;
+  - marking the whole chain as connector (force && exempt): connector cells/erosion restoration appear
+    (`forcedInTile=26`, `erosionExempt=114`) but coverage stays 0%;
+  - forcing the ladder's own box triangles walkable: 5 m 60% coverage, 6 m 0%;
+  - excluding the ladder's own collision from the soup: coverage still 0% (the chain alone does not
+    rasterise);
+  - offset connector first for ladders: 6 m 68.2% coverage, 5 m 0.9% (its 45 deg foot is 4.45 m from the
+    top and lands off the platform);
+  - Test 25 fixture replaced with the real 12-tri box / a closed slab: still `connected=False`, and the
+    slab broke case (a).
+- Next direction: instrument the chain's rasterisation (heightfield spans / where the 3 quads go) instead
+  of guessing shapes. The 0.31 m2 result says the problem is before the region/contour stage. A narrower
+  offset (or an on-plane chain plus a forced span marker that `MarkSteppedCells`/`RestoreSteppedSpans`
+  actually retains) is the likely lever.
+- Acceptance: Birtu `civilian_ladder_5m/6m` coverage near 100% with `--ramps on`, `--test25` PASS,
+  full suite green elsewhere, module build clean.
 
 ## 7. Persist the acceptance suite in the repo (accepted; queued - no repo changes yet)
 

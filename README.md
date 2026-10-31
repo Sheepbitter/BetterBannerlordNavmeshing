@@ -96,7 +96,11 @@ or build), **Probe Geometry** (collision-geometry diagnostic, see Probe Geometry
 
 `SceneNavMeshMissionLogic` is a `MissionLogic`: register it on a mission (e.g. from a mission-behaviour
 registration hook) and press `~` while a mission is `Continuing`. Work is queued on the key press and run on
-the **next** tick, so the input call never blocks. It runs the same pipeline on `Mission.Current.Scene`.
+the **next** tick, so the input call never blocks. It runs the same pipeline on `Mission.Current.Scene`, using
+the v2 tiled voxel core and the **same shipped defaults as the editor** (`NavMeshPipelineDefaults`: 10 m tile,
+0.25 m cells, contour 2.0 vox, stitch 6, stepped props and gate connectors on). It has no scene component to
+read per-scene overrides from, so a scene whose panel settings differ from the defaults still builds the
+defaults in-game.
 
 > Singleplayer only for now. In vanilla, imports/navmesh changes on a mission are server-authoritative
 > (`MissionObject.OnInit` guards on `GameNetwork.IsClientOrReplay`); that guard is **not** added here yet.
@@ -1118,6 +1122,12 @@ face may be thinner than 1.5 deg, the component count must not change, component
 skipped, and the topology gate - the same thing the export's invariant gate checks - refuses any removal that
 would create a duplicate face or an edge with more than two faces.
 
+Two constants beside those guards are **not on a decision path**, and the code now says so: the 120 deg
+`MaxFanNormalSpreadDegrees` cap is **inert** (`FanPlanar` folds the angle into 0-90 deg before comparing, so
+it can never fire), and `FaceSlopeDeg` / `MaxCleanupSlopeDegrees` are **dead code** (no callers), so the
+"fans containing a steep face are never touched" rule is not enforced as written. They are kept for the
+record; making either load-bearing changes output, so it needs its own measured round.
+
 The quad merge has its own small guard set, all checked per candidate pair before the pair is recorded:
 neither face may already be merged; the union's four vertices must be distinct; the two faces may fold by at
 most 25 deg, so a step rim or two stacked levels sharing an edge never become one polygon; the resulting quad
@@ -1527,7 +1537,7 @@ The setting rides the same collector path as `NavMeshVoxelSteppedProps`; the har
 `gate: plates=<n> strips=<n> skipped=<n>` plus one `gate strip '...' gap=... drop=... slope=...` line per
 emitted strip. See `GateBridgeStrips.cs`.
 
-### Stairs & ladders - `NavMeshVoxelSteppedProps`, **off by default**
+### Stairs & ladders - `NavMeshVoxelSteppedProps`, **on by default**
 
 Two mechanisms for props whose body flags include `HasSteps` (`0x800`) or `Ladder` (`0x40`) - Birtu has 84 of
 the former and 2 of the latter. **Everything else keeps the ordinary 50 deg cap** (the builder's

@@ -37,6 +37,9 @@ namespace BetterBannerlordNavmeshing
         // A fan whose triangle normals spread more than this (degrees) is a step/corner/rim: skip it.
         // Kept generous on purpose - the real bound on a fold is the move tolerance below, and a tight
         // spread cap was refusing ordinary bumpy ground.
+        // INERT (kept for the record): FanPlanar folds the angle into [0, 90] (`if (na > 90) na = 180 - na`)
+        // before this comparison, so a 120 deg cap can never fire. Making it load-bearing changes output
+        // (it would start refusing real folds) and needs its own measured round.
         public const float MaxFanNormalSpreadDegrees = 120f;
         // Needle: shortest altitude < 0.05 m AND longest edge > 0.5 m. Thin: min angle < 5 deg.
         public const float NeedleAltitudeMeters = 0.05f;
@@ -57,6 +60,9 @@ namespace BetterBannerlordNavmeshing
         // Fans containing any face steeper than this are never touched: step risers, staircase treads, the
         // synthesised ramps and wall bases are load-bearing geometry, and folding them is what dropped the
         // mesh under the top of staircases.
+        // DEAD CODE (zero callers, with FaceSlopeDeg): this guard is NOT enforced today. Steep slivers are
+        // kept by the enforced normal-spread / move-tolerance / height-change guards instead. Making it
+        // real changes output and needs its own round.
         public const float MaxCleanupSlopeDegrees = 40f;
         // A face is only a navmesh surface if its GROUND FOOTPRINT (the signed XZ area in walk order, in
         // m^2) is strictly positive: positive = faces up (walkable), zero = a wall (no footprint at all -
@@ -2156,6 +2162,7 @@ namespace BetterBannerlordNavmeshing
         }
 
         // Slope of a face relative to the up (Y) axis, in degrees.
+        // DEAD CODE (zero callers - kept for the record): see MaxCleanupSlopeDegrees.
         private static double FaceSlopeDeg(float[] v, int a, int b, int c)
         {
             double[] n = Normal(v, a, b, c);

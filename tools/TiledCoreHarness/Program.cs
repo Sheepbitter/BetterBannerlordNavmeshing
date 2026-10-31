@@ -765,6 +765,20 @@ internal static class Program
             Test27_QuadMerge();
             return;
         }
+        // Single-test entry points for triage: the full suite takes minutes, and a failing test
+        // should be reproducible on its own. Keep these in sync with the suite order in Main.
+        if (args != null && args.Length > 0 && args[0] == "--test11")
+        {
+            TiledNavMeshBuilder.GatePlateTrace = true;
+            Test11_Assets();
+            return;
+        }
+        if (args != null && args.Length > 0 && args[0] == "--test25")
+        {
+            TiledNavMeshBuilder.GatePlateTrace = true;
+            Test25_LadderSlopeExemption();
+            return;
+        }
 
         Console.WriteLine("== TiledNavMeshBuilder standalone harness (net472 / C# 7.3) ==");
         Console.WriteLine("processors = " + Environment.ProcessorCount);
@@ -913,9 +927,13 @@ internal static class Program
                     case "--holes":
                         holesMinCells = (int)ParseFloat(v); i++; break;
                     case "--ramps":
-                        propRamps = ParseOnOff(v); i++; break;
+                        propRamps = !IsOnOffValue(v) || ParseOnOff(v);
+                        if (IsOnOffValue(v)) i++;
+                        break;
                     case "--gate":
-                        gateConnectors = ParseOnOff(v); i++; break;
+                        gateConnectors = !IsOnOffValue(v) || ParseOnOff(v);
+                        if (IsOnOffValue(v)) i++;
+                        break;
                     case "--probe":
                         probeSpecs.Add(v); i++; break;
                     case "--propdump":
@@ -942,7 +960,9 @@ internal static class Program
                     case "--xzprobe":
                         xzprobe = true; break;
                     case "--cleanup":
-                        cleanupOn = ParseOnOff(v); i++; break;
+                        cleanupOn = !IsOnOffValue(v) || ParseOnOff(v);
+                        if (IsOnOffValue(v)) i++;
+                        break;
                     // ---- cleanup determinism / calibration overrides (det v1) ----
                     // Every knob the cleanup's counted work budgets expose, so the calibration is
                     // executable with no code edit between runs. All of these are echoed back in the
@@ -2546,6 +2566,18 @@ internal static class Program
         return v.Equals("on", StringComparison.OrdinalIgnoreCase) || v == "1" || v.Equals("true", StringComparison.OrdinalIgnoreCase);
     }
 
+    // True when the next argv token is an explicit on/off value. The flagged toggles
+    // (--cleanup, --gate, --ramps) are optional-argument: "--cleanup --quality" must mean
+    // "--cleanup on" plus "--quality", never consume "--quality" as the value and silently
+    // build without cleanup (that bug invalidated older baseline rows).
+    private static bool IsOnOffValue(string v)
+    {
+        if (v == null) return false;
+        return v.Equals("on", StringComparison.OrdinalIgnoreCase) || v.Equals("off", StringComparison.OrdinalIgnoreCase)
+            || v == "1" || v == "0"
+            || v.Equals("true", StringComparison.OrdinalIgnoreCase) || v.Equals("false", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static float[] ParsePair(string spec)
     {
         if (string.IsNullOrEmpty(spec)) return null;
@@ -3106,6 +3138,7 @@ internal static class Program
     {
         if (PropDump != null)
         {
+            ApplyRampsVerbose = true;
             for (int i = 0; i < assets.Count; i++)
             {
                 SceneSnapshot.EntityRecord rec = assets[i];
@@ -3983,6 +4016,34 @@ internal static class Program
         return n;
     }
 
+    // The shipped steep-face contract (README "Steep-and-tall faces"): a face is a defect only when
+    // it is BOTH steeper than limit+margin AND taller than two agent climbs plus one cell height.
+    // Short steep faces (a kerb, one riser, the connectivity lab's 71.5 deg stair connector) are
+    // deliberate and must survive. A blanket "max slope <= limit" assertion is therefore wrong:
+    // it is what made Test 11 fail at the 10 m tile on a 1.2 m stair-side face.
+    private static int CountTallSteepAbove(TiledNavMeshBuilder.VoxelMeshResult r, double limitDeg,
+        float maxHeightMeters)
+    {
+        int n = 0;
+        double thr = limitDeg * Math.PI / 180.0;
+        for (int f = 0; f < r.FaceCount; f++)
+        {
+            int ia = r.Tris[f * 3 + 0], ib = r.Tris[f * 3 + 1], ic = r.Tris[f * 3 + 2];
+            float ax = r.VertsXyz[ia * 3], ay = r.VertsXyz[ia * 3 + 1], az = r.VertsXyz[ia * 3 + 2];
+            float bx = r.VertsXyz[ib * 3], by = r.VertsXyz[ib * 3 + 1], bz = r.VertsXyz[ib * 3 + 2];
+            float cx = r.VertsXyz[ic * 3], cy = r.VertsXyz[ic * 3 + 1], cz = r.VertsXyz[ic * 3 + 2];
+            float ux = bx - ax, uy = by - ay, uz = bz - az;
+            float vx = cx - ax, vy = cy - ay, vz = cz - az;
+            float nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            double slope = Math.Atan2(Math.Sqrt((double)nx * nx + (double)nz * nz), Math.Abs(ny));
+            if (slope <= thr) continue;
+            float lo = Math.Min(ay, Math.Min(by, cy));
+            float hi = Math.Max(ay, Math.Max(by, cy));
+            if (hi - lo > maxHeightMeters) n++;
+        }
+        return n;
+    }
+
     private static void PrintSteepest(TiledNavMeshBuilder.VoxelMeshResult r, string tag)
     {
         double max = 0.0;
@@ -4839,9 +4900,12 @@ internal static class Program
         ok &= AssertBand("[fan] gully ground under bridge (terrain -3 + ~0.5)", rf, 32f, 26f, -2.52f, -2.05f, true);
         PrintSteepest(rf, "[fan]");
         double ms = MaxSlope(rf);
-        bool slopeOk = ms <= fanS.MaxSlopeDegrees + 2.0;
-        Console.WriteLine("  [fan] max face slope=" + ms.ToString("F1") + " deg (limit " + fanS.MaxSlopeDegrees
-            + ") ok=" + slopeOk);
+        float tallLimit = 2f * fanS.AgentMaxClimbMeters + fanS.CellHeightMeters;
+        int tallFan = CountTallSteepAbove(rf, fanS.MaxSlopeDegrees + fanS.SteepFaceMarginDegrees, tallLimit);
+        Console.WriteLine("  [fan] max face slope=" + ms.ToString("F1") + " deg; tallSteep(>" +
+            (fanS.MaxSlopeDegrees + fanS.SteepFaceMarginDegrees).ToString("F0") + "deg and >" +
+            tallLimit.ToString("F2") + "m)=" + tallFan + " (short steep faces are allowed by design)");
+        bool slopeOk = tallFan == 0;
         ok &= slopeOk;
 
         // --- detail build (the shipped default): invariants + determinism. The uniform +0.5 lift
@@ -4873,10 +4937,14 @@ internal static class Program
             + " (detail-phase triangles bridging the stair/ground step; detail is height-bounded, not slope-bounded)");
         // The POLY (fan) mesh bounds traversability; the detail phase refines geometry and can locally
         // exceed the poly slope where it interpolates across a height discontinuity (a step/ledge), just
-        // as it can at a terrain cliff edge (see Test 2's detail-ON note). Assert the poly mesh slope.
-        bool slopeOk2 = ms <= ds.MaxSlopeDegrees + 2.0;
-        Console.WriteLine("  [detail] poly-mesh max slope=" + ms.ToString("F1") + " deg (limit "
-            + ds.MaxSlopeDegrees + "+2) ok=" + slopeOk2);
+        // as it can at a terrain cliff edge (see Test 2's detail-ON note). Assert the documented
+        // steep-and-tall contract on the poly mesh, not a blanket slope bound.
+        int tallDetail = CountTallSteepAbove(rd, ds.MaxSlopeDegrees + ds.SteepFaceMarginDegrees, tallLimit);
+        bool slopeOk2 = tallDetail == 0;
+        Console.WriteLine("  [detail] poly-mesh tallSteep(>" +
+            (ds.MaxSlopeDegrees + ds.SteepFaceMarginDegrees).ToString("F0") + "deg and >" +
+            tallLimit.ToString("F2") + "m)=" + tallDetail + " (limit " + ds.MaxSlopeDegrees + "deg + margin) ok="
+            + slopeOk2);
         ok &= slopeOk2;
 
         // Caveat (informational + asserted): with the SHIPPED RegionMinSize=8 (min region area 64
@@ -7632,6 +7700,14 @@ internal static class Program
             List<SteppedPropRamps.Prop> props = LadderScene25(lean60, SteppedPropRamps.FlagLadder);
             cOn = RampLink23(props, true, 1.2f, 3.4f, 0.2f, 2.6f + lean60, 3.4f, 3.2f,
                 out iv, out faces, out rt, true, 0);
+            // KNOWN FAILURE (real product defect, SHIPPED ladders included): this fixture's ladder is
+            // 5 rung boxes plus a slanted plank. The ordinary ladder chain is emitted on the steep rung
+            // plane and then almost none of it becomes walkable. The same happens on Birtu's real
+            // civilian_ladder_5m/6m: `--snapshot <Birtu> --ramps on --coverage civilian_ladder` reports
+            // cov=0.0% / rampArea=0.31/0.00m2 with rampTris=6. The 90 deg path works because its offset
+            // connector is a separate 45 deg ramp. Note --ramps defaults OFF in snapshot mode, so a
+            // plain snapshot run does not exercise this. Rejected experiments and the rasterisation
+            // next step are in TODO "Ladder chain on a leaning ladder". Left red so it stays visible.
             Console.WriteLine("    [c] meshY=[" + MeshYRange(LastRampMesh23) + "]"
                 + " floorProbe=" + (FaceAt(LastRampMesh23, 1.2f, 3.4f, 0.2f, 0.8f) >= 0)
                 + " topProbe=" + (FaceAt(LastRampMesh23, 2.6f + lean60, 3.4f, 3.2f, 0.8f) >= 0));
@@ -7642,7 +7718,8 @@ internal static class Program
         bool ok = !aOff && aOn && !bOn && cOn;
         Console.WriteLine("  expectations: the 90 deg ladder synthesizes and connects with the ramps on"
             + " (impossible before V3.19) and not with them off; the same vertical geometry flagged"
-            + " HasSteps is still refused; a 60 deg ladder still connects");
+            + " HasSteps is still refused; a 60 deg ladder still connects (KNOWN RED: the leaning case"
+            + " loses its on-plane chain - see the comment in case (c))");
         Console.WriteLine("  LADDER-CAP TEST: " + (ok ? "PASS" : "FAIL"));
     }
 
