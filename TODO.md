@@ -368,9 +368,14 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
 ## 12. Ladder chain on a leaning ladder (REAL product defect - Test 25 case c)
 
+- USER REPORT (2026-10-31): ladders on **Basamu work great**. On **Birtu the failure is specifically the
+  small doorway right at the ladder's top**, not the climb itself. That reframes this item: the chain
+  geometry is adequate where the top lands openly; the remaining defect is the top landing through a
+  narrow throat.
 - Failing case: a 60 deg leaning ladder from `(2.6, 3.4, 0.2)` to `(4.332, 3.4, 3.2)` in the Test 25
   scene. `--test25` prints `c) 60 deg leaning ladder: rampsOn connected=False rampTris=6 F=56`, then
-  `LADDER-CAP TEST: FAIL`. Cases (a) 90 deg and (b) HasSteps control pass.
+  `LADDER-CAP TEST: FAIL`. Cases (a) 90 deg and (b) HasSteps control pass. The synthetic hatch is the
+  analogue of Birtu's doorway.
 - SCOPE: this is about actual `Ladder`-flagged props (`BodyFlags 0x40`), not the `european_castle_ladder`
   asset on CC_20 (flags `0x0`, an unflagged staircase handled by the staircase round). The real shipped
   ladders are Birtu's `civilian_ladder_5m` / `civilian_ladder_6m`; with the harness snapshot they are
@@ -420,6 +425,22 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
     effective run (tread >= 2 cells). For a ladder at a platform edge there may be no room for that run,
     which points at the engine-native mechanism instead: per-face group ids in `Nmg8Writer` (f1, now
     always 0) so the engine's ladder machinery can mark the faces, not a geometric ramp.
+  - TOP-PAD / DOORWAY EXPERIMENT (same branch, 2026-10-31): the chain's top apron is only 0.5 cell, so
+    it cannot cross the threshold at Birtu. Added 3 m flat landing pads at the chain top in eight
+    directions (connector-marked, clipped by the scene probe), and made the pad test ignore the surface
+    it sits on (`OwnGeometryBlocks` now skips geometry at/below padTop+0.05 instead of padTop-0.3).
+    The harness snapshot now carries `ConnectorTris` into the force+exempt masks (it previously marked
+    every ramp force-only, so connector pads were never exempt).
+    Result with `--ramps on --coverage civilian_ladder`:
+    - `civilian_ladder_6m` (open top): 13.7% -> **78.4%** coverage; probes now find landing faces.
+    - `civilian_ladder_5m` (Birtu doorway): still **0%**; its top is surrounded by `editor_cube` /
+      stone-heap geometry at (302.7,316.1..317.0) and no pad face appears at 21.0-21.5 even with 8
+      directions and a 0.6 m pad.
+    - Basamu `civilian_ladder_4m` coverage unchanged (the user-visible working case is not regressed).
+    - Full suite otherwise green (PROP-RAMP / DOORWAY-LADDER / NARROW-DOORWAY PASS); Test 25 still red.
+    The 5m top needs the scene's own `SeekSurface`/`IsFreeAt` behaviour, which the snapshot harness does
+    not reproduce; this is the first thing to check in-editor.
+
 
 - Acceptance: Birtu `civilian_ladder_5m/6m` coverage near 100% with `--ramps on`, `--test25` PASS,
   full suite green elsewhere, module build clean.

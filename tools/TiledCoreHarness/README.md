@@ -73,25 +73,20 @@ handling (byte-identical, the goldens).
 
 ## Known documented failure
 
-`LADDER-CAP TEST: FAIL` in Test 25 is a **real product defect**: the synthesized leaning-ladder chain
-does not become walkable navmesh. The same failure is visible on the shipped ladders. Run the Birtu
-snapshot with the feature on and check coverage:
+`LADDER-CAP TEST: FAIL` in Test 25 is a **real top-landing defect**, not a general ladder failure. The
+user confirms ladders on Basamu work; on Birtu the failure is the **small doorway at the ladder's
+top**. Case (c) is the synthetic analogue. Check the shipped ladders with:
 
 ```
 TiledCoreHarness --snapshot <Birtu> --ramps on --coverage civilian_ladder
 ```
 
-Both `civilian_ladder_5m` and `civilian_ladder_6m` report `cov=0.0% ramp=0.0% rampArea=0.31/0.00m2
-rampTris=6`, although the chain is synthesized (6 tris, 5.5 m rise, 62-63 deg). Note that **`--ramps`
-defaults to off**, so a plain snapshot run does not exercise the ladder feature at all - always pass
-`--ramps on` when checking ladders.
-
-Case (c) in Test 25 is the synthetic shape that reproduces the same symptom (rungs plus a slanted
-plank; the chain is emitted on the rung plane and lost). The `european_castle_ladder` asset is an
-unflagged staircase and never enters this path. Mechanism, all rejected experiments (endpoint
-anchoring, connector marking, forcing the ladder surface, excluding the ladder collision, offset
-connector first, real-box/slab fixtures) and the acceptance target are recorded in `TODO.md`
-(ladder-chain item).
+Baseline: `civilian_ladder_5m` (the doorway case) and `civilian_ladder_6m` both report 0% coverage.
+`--ramps` defaults to **off**, so a plain snapshot run does not exercise the feature. The chain's top
+apron is only 0.5 cell and cannot cross the threshold; the experiment branch `exp/ladder-raster` adds
+8-direction landing pads (6 m reaches 78.4%, 5 m still 0% because its top is sealed by ruin cubes in
+the snapshot). The `european_castle_ladder` asset is an unflagged staircase and never enters this path.
+Mechanism, experiments and next steps are in `TODO.md` (ladder-chain item).
 
 
 Other `FAIL` strings in the log are *informational per-scenario* rows, not suite verdicts: Test 13
