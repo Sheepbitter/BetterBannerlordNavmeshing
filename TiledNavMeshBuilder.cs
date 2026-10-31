@@ -44,6 +44,52 @@ namespace BetterBannerlordNavmeshing
         // was rejected). Never set in production; off means the run log only carries the summary counters.
         public static bool GatePlateTrace;
 
+        // Harness-only span probe: a world-space XZ box (optional Y range). When set (X0 not NaN),
+        // BuildTile dumps every heightfield span in the box at each filter stage
+        // (raster -> ledge -> restored -> clearance), so a ramp that disappears can be traced to the
+        // stage that dropped it. Never set in production; off by default.
+        public static float DebugSpanX0 = float.NaN, DebugSpanZ0 = float.NaN;
+        public static float DebugSpanX1 = float.NaN, DebugSpanZ1 = float.NaN;
+        public static float DebugSpanY0 = float.NaN, DebugSpanY1 = float.NaN;
+        private static readonly object DebugSpanSync = new object();
+
+        private static void DebugDumpSpans(string stage, RcHeightfield hf)
+        {
+            if (float.IsNaN(DebugSpanX0) || hf == null) return;
+            int w = hf.width, h = hf.height;
+            int x0 = (int)Math.Floor((DebugSpanX0 - hf.bmin.X) / hf.cs);
+            int x1 = (int)Math.Floor((DebugSpanX1 - hf.bmin.X) / hf.cs);
+            int z0 = (int)Math.Floor((DebugSpanZ0 - hf.bmin.Z) / hf.cs);
+            int z1 = (int)Math.Floor((DebugSpanZ1 - hf.bmin.Z) / hf.cs);
+            if (x0 < 0) x0 = 0; if (z0 < 0) z0 = 0;
+            if (x1 >= w) x1 = w - 1; if (z1 >= h) z1 = h - 1;
+            if (x0 > x1 || z0 > z1) return;
+            lock (DebugSpanSync)
+            {
+                int lines = 0;
+                for (int z = z0; z <= z1; z++)
+                {
+                    for (int x = x0; x <= x1; x++)
+                    {
+                        int ci = z * w + x;
+                        for (RcSpan sp = hf.spans[ci]; sp != null && lines < 2000; sp = sp.next)
+                        {
+                            float sy0 = hf.bmin.Y + sp.smin * hf.ch;
+                            float sy1 = hf.bmin.Y + sp.smax * hf.ch;
+                            if (!float.IsNaN(DebugSpanY0) && sy1 < DebugSpanY0) continue;
+                            if (!float.IsNaN(DebugSpanY1) && sy0 > DebugSpanY1) continue;
+                            lines++;
+                            Console.WriteLine("[span] " + stage + " cell=("
+                                + (hf.bmin.X + (x + 0.5f) * hf.cs).ToString("F2") + ","
+                                + (hf.bmin.Z + (z + 0.5f) * hf.cs).ToString("F2") + ") y=["
+                                + sy0.ToString("F2") + ".." + sy1.ToString("F2") + "] area=" + sp.area);
+                        }
+                    }
+                }
+                Console.WriteLine("[span] " + stage + " lines=" + lines);
+            }
+        }
+
         // ==================================================================
         // Barrier support (V3.58)
         // ==================================================================
@@ -4341,6 +4387,7 @@ namespace BetterBannerlordNavmeshing
                 RcRasterizations.RasterizeTriangles(ctx, vertsXyz, subTris, areaIds, assigned, hf, walkableClimb);
 
                 RcFilters.FilterLowHangingWalkableObstacles(ctx, walkableClimb, hf);
+                DebugDumpSpans("raster", hf);
 
                 // BORDER CLAMP, part 3: the per-cell mask. See ApplyBorderMask for why this sits here
                 // rather than immediately after the rasteriser.
@@ -4482,6 +4529,7 @@ namespace BetterBannerlordNavmeshing
                     //   erosion - horizontal (walkableRadius) only.
                     RcFilters.FilterLedgeSpans(ctx, walkableHeight, walkableClimb, hf);
                 }
+                DebugDumpSpans("ledge", hf);
                 if (steppedSpans != null)
                 {
                     // Restore per SPAN, not per cell: ordinary geometry in the same tile keeps the exact
@@ -4524,8 +4572,10 @@ namespace BetterBannerlordNavmeshing
                     r.ConnectorClearedCeilings += ClearConnectorCeilings(hf, connectorCells, connectorTop,
                         walkableHeight, walkableClimb, s.CellHeightMeters);
                 }
+                DebugDumpSpans("restored", hf);
                 // Clearance still applies to ramp surfaces: a ramp must not become a low ceiling.
                 RcFilters.FilterWalkableLowHeightSpans(ctx, walkableHeight, hf);
+                DebugDumpSpans("clearance", hf);
 
                 RcCompactHeightfield chf = RcCompacts.BuildCompactHeightfield(ctx, walkableHeight, walkableClimb, hf);
                 RcAreas.ErodeWalkableArea(ctx, walkableRadius, chf);

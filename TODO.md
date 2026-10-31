@@ -400,6 +400,27 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   of guessing shapes. The 0.31 m2 result says the problem is before the region/contour stage. A narrower
   offset (or an on-plane chain plus a forced span marker that `MarkSteppedCells`/`RestoreSteppedSpans`
   actually retains) is the likely lever.
+- EXPERIMENTS 2026-10-31 (branch `exp/ladder-raster`, NOT merged; main is back at d02c692):
+  - Added a `--spanprobe "x0,z0,x1,z1[,y0,y1]"` stage dump (`raster -> ledge -> restored -> clearance`).
+    On Birtu the continuous 63 deg chain produces ~1-2 m tall spans per cell (one cell spans several
+    chain heights). `FilterWalkableLowHeightSpans` keeps the ladder's own upper span and nulls the chain;
+    the chain's own span is not identified. That is why only ~0.3 m2 survives.
+  - Tagging connector spans with a private area id (62) at rasterisation, using the cell-centre height
+    for `connectorTop`, and making erosion skip tagged spans by identity got the chain spans to survive
+    the heightfield (`clearance` shows continuous area-62 spans 15.6..21.2 on the 5 m ladder), but
+    region/contour still do not turn them into a walkable path (coverage 0%).
+  - Replacing the chain with a staircase of flat treads (on-plane, 0.5 m rise) gives coverage 2.1% /
+    4.2% (5 m / 6 m); footprints correct, probes find mid-height faces, ends still missing.
+  - A 45 deg OFFSET connector emitted as flat treads gives 44.7% on `civilian_ladder_6m`, 2.8% on
+    `civilian_ladder_5m` (its foot lands 4.45 m from the top, off the platform).
+  - This work also broke PROP-RAMP, DOORWAY-LADDER and NARROW-DOORWAY in the suite, so it stays on the
+    experiment branch only.
+  - Read: a 63 deg ladder cannot be represented as a walkable Recast staircase at 0.25 m cells with a
+    0.25 m tread (several treads merge into one tall span). A walkable staircase needs a ~45 deg
+    effective run (tread >= 2 cells). For a ladder at a platform edge there may be no room for that run,
+    which points at the engine-native mechanism instead: per-face group ids in `Nmg8Writer` (f1, now
+    always 0) so the engine's ladder machinery can mark the faces, not a geometric ramp.
+
 - Acceptance: Birtu `civilian_ladder_5m/6m` coverage near 100% with `--ramps on`, `--test25` PASS,
   full suite green elsewhere, module build clean.
 

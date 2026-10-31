@@ -936,6 +936,23 @@ internal static class Program
                         break;
                     case "--probe":
                         probeSpecs.Add(v); i++; break;
+                    case "--spanprobe":
+                    {
+                        string[] sp = v.Split(',');
+                        if (sp.Length >= 4)
+                        {
+                            TiledNavMeshBuilder.DebugSpanX0 = (float)ParseFloat(sp[0]);
+                            TiledNavMeshBuilder.DebugSpanZ0 = (float)ParseFloat(sp[1]);
+                            TiledNavMeshBuilder.DebugSpanX1 = (float)ParseFloat(sp[2]);
+                            TiledNavMeshBuilder.DebugSpanZ1 = (float)ParseFloat(sp[3]);
+                            if (sp.Length >= 6)
+                            {
+                                TiledNavMeshBuilder.DebugSpanY0 = (float)ParseFloat(sp[4]);
+                                TiledNavMeshBuilder.DebugSpanY1 = (float)ParseFloat(sp[5]);
+                            }
+                        }
+                        i++; break;
+                    }
                     case "--propdump":
                         PropDump = v; i++; break;
                     case "--pair":
