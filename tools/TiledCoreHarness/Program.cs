@@ -7957,7 +7957,57 @@ internal static class Program
             shown++;
         }
         WriteObj(r, System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_nav.obj"));
+        WriteObjRaw(mx, mt, System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_soup.obj"));
         Console.WriteLine("obj: " + System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_nav.obj"));
+        Console.WriteLine("obj: " + System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_soup.obj"));
+
+        if (Array.IndexOf(args, "--filter") >= 0)
+        {
+            var kv = new List<float>();
+            var kt = new List<int>();
+            int dropped = 0;
+            for (int f = 0; f < r.FaceCount; f++)
+            {
+                int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+                double ux = r.VertsXyz[b * 3] - r.VertsXyz[a * 3];
+                double uy = r.VertsXyz[b * 3 + 1] - r.VertsXyz[a * 3 + 1];
+                double uz = r.VertsXyz[b * 3 + 2] - r.VertsXyz[a * 3 + 2];
+                double vx = r.VertsXyz[c * 3] - r.VertsXyz[a * 3];
+                double vy = r.VertsXyz[c * 3 + 1] - r.VertsXyz[a * 3 + 1];
+                double vz = r.VertsXyz[c * 3 + 2] - r.VertsXyz[a * 3 + 2];
+                double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                double slope = len > 1e-12 ? Math.Acos(Math.Min(1.0, Math.Abs(ny) / len)) * 180.0 / Math.PI : 0.0;
+                double area = 0.5 * len;
+                double e0 = Math.Sqrt(ux * ux + uy * uy + uz * uz);
+                double wx = r.VertsXyz[c * 3] - r.VertsXyz[b * 3];
+                double wy = r.VertsXyz[c * 3 + 1] - r.VertsXyz[b * 3 + 1];
+                double wz = r.VertsXyz[c * 3 + 2] - r.VertsXyz[b * 3 + 2];
+                double e1 = Math.Sqrt(wx * wx + wy * wy + wz * wz);
+                double e2 = Math.Sqrt((r.VertsXyz[c * 3] - r.VertsXyz[a * 3]) * (r.VertsXyz[c * 3] - r.VertsXyz[a * 3])
+                    + (r.VertsXyz[c * 3 + 1] - r.VertsXyz[a * 3 + 1]) * (r.VertsXyz[c * 3 + 1] - r.VertsXyz[a * 3 + 1])
+                    + (r.VertsXyz[c * 3 + 2] - r.VertsXyz[a * 3 + 2]) * (r.VertsXyz[c * 3 + 2] - r.VertsXyz[a * 3 + 2]));
+                double longest = Math.Max(e0, Math.Max(e1, e2));
+                double width = longest > 1e-9 ? 2.0 * area / longest : 0.0;
+                float ylo = Math.Min(r.VertsXyz[a * 3 + 1], Math.Min(r.VertsXyz[b * 3 + 1], r.VertsXyz[c * 3 + 1]));
+                float yhi = Math.Max(r.VertsXyz[a * 3 + 1], Math.Max(r.VertsXyz[b * 3 + 1], r.VertsXyz[c * 3 + 1]));
+                float fcx = (r.VertsXyz[a * 3] + r.VertsXyz[b * 3] + r.VertsXyz[c * 3]) / 3f;
+                float fcz = (r.VertsXyz[a * 3 + 2] + r.VertsXyz[b * 3 + 2] + r.VertsXyz[c * 3 + 2]) / 3f;
+                bool inStair = fcx >= 1117.0f - 0.3f && fcx <= 1123.6f + 0.3f
+                    && fcz >= 1072.1f - 0.3f && fcz <= 1087.6f + 0.3f;
+                bool drop = slope >= 15.0 && slope <= 60.0
+                    && (inStair || (width < 0.8 && yhi - ylo > 0.3f));
+                if (drop) { dropped++; continue; }
+                int baseI = kv.Count / 3;
+                kv.Add(r.VertsXyz[a * 3]); kv.Add(r.VertsXyz[a * 3 + 1]); kv.Add(r.VertsXyz[a * 3 + 2]);
+                kv.Add(r.VertsXyz[b * 3]); kv.Add(r.VertsXyz[b * 3 + 1]); kv.Add(r.VertsXyz[b * 3 + 2]);
+                kv.Add(r.VertsXyz[c * 3]); kv.Add(r.VertsXyz[c * 3 + 1]); kv.Add(r.VertsXyz[c * 3 + 2]);
+                kt.Add(baseI); kt.Add(baseI + 1); kt.Add(baseI + 2);
+            }
+            string fp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_nav_filtered.obj");
+            WriteObjRaw(kv.ToArray(), kt.ToArray(), fp);
+            Console.WriteLine("filter: dropped=" + dropped + " kept=" + (kt.Count / 3) + " obj=" + fp);
+        }
     }
 
     private static void WriteObj(TiledNavMeshBuilder.VoxelMeshResult r, string path)
@@ -7971,6 +8021,20 @@ internal static class Program
             sb.Append("f ").Append(r.Tris[f * 3] + 1).Append(' ')
               .Append(r.Tris[f * 3 + 1] + 1).Append(' ')
               .Append(r.Tris[f * 3 + 2] + 1).Append('\n');
+        System.IO.File.WriteAllText(path, sb.ToString());
+    }
+
+    private static void WriteObjRaw(float[] verts, int[] tris, string path)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < verts.Length / 3; i++)
+            sb.Append("v ").Append(verts[i * 3].ToString("F3")).Append(' ')
+              .Append(verts[i * 3 + 1].ToString("F3")).Append(' ')
+              .Append(verts[i * 3 + 2].ToString("F3")).Append('\n');
+        for (int f = 0; f < tris.Length / 3; f++)
+            sb.Append("f ").Append(tris[f * 3] + 1).Append(' ')
+              .Append(tris[f * 3 + 1] + 1).Append(' ')
+              .Append(tris[f * 3 + 2] + 1).Append('\n');
         System.IO.File.WriteAllText(path, sb.ToString());
     }
 
