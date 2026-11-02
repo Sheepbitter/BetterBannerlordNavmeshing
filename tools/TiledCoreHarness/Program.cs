@@ -779,16 +779,6 @@ internal static class Program
             Test25_LadderSlopeExemption();
             return;
         }
-        if (args != null && args.Length > 0 && args[0] == "--doorsweep")
-        {
-            DoorwaySweep();
-            return;
-        }
-        if (args != null && args.Length > 0 && args[0] == "--doorradius")
-        {
-            DoorRadiusSweep();
-            return;
-        }
 
         Console.WriteLine("== TiledNavMeshBuilder standalone harness (net472 / C# 7.3) ==");
         Console.WriteLine("processors = " + Environment.ProcessorCount);
@@ -1145,7 +1135,6 @@ internal static class Program
                     // with the census rows.
                     n++;
                     Console.WriteLine("  [" + n + "] '" + rec.Name + "' flags=0x" + rec.Flags.ToString("X8")
-                        + " gate=" + rec.Gate
                         + (SteppedPropRamps.IsSteppedOrLadder(rec.Flags) ? " STEPPED/LADDER" : "")
                         + " tris=" + (rec.Tris.Length / 3)
                         + " X=[" + x0.ToString("F2") + ".." + x1.ToString("F2") + "]"
@@ -7852,129 +7841,6 @@ internal static class Program
     {
         return x >= x0 && x <= x1 && y >= y0 && y <= y1 && z >= z0 && z <= z1;
     }
-
-    // ---- Doorway size sweep: flat vs arched openings, 0.1 m steps --------------------------------
-    // Builds a simple 10 x 10 floor with a 0.2 m wall at x=5 and an opening of width w and height h.
-    // Connects a probe on each side; prints a grid so the actual threshold is visible instead of
-    // guessed. No ladder is involved: this isolates the doorway (height/width) from the climb.
-    private static void DoorwaySweep()
-    {
-        Console.WriteLine("== doorway sweep (flat vs arch, cs=0.25, radius=0.25) ==");
-        float[] agentHeights = { 1.8f, 1.7f, 1.6f };
-        for (int ai = 0; ai < agentHeights.Length; ai++)
-        {
-            float ah = agentHeights[ai];
-            var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
-            s.AgentHeightMeters = ah;
-            s.UseDetailMesh = false;
-            s.CleanupSlivers = false;
-            s.GatePlateBlend = false;
-            s.QuadMerge = false;
-            s.PruneIsolatedIslands = false;
-            s.VoxelCellSizeMeters = 0.25f;
-            int wh = (int)Math.Ceiling(ah / s.CellHeightMeters);
-            Console.WriteLine("-- agentHeight=" + ah.ToString("F1") + " m -> walkableHeight=" + wh
-                + " cells (" + (wh * s.CellHeightMeters).ToString("F1") + " m) --");
-            for (int shape = 0; shape < 2; shape++)
-            {
-                bool arch = shape == 1;
-                Console.WriteLine("  " + (arch ? "ARCH" : "FLAT") + "   h\\w  0.5 .. 3.0 in 0.1 m steps (Y=connected)");
-                for (float h = 1.0f; h <= 2.401f; h += 0.1f)
-                {
-                    var row = new System.Text.StringBuilder("    h=" + h.ToString("F1") + "  ");
-                    for (float w = 0.5f; w <= 3.001f; w += 0.1f)
-                    {
-                        bool conn = DoorwayConnects(s, w, h, arch);
-                        row.Append(conn ? "Y" : ".");
-                    }
-                    Console.WriteLine(row.ToString());
-                }
-            }
-        }
-    }
-
-    // Radius-only sweep: how the flat-doorway width threshold moves as the agent radius shrinks.
-    // Recast erodes ceil(radius/cs) cells, so 0.25..0.05 are all ONE cell at cs=0.25; only radius 0
-    // removes the inset. This prints that explicitly instead of assuming.
-    private static void DoorRadiusSweep()
-    {
-        Console.WriteLine("== doorway radius sweep (flat, agentHeight=1.8, cs=0.25) ==");
-        float[] radii = { 0.25f, 0.20f, 0.15f, 0.10f, 0.05f, 0.0f };
-        float[] hs = { 1.8f, 1.9f, 2.0f };
-        for (int ri = 0; ri < radii.Length; ri++)
-        {
-            var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
-            s.AgentRadiusMeters = radii[ri];
-            s.VoxelCellSizeMeters = 0.25f;
-            s.UseDetailMesh = false;
-            s.CleanupSlivers = false;
-            s.GatePlateBlend = false;
-            s.QuadMerge = false;
-            s.PruneIsolatedIslands = false;
-            int wr = radii[ri] <= 0f ? 0 : (int)Math.Ceiling(radii[ri] / s.VoxelCellSizeMeters);
-            Console.WriteLine("-- radius=" + radii[ri].ToString("F2") + " m -> walkableRadius=" + wr
-                + " cell(s) (" + (wr * s.VoxelCellSizeMeters).ToString("F2") + " m) --");
-            for (int hi = 0; hi < hs.Length; hi++)
-            {
-                var row = new System.Text.StringBuilder("    h=" + hs[hi].ToString("F1") + "  ");
-                for (float w = 0.5f; w <= 3.001f; w += 0.1f)
-                    row.Append(DoorwayConnects(s, w, hs[hi], false) ? "Y" : ".");
-                Console.WriteLine(row.ToString());
-            }
-        }
-    }
-
-    private static bool DoorwayConnects(TiledNavMeshBuilder.TiledNavMeshSettings s, float w, float h, bool arch)    {
-        var v = new List<float>();
-        var t = new List<int>();
-        BuildDoorwayScene(v, t, w, h, arch);
-        float[] mx;
-        int[] mt;
-        TiledNavMeshBuilder.BuildCombinedSoup(new float[0], new int[0], v.ToArray(), t.ToArray(),
-            out mx, out mt, out int _f);
-        TiledNavMeshBuilder.VoxelMeshResult r = TiledNavMeshBuilder.Build(
-            mx, mt, s, Environment.ProcessorCount, null, null, null);
-        int[] fp = FaceComponents(r, out _);
-        int a = FaceAt(r, 4.0f, 5f, 0.2f, 0.9f);
-        int b = FaceAt(r, 7.0f, 5f, 0.2f, 0.9f);
-        return a >= 0 && b >= 0 && Find(fp, a) == Find(fp, b);
-    }
-
-    private static void BuildDoorwayScene(List<float> v, List<int> t, float w, float h, bool arch)
-    {
-        const float wallX0 = 5.0f, wallX1 = 6.0f, wallTop = 6.0f, floorTop = 0.2f;
-        float halfW = 0.5f * w;
-        float r = halfW;
-        float R = h >= r ? 0f : (r * r + h * h) / (2f * h);   // segmental arch radius when h < r
-        float spring = h >= r ? (h - r) : (R - h);
-        // Floor is split around the wall; the opening gets its own sill. Never put a floor surface
-        // under the solid wall: Recast rasterises surfaces, so a floor under a wall would make the
-        // wall base walkable and the fixture would test the wrong thing.
-        AddBoxZ(v, t, 0f, 0f, floorTop - 0.2f, wallX0, 10f, floorTop);
-        AddBoxZ(v, t, wallX1, 0f, floorTop - 0.2f, 10f, 10f, floorTop);
-        AddBoxZ(v, t, wallX0, 5f - halfW, floorTop - 0.2f, wallX1, 5f + halfW, floorTop);
-        for (float y0 = 0f; y0 < 10f - 1e-4f; y0 += 0.2f)
-        {
-            float y1 = y0 + 0.2f;
-            float yc = 0.5f * (y0 + y1);
-            float openTop = floorTop;
-            if (Math.Abs(yc - 5f) <= halfW)
-            {
-                if (!arch) openTop = floorTop + h;
-                else
-                {
-                    float dy = yc - 5f;
-                    float rad = h >= r ? r : R;
-                    float dz = (float)Math.Sqrt(Math.Max(0f, rad * rad - dy * dy));
-                    openTop = floorTop + spring + dz - (h >= r ? 0f : (R - h));
-                }
-            }
-            if (openTop < floorTop) openTop = floorTop;
-            if (openTop >= wallTop) continue;
-            AddBoxZ(v, t, wallX0, y0, openTop, wallX1, y1, wallTop);
-        }
-    }
-
 
     private static void Test26_NarrowDoorway()
     {
