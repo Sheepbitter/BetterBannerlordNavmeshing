@@ -267,6 +267,17 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   10 m tile) are real ("The stairs regression is real") and are to be handled by THIS round together with
   the pre-existing V3.52 gate-plate staircase issue (section 9). Do not chase them separately. Attribution
   (2.0 vs 10 m vs both) can be bisected with the harness levers `--conterr` / `--tile` when the round starts.
+- FIXED (2026-11-02): the CC_20 hub/fan at (1120.5, 1077) - `RestoreSplitComponents` no longer restores a
+  face marked as a contour-spike fan. The fan is what joined the wood-heap fragment to the stair column;
+  leaving it dropped lets the tiny fragment island and the post-steep prune removes it. Measured on CC_20
+  (`--ramps on --census 1120.5,1077,6`): the 84.5 deg / 9.08 m2 fan face is gone; the hub is now one
+  60.8 deg / 1.67 m2 steep face, global steep>55 1624 -> 1604, steep area 2897 -> 2866 m2. Post-steep
+  prune removes 3 islands / 12 faces (largest 8 at the hub); islands stay 14. The user's #33/#34 landing
+  remains flat 117.10, and Birtu is unchanged (43830 faces / 5 islands). Full suite otherwise green
+  (Test 26 and Test 23 pass).
+- Remaining for this round: the user's report that earlier connectivity fixes made ordinary staircases
+  jump a few steps before the bottom (needs in-editor verification on this build); the 2.0 vox / 10 m
+  default attribution; and stair tread coverage/visual quality beyond the hub.
 
 ## 5. Fixture refresh (queued/partially done)
 

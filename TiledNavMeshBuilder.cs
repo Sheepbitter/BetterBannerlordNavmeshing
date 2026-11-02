@@ -5982,6 +5982,7 @@ namespace BetterBannerlordNavmeshing
                         }
                         if (!twoSides) continue;                 // touches one fragment only: cannot bridge
                         bool isSpike = spike != null && spike[f];
+                        if (isSpike) continue;                   // never force a contour-spike fan back
                         bool better = isSpike != bestSpike
                             ? !isSpike                              // never pick a fan while a plain face can
                             : (touched > bestTouch || (touched == bestTouch && size > bestSize));
