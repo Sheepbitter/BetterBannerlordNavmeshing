@@ -784,6 +784,11 @@ internal static class Program
             DoorwaySweep();
             return;
         }
+        if (args != null && args.Length > 0 && args[0] == "--doorradius")
+        {
+            DoorRadiusSweep();
+            return;
+        }
 
         Console.WriteLine("== TiledNavMeshBuilder standalone harness (net472 / C# 7.3) ==");
         Console.WriteLine("processors = " + Environment.ProcessorCount);
@@ -7886,8 +7891,37 @@ internal static class Program
         }
     }
 
-    private static bool DoorwayConnects(TiledNavMeshBuilder.TiledNavMeshSettings s, float w, float h, bool arch)
+    // Radius-only sweep: how the flat-doorway width threshold moves as the agent radius shrinks.
+    // Recast erodes ceil(radius/cs) cells, so 0.25..0.05 are all ONE cell at cs=0.25; only radius 0
+    // removes the inset. This prints that explicitly instead of assuming.
+    private static void DoorRadiusSweep()
     {
+        Console.WriteLine("== doorway radius sweep (flat, agentHeight=1.8, cs=0.25) ==");
+        float[] radii = { 0.25f, 0.20f, 0.15f, 0.10f, 0.05f, 0.0f };
+        float[] hs = { 1.8f, 1.9f, 2.0f };
+        for (int ri = 0; ri < radii.Length; ri++)
+        {
+            var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
+            s.AgentRadiusMeters = radii[ri];
+            s.UseDetailMesh = false;
+            s.CleanupSlivers = false;
+            s.GatePlateBlend = false;
+            s.QuadMerge = false;
+            s.PruneIsolatedIslands = false;
+            int wr = radii[ri] <= 0f ? 0 : (int)Math.Ceiling(radii[ri] / s.VoxelCellSizeMeters);
+            Console.WriteLine("-- radius=" + radii[ri].ToString("F2") + " m -> walkableRadius=" + wr
+                + " cell(s) (" + (wr * s.VoxelCellSizeMeters).ToString("F2") + " m) --");
+            for (int hi = 0; hi < hs.Length; hi++)
+            {
+                var row = new System.Text.StringBuilder("    h=" + hs[hi].ToString("F1") + "  ");
+                for (float w = 0.5f; w <= 3.001f; w += 0.1f)
+                    row.Append(DoorwayConnects(s, w, hs[hi], false) ? "Y" : ".");
+                Console.WriteLine(row.ToString());
+            }
+        }
+    }
+
+    private static bool DoorwayConnects(TiledNavMeshBuilder.TiledNavMeshSettings s, float w, float h, bool arch)    {
         var v = new List<float>();
         var t = new List<int>();
         BuildDoorwayScene(v, t, w, h, arch);

@@ -471,6 +471,16 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   locally exempt doorway region. Lowering `AgentHeightMeters` to 1.7 is a no-op; 1.6 only buys 0.1 m of
   height and does not help width, so the shipped default stays 1.8.
 - Reproduce: `TiledCoreHarness --doorsweep` (prints the flat/arch grid for 1.8 / 1.7 / 1.6).
+- RADIUS SWEEP (2026-11-02): `--doorradius` holds agentHeight=1.8 and sweeps the agent radius.
+  - radius 0.25, 0.20, 0.15, 0.10, 0.05 all give walkableRadius = ceil(r/0.25) = **1 cell (0.5 m)** and
+    produce **identical** grids: flat connects only at h>=2.0 **and w>=2.2 m**.
+  - radius 0.00 gives **0 cells** and moves the width threshold to **w>=1.0 m**; the height threshold
+    stays 2.0 m.
+  - So radius is a cliff, not a dial, at cs=0.25: anything above 0 erodes the same one cell. Only
+    radius 0 helps, and it removes the agent inset from the entire map (navmesh tight to walls and
+    ledges), which is not acceptable as a global default.
+- Next: a doorway connector strip (or a locally exempt throat) remains the right fix. Radius tuning
+  alone cannot open a ~1 m doorway without setting the global radius to 0.
 - Next: detect doorway throats geometrically (a short, narrow gap between walls with a floor through it)
   and emit a connector strip, reusing `GateBridgeStrips`/the ladder top-pad exemptions. Validate against
   this sweep first: the strip should connect 0.8-1.2 m doorways without opening walls.
