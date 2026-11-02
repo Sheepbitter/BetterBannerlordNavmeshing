@@ -7860,7 +7860,8 @@ internal static class Program
     private static void DoorwaySweep()
     {
         Console.WriteLine("== doorway sweep (flat vs arch, cs=0.25, radius=0.25) ==");
-        float[] agentHeights = { 1.8f, 1.7f, 1.6f };        for (int ai = 0; ai < agentHeights.Length; ai++)
+        float[] agentHeights = { 1.8f, 1.7f, 1.6f };
+        for (int ai = 0; ai < agentHeights.Length; ai++)
         {
             float ah = agentHeights[ai];
             var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
@@ -7870,6 +7871,7 @@ internal static class Program
             s.GatePlateBlend = false;
             s.QuadMerge = false;
             s.PruneIsolatedIslands = false;
+            s.VoxelCellSizeMeters = 0.25f;
             int wh = (int)Math.Ceiling(ah / s.CellHeightMeters);
             Console.WriteLine("-- agentHeight=" + ah.ToString("F1") + " m -> walkableHeight=" + wh
                 + " cells (" + (wh * s.CellHeightMeters).ToString("F1") + " m) --");
@@ -7903,6 +7905,7 @@ internal static class Program
         {
             var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
             s.AgentRadiusMeters = radii[ri];
+            s.VoxelCellSizeMeters = 0.25f;
             s.UseDetailMesh = false;
             s.CleanupSlivers = false;
             s.GatePlateBlend = false;
@@ -7940,11 +7943,16 @@ internal static class Program
     private static void BuildDoorwayScene(List<float> v, List<int> t, float w, float h, bool arch)
     {
         const float wallX0 = 5.0f, wallX1 = 6.0f, wallTop = 6.0f, floorTop = 0.2f;
-        AddBoxZ(v, t, 0f, 0f, floorTop - 0.2f, 10f, 10f, floorTop);
         float halfW = 0.5f * w;
         float r = halfW;
         float R = h >= r ? 0f : (r * r + h * h) / (2f * h);   // segmental arch radius when h < r
         float spring = h >= r ? (h - r) : (R - h);
+        // Floor is split around the wall; the opening gets its own sill. Never put a floor surface
+        // under the solid wall: Recast rasterises surfaces, so a floor under a wall would make the
+        // wall base walkable and the fixture would test the wrong thing.
+        AddBoxZ(v, t, 0f, 0f, floorTop - 0.2f, wallX0, 10f, floorTop);
+        AddBoxZ(v, t, wallX1, 0f, floorTop - 0.2f, 10f, 10f, floorTop);
+        AddBoxZ(v, t, wallX0, 5f - halfW, floorTop - 0.2f, wallX1, 5f + halfW, floorTop);
         for (float y0 = 0f; y0 < 10f - 1e-4f; y0 += 0.2f)
         {
             float y1 = y0 + 0.2f;

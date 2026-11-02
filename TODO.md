@@ -451,31 +451,27 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   generally struggles with small native doorways. The door is small enough that a full-height
   character would clip its head. This is a doorway-handling issue, not a ladder-climb issue (Basamu
   ladders work).
-- MEASURED with `--doorsweep` (harness): a 10 x 10 floor, a 1.0 m thick wall at x=5, and a flat or
-  arched opening swept in 0.1 m steps. cs=0.25, radius=0.25, region defaults. Y = the two sides are
-  connected.
-  - `agentHeight=1.8 m` (walkableHeight 9 cells): FLAT connects only at **h >= 2.0 m AND w >= 2.2 m**.
+- MEASURED with `--doorsweep` (harness): a 10 x 10 floor split around a 1.0 m thick wall at x=5, with
+  a flat or arched opening swept in 0.1 m steps. cs=0.25, radius=0.25, region defaults. Y = the two
+  sides are connected. (The first sweep accidentally used the bare builder default cs=0.5; the numbers
+  below are the corrected shipped-config ones.)
+  - `agentHeight=1.8 m` (walkableHeight 9 cells): FLAT connects only at **h >= 2.0 m AND w >= 1.0 m**.
     Below either threshold the sides are separate components.
   - `agentHeight=1.7 m`: **identical** (ceil(1.7/0.2) is still 9 cells, 1.8 m). Changing 1.8 -> 1.7
     therefore has no effect.
-  - `agentHeight=1.6 m` (walkableHeight 8 cells): FLAT height threshold drops to **1.9 m**, width stays
-    **2.2 m**. The width floor is the dominant limit.
-  - ARCH is stricter: at 1.8 m it does not connect anywhere up to 3.0 m wide x 2.4 m high; at 1.6 m it
-    needs w >= 2.8 m at h=2.4 m. The arch narrows toward the top, so the walkable band is thinner than
-    a flat opening of the same apex height.
-  - Width loss (2.2 m for a 1.0 m wall) is the agent-radius erosion (0.5 m total) plus contour/tile
-    margins; height loss is walkableHeight + one cell. It is not a bug in the doorway geometry.
-- Consequence: a native doorway around 1 m wide / <2 m high cannot pass ordinary geometry at cs=0.25 /
-  radius=0.25, no matter how the height is nudged. It needs the same treatment as a gate or a ladder top:
-  a forced connector strip through the throat (force-walkable + ledge/clearance/erosion exempt), or a
-  locally exempt doorway region. Lowering `AgentHeightMeters` to 1.7 is a no-op; 1.6 only buys 0.1 m of
-  height and does not help width, so the shipped default stays 1.8.
+  - `agentHeight=1.6 m` (walkableHeight 8 cells): FLAT height threshold drops to **1.8 m**, width stays
+    **1.0 m**.
+  - ARCH is stricter: at 1.8 m it does not connect anywhere up to 3.0 m wide x 2.4 m high; at 1.6 m
+    h=1.9 needs w>=2.6 m and h=2.0 needs w>=1.5 m. The arch narrows toward the top.
+- Consequence: a ~1.0 m wide, <2.0 m high native doorway is exactly at/below the ordinary threshold.
+  Lowering the agent height to 1.7 is a no-op; 1.6 buys 0.2 m of height and gets Birtu's
+  `civilian_ladder_5m` from 0% to 20% coverage, but the last 0.25 m still does not connect. A doorway
+  link/strip (or a smaller agent type) is still needed for the short case.
 - Reproduce: `TiledCoreHarness --doorsweep` (prints the flat/arch grid for 1.8 / 1.7 / 1.6).
-- RADIUS SWEEP (2026-11-02): `--doorradius` holds agentHeight=1.8 and sweeps the agent radius.
-  - radius 0.25, 0.20, 0.15, 0.10, 0.05 all give walkableRadius = ceil(r/0.25) = **1 cell (0.5 m)** and
-    produce **identical** grids: flat connects only at h>=2.0 **and w>=2.2 m**.
-  - radius 0.00 gives **0 cells** and moves the width threshold to **w>=1.0 m**; the height threshold
-    stays 2.0 m.
+- RADIUS SWEEP (2026-11-02, cs=0.25): `--doorradius` holds agentHeight=1.8 and sweeps the agent radius.
+  - radius 0.25, 0.20, 0.15, 0.10, 0.05 all give walkableRadius = ceil(r/0.25) = **1 cell (0.25 m)** and
+    produce **identical** grids: flat connects only at h>=2.0 **and w>=1.0 m**.
+  - radius 0.00 gives **0 cells** and moves the width threshold to **w>=0.6 m**; height stays 2.0 m.
   - So radius is a cliff, not a dial, at cs=0.25: anything above 0 erodes the same one cell. Only
     radius 0 helps, and it removes the agent inset from the entire map (navmesh tight to walls and
     ledges), which is not acceptable as a global default.
@@ -484,6 +480,26 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
     (303.043,316.126)). Radius 0 alone does not cross the doorway; it only removes the erosion loss.
 - Next: a doorway connector strip (or a locally exempt throat) remains the right fix. Radius tuning
   alone cannot open a ~1 m doorway without setting the global radius to 0.
+- INDUSTRY PRACTICE (researched 2026-11-02):
+  - Recast/Unreal guidance: agent radius is fine-tuning; for tight areas use **cell size / tile size**
+    (finer cells) or a **smaller agent type**, not a global radius change. Unreal's Recast also exposes
+    nav links for doors.
+  - Unity: narrow passages are carved out when `door width < 2 * agent radius`; the standard answers are
+    a smaller bake radius / separate agent type, a **NavMesh Link / Off-Mesh Link** across the door, or
+    an area-type override (a `Door` area excluded per agent).
+  - Godot: separate navigation regions/links; doorways handled by links rather than forcing geometry.
+  - Common thread: **do not expect the geometric navmesh to pass a sub-agent-size door**. Represent the
+    door as a LINK (off-mesh/nav link) or a separate agent type. Our `GateBridgeStrips` is the same idea.
+- STRIP/EXEMPTION ATTEMPTS (2026-11-02, reverted - kept on `exp/ladder-raster` where relevant):
+  - Merge-stitch relaxation with min strip width 0.6 m / max gap 2.0 m / 1.2 m low clearance: produced
+    12 "doorway strips" on Birtu but no coverage change; the nearest boundary edges are the wall faces,
+    so a min-width quad is wider than the opening and the low envelope stays blocked.
+  - Heightfield corridor detection (short narrow band, rooms at both ends) + restore after erosion:
+    marked 6160 cells on Birtu and 32 in the synthetic case, but the sweep threshold stayed 1.0 x 2.0.
+    The throat is also lost at the ledge/clearance stage, so erosion restore alone cannot fix it.
+  - Conclusion: a correct door strip needs **opening detection** (width from the actual throat, not the
+    nearest wall edge) applied BEFORE the ledge/clearance filters, or a true link/face-group. That is
+    the next implementation, not another radius/height tweak.
 - Next: detect doorway throats geometrically (a short, narrow gap between walls with a floor through it)
   and emit a connector strip, reusing `GateBridgeStrips`/the ladder top-pad exemptions. Validate against
   this sweep first: the strip should connect 0.8-1.2 m doorways without opening walls.
