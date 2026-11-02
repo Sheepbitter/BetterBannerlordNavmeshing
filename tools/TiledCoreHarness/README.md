@@ -35,6 +35,7 @@ TiledCoreHarness.exe > suite.txt
 | *(no args)* | Full 29-test acceptance suite + doorway sweep |
 | `--test11` | Test 11 only (multi-level assets). For triage after a tile/contour change |
 | `--test25` | Test 25 only (ladder slope exemption). The suite's one known red - see *Known documented failure* |
+| `--doorsweep` | Doorway size sweep, no ladder: flat vs arched openings at 0.1 m width/height steps for agent heights 1.8/1.7/1.6 m. Prints a connectivity grid; see `TODO.md` #13 |
 | `--quadtest` | Test 27 only (quad merge + NMG8 writer round trip). Seconds; good smoke test |
 | `--barriers` | Barrier honour-mask rule check (`BarrierBlocksAgents` over the four engine masks) |
 | `--barriercase` | The CC_20_siege barrier regression case: builds the snapshot twice, barriers off vs on, and compares the mesh at the user's crossing |

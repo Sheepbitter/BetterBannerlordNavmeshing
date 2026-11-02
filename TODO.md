@@ -445,6 +445,36 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
 - Acceptance: Birtu `civilian_ladder_5m/6m` coverage near 100% with `--ramps on`, `--test25` PASS,
   full suite green elsewhere, module build clean.
 
+## 13. Native small doorways are below the ordinary connectivity threshold (measured)
+
+- USER REPORT (2026-11-02): the Birtu ladder-top doorway is open but **short and thin**; the tool
+  generally struggles with small native doorways. The door is small enough that a full-height
+  character would clip its head. This is a doorway-handling issue, not a ladder-climb issue (Basamu
+  ladders work).
+- MEASURED with `--doorsweep` (harness): a 10 x 10 floor, a 1.0 m thick wall at x=5, and a flat or
+  arched opening swept in 0.1 m steps. cs=0.25, radius=0.25, region defaults. Y = the two sides are
+  connected.
+  - `agentHeight=1.8 m` (walkableHeight 9 cells): FLAT connects only at **h >= 2.0 m AND w >= 2.2 m**.
+    Below either threshold the sides are separate components.
+  - `agentHeight=1.7 m`: **identical** (ceil(1.7/0.2) is still 9 cells, 1.8 m). Changing 1.8 -> 1.7
+    therefore has no effect.
+  - `agentHeight=1.6 m` (walkableHeight 8 cells): FLAT height threshold drops to **1.9 m**, width stays
+    **2.2 m**. The width floor is the dominant limit.
+  - ARCH is stricter: at 1.8 m it does not connect anywhere up to 3.0 m wide x 2.4 m high; at 1.6 m it
+    needs w >= 2.8 m at h=2.4 m. The arch narrows toward the top, so the walkable band is thinner than
+    a flat opening of the same apex height.
+  - Width loss (2.2 m for a 1.0 m wall) is the agent-radius erosion (0.5 m total) plus contour/tile
+    margins; height loss is walkableHeight + one cell. It is not a bug in the doorway geometry.
+- Consequence: a native doorway around 1 m wide / <2 m high cannot pass ordinary geometry at cs=0.25 /
+  radius=0.25, no matter how the height is nudged. It needs the same treatment as a gate or a ladder top:
+  a forced connector strip through the throat (force-walkable + ledge/clearance/erosion exempt), or a
+  locally exempt doorway region. Lowering `AgentHeightMeters` to 1.7 is a no-op; 1.6 only buys 0.1 m of
+  height and does not help width, so the shipped default stays 1.8.
+- Reproduce: `TiledCoreHarness --doorsweep` (prints the flat/arch grid for 1.8 / 1.7 / 1.6).
+- Next: detect doorway throats geometrically (a short, narrow gap between walls with a floor through it)
+  and emit a connector strip, reusing `GateBridgeStrips`/the ladder top-pad exemptions. Validate against
+  this sweep first: the strip should connect 0.8-1.2 m doorways without opening walls.
+
 ## 7. Persist the acceptance suite in the repo (accepted; queued - no repo changes yet)
 
 - The 27-test harness suite (plus flagged modes: barriers, quadtest) lives only in the temp harness project
