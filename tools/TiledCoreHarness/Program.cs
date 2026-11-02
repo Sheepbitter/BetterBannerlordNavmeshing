@@ -779,6 +779,11 @@ internal static class Program
             Test25_LadderSlopeExemption();
             return;
         }
+        if (args != null && args.Length > 0 && args[0] == "--extractstair")
+        {
+            ExtractStair(args);
+            return;
+        }
 
         Console.WriteLine("== TiledNavMeshBuilder standalone harness (net472 / C# 7.3) ==");
         Console.WriteLine("processors = " + Environment.ProcessorCount);
@@ -7738,6 +7743,235 @@ internal static class Program
             + " HasSteps is still refused; a 60 deg ladder still connects (KNOWN RED: the leaning case"
             + " loses its on-plane chain - see the comment in case (c))");
         Console.WriteLine("  LADDER-CAP TEST: " + (ok ? "PASS" : "FAIL"));
+    }
+
+    // ---- Real-prop extraction of the CC_20 staircase area --------------------------------------
+    // Pulls the props around (1119,1079) out of a recorded snapshot, adds a flat ground at z=112.98,
+    // and rebuilds just that area. --hassteps additionally marks european_castle_ladder as a stepped
+    // prop (the user's experiment). Writes the extracted navmesh to %TEMP%\stair_extract_nav.obj so
+    // the actual strip can be inspected outside the editor.
+    private static void ExtractStair(string[] args)
+    {
+        if (args.Length < 3)
+        {
+            Console.WriteLine("usage: --extractstair <terrain.bin> <assets.bin> [--hassteps]");
+            return;
+        }
+        bool hasSteps = Array.IndexOf(args, "--hassteps") >= 0;
+        bool minimal = Array.IndexOf(args, "--minimal") >= 0;
+        SceneSnapshot.TerrainData terrain = SceneSnapshot.ReadTerrainBin(args[1]);
+        List<SceneSnapshot.EntityRecord> assets = SceneSnapshot.ReadAssetsBin(args[2]);
+        Console.WriteLine("extract: assets=" + assets.Count + " hasSteps=" + hasSteps);
+
+        var specs = new[]
+        {
+            new[] { "european_castle_ladder", "1119.57", "1079.10" },
+            new[] { "bd_wood_heap_b", "1119.90", "1080.06" },
+            new[] { "castle_wall_9_b", "1115.30", "1078.19" },
+            new[] { "bd_wood_heap_e", "1118.35", "1074.96" },
+            new[] { "rock_cliff_a", "1106.15", "1093.32" },
+            new[] { "european_castle_wall_a_damaged_heap_b", "1123.38", "1084.13" },
+        };
+        var picked = new List<SceneSnapshot.EntityRecord>();
+        for (int i = 0; i < specs.Length; i++)
+        {
+            string name = specs[i][0];
+            float ox = (float)ParseFloat(specs[i][1]), oz = (float)ParseFloat(specs[i][2]);
+            SceneSnapshot.EntityRecord best = null;
+            double bestD = double.MaxValue;
+            for (int e = 0; e < assets.Count; e++)
+            {
+                SceneSnapshot.EntityRecord rec = assets[e];
+                if (rec.Name != name) continue;
+                float x0 = float.MaxValue, x1 = float.MinValue, y0 = float.MaxValue, y1 = float.MinValue;
+                for (int vi = 0; vi < rec.VertsXyz.Length; vi += 3)
+                {
+                    float vx = rec.VertsXyz[vi], vy = rec.VertsXyz[vi + 1];
+                    if (vx < x0) x0 = vx; if (vx > x1) x1 = vx;
+                    if (vy < y0) y0 = vy; if (vy > y1) y1 = vy;
+                }
+                double dx = (x0 + x1) * 0.5 - ox, dz = (y0 + y1) * 0.5 - oz;
+                double d = dx * dx + dz * dz;
+                if (d < bestD) { bestD = d; best = rec; }
+            }
+            if (best == null) { Console.WriteLine("  MISSING " + name); continue; }
+            if (minimal && name != "european_castle_ladder") continue;
+            picked.Add(best);
+            Console.WriteLine("  picked '" + name + "' tris=" + (best.Tris.Length / 3)
+                + " flags=0x" + best.Flags.ToString("X8") + " dist=" + Math.Sqrt(bestD).ToString("F2"));
+        }
+
+        var av = new List<float>();
+        var at = new List<int>();
+        var exempt = new List<bool>();
+        for (int pi = 0; pi < picked.Count; pi++)
+        {
+            if (picked[pi].Name != "european_castle_ladder") continue;
+            SceneSnapshot.EntityRecord lr = picked[pi];
+            var bands = new int[130];
+            int flat = 0;
+            for (int t = 0; t < lr.Tris.Length / 3; t++)
+            {
+                int a = lr.Tris[t * 3], b = lr.Tris[t * 3 + 1], c = lr.Tris[t * 3 + 2];
+                double ux = lr.VertsXyz[b * 3] - lr.VertsXyz[a * 3];
+                double uy = lr.VertsXyz[b * 3 + 1] - lr.VertsXyz[a * 3 + 1];
+                double uz = lr.VertsXyz[b * 3 + 2] - lr.VertsXyz[a * 3 + 2];
+                double vx = lr.VertsXyz[c * 3] - lr.VertsXyz[a * 3];
+                double vy = lr.VertsXyz[c * 3 + 1] - lr.VertsXyz[a * 3 + 1];
+                double vz = lr.VertsXyz[c * 3 + 2] - lr.VertsXyz[a * 3 + 2];
+                double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                if (len < 1e-12) continue;
+                double deg = Math.Acos(Math.Min(1.0, Math.Abs(ny) / len)) * 180.0 / Math.PI;
+                if (deg > 15.0) continue;
+                flat++;
+                float h = (lr.VertsXyz[a * 3 + 2] + lr.VertsXyz[b * 3 + 2] + lr.VertsXyz[c * 3 + 2]) / 3f;
+                int bi = (int)Math.Floor(h);
+                if (bi >= 0 && bi < bands.Length) bands[bi]++;
+            }
+            var hs = new System.Text.StringBuilder("  ladder flat tris=" + flat + " bands:");
+            for (int bi = 100; bi < bands.Length; bi++) if (bands[bi] > 0) hs.Append(" ").Append(bi).Append("=").Append(bands[bi]);
+            Console.WriteLine(hs.ToString());
+        }        for (int i = 0; i < picked.Count; i++)
+        {
+            SceneSnapshot.EntityRecord rec = picked[i];
+            int baseIndex = av.Count / 3;
+            for (int k = 0; k < rec.VertsXyz.Length; k++) av.Add(rec.VertsXyz[k]);
+            for (int k = 0; k < rec.Tris.Length; k++) at.Add(rec.Tris[k] + baseIndex);
+            bool mark = hasSteps && rec.Name == "european_castle_ladder";
+            for (int k = 0; k < rec.Tris.Length / 3; k++) exempt.Add(mark);
+        }
+        // Ground at z=112.98 (the user's value), covering the courtyard around these props.
+        AddBoxZ(av, at, 1105f, 1068f, 112.78f, 1130f, 1095f, 112.98f);
+        // Small landing at the top of the staircase (the reported platform; the barrier line there is
+        // 123.56). Without it the upper flight has nothing to connect to in the mini-scene.
+        AddBoxZ(av, at, 1117.5f, 1077.0f, 123.36f, 1122.5f, 1082.5f, 123.56f);
+        for (int k = 0; k < 2; k++) exempt.Add(false); // AddBoxZ emits 12 tris each
+        while (exempt.Count < at.Count / 3) exempt.Add(false);
+
+        float[] mx; int[] mt;
+        TiledNavMeshBuilder.BuildCombinedSoup(new float[0], new int[0], av.ToArray(), at.ToArray(),
+            out mx, out mt, out int _f);
+        var s = new TiledNavMeshBuilder.TiledNavMeshSettings();
+        s.VoxelCellSizeMeters = 0.25f;
+        s.TileWorldSizeMeters = 8f;
+        s.UseDetailMesh = true;
+        s.StitchMaxGapCells = 6;
+        s.PruneIsolatedIslands = false;   // the mini scene is below the 400-face island cap
+        s.GatePlateBlend = false;     // isolate the stair/props, not the gate blend
+        Console.WriteLine("build: soupV=" + (mx.Length / 3) + " soupT=" + (mt.Length / 3)
+            + " exempt=" + CountTrue(exempt.ToArray()));
+        {
+            var fv = new List<float>(); var ft = new List<int>();
+            AddBoxZ(fv, ft, 1105f, 1068f, 112.78f, 1110f, 1073f, 112.98f);
+            float[] fmx; int[] fmt;
+            TiledNavMeshBuilder.BuildCombinedSoup(new float[0], new int[0], fv.ToArray(), ft.ToArray(),
+                out fmx, out fmt, out int _ff);
+            var fr = TiledNavMeshBuilder.Build(fmx, fmt, s, Environment.ProcessorCount, null, null, null);
+            Console.WriteLine("sanity floor-only (world coords) F=" + fr.FaceCount);
+            var gv = new List<float>(); var gt = new List<int>();
+            AddBoxZ(gv, gt, 0f, 0f, 112.78f, 5f, 5f, 112.98f);
+            TiledNavMeshBuilder.BuildCombinedSoup(new float[0], new int[0], gv.ToArray(), gt.ToArray(),
+                out fmx, out fmt, out int _gg);
+            var gr = TiledNavMeshBuilder.Build(fmx, fmt, s, Environment.ProcessorCount, null, null, null);
+            Console.WriteLine("sanity floor-only (origin coords) F=" + gr.FaceCount);
+        }
+        TiledNavMeshBuilder.VoxelMeshResult r = TiledNavMeshBuilder.Build(
+            mx, mt, s, Environment.ProcessorCount, null, null, exempt.ToArray());
+        int islandCount;
+        int[] compFp = FaceComponents(r, out islandCount);
+        Console.WriteLine("nav: F=" + r.FaceCount + " islands=" + islandCount
+            + " steep60=" + r.SteepFaces + " tallSteep=" + r.SteepTallFaces
+            + " invariants=" + (r.InvariantsPassed ? "PASS" : "FAIL"));
+        {
+            var stats = new Dictionary<int, int[]>();
+            for (int f = 0; f < r.FaceCount; f++)
+            {
+                int root = Find(compFp, f);
+                int[] st;
+                if (!stats.TryGetValue(root, out st))
+                {
+                    st = new int[] { 0, 0, 0 }; // faces, sloped>20, minY index
+                    stats[root] = st;
+                }
+                st[0]++;
+                float y = FaceCentroidY(r, f);
+                int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+                double ux = r.VertsXyz[b * 3] - r.VertsXyz[a * 3];
+                double uy = r.VertsXyz[b * 3 + 1] - r.VertsXyz[a * 3 + 1];
+                double uz = r.VertsXyz[b * 3 + 2] - r.VertsXyz[a * 3 + 2];
+                double vx = r.VertsXyz[c * 3] - r.VertsXyz[a * 3];
+                double vy = r.VertsXyz[c * 3 + 1] - r.VertsXyz[a * 3 + 1];
+                double vz = r.VertsXyz[c * 3 + 2] - r.VertsXyz[a * 3 + 2];
+                double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                double deg = len > 1e-12 ? Math.Acos(Math.Min(1.0, Math.Abs(ny) / len)) * 180.0 / Math.PI : 0.0;
+                if (deg > 20.0) st[1]++;
+                if (y < st[2] || st[2] == 0) st[2] = (int)(y * 10);
+            }
+            var order = new List<int>(stats.Keys);
+            order.Sort(delegate (int a, int b) { return stats[b][0].CompareTo(stats[a][0]); });
+            Console.WriteLine("  components (top 12):");
+            for (int i = 0; i < order.Count && i < 12; i++)
+            {
+                int root = order[i];
+                float ylo = float.MaxValue, yhi = float.MinValue;
+                for (int f = 0; f < r.FaceCount; f++)
+                    if (Find(compFp, f) == root)
+                    {
+                        float y = FaceCentroidY(r, f);
+                        if (y < ylo) ylo = y;
+                        if (y > yhi) yhi = y;
+                    }
+                Console.WriteLine("    comp faces=" + stats[root][0] + " sloped>20=" + stats[root][1]
+                    + " y=[" + ylo.ToString("F1") + ".." + yhi.ToString("F1") + "]");
+            }
+        }
+
+        // Report sloped faces inside the ladder AABB: this is where the side strip appears.
+        float lx0 = 1117.0f, lx1 = 1123.6f, ly0 = 1072.1f, ly1 = 1087.6f;
+        int shown = 0;
+        for (int f = 0; f < r.FaceCount && shown < 40; f++)
+        {
+            int a = r.Tris[f * 3], b = r.Tris[f * 3 + 1], c = r.Tris[f * 3 + 2];
+            float cx = (r.VertsXyz[a * 3] + r.VertsXyz[b * 3] + r.VertsXyz[c * 3]) / 3f;
+            float cz = (r.VertsXyz[a * 3 + 2] + r.VertsXyz[b * 3 + 2] + r.VertsXyz[c * 3 + 2]) / 3f;
+            if (cx < lx0 || cx > lx1 || cz < ly0 || cz > ly1) continue;
+            double ux = r.VertsXyz[b * 3] - r.VertsXyz[a * 3];
+            double uy = r.VertsXyz[b * 3 + 1] - r.VertsXyz[a * 3 + 1];
+            double uz = r.VertsXyz[b * 3 + 2] - r.VertsXyz[a * 3 + 2];
+            double vx = r.VertsXyz[c * 3] - r.VertsXyz[a * 3];
+            double vy = r.VertsXyz[c * 3 + 1] - r.VertsXyz[a * 3 + 1];
+            double vz = r.VertsXyz[c * 3 + 2] - r.VertsXyz[a * 3 + 2];
+            double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+            double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+            if (len < 1e-12) continue;
+            double deg = Math.Acos(Math.Min(1.0, Math.Abs(ny) / len)) * 180.0 / Math.PI;
+            if (deg < 20.0 || deg > 80.0) continue;
+            float ylo = Math.Min(r.VertsXyz[a * 3 + 1], Math.Min(r.VertsXyz[b * 3 + 1], r.VertsXyz[c * 3 + 1]));
+            float yhi = Math.Max(r.VertsXyz[a * 3 + 1], Math.Max(r.VertsXyz[b * 3 + 1], r.VertsXyz[c * 3 + 1]));
+            if (yhi - ylo < 0.3f) continue;
+            Console.WriteLine("  sloped f" + f + " c=(" + cx.ToString("F1") + "," + (ylo + yhi) * 0.5f
+                + "," + cz.ToString("F1") + ") slope=" + deg.ToString("F1") + " y=["
+                + ylo.ToString("F1") + ".." + yhi.ToString("F1") + "]");
+            shown++;
+        }
+        WriteObj(r, System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_nav.obj"));
+        Console.WriteLine("obj: " + System.IO.Path.Combine(System.IO.Path.GetTempPath(), "stair_extract_nav.obj"));
+    }
+
+    private static void WriteObj(TiledNavMeshBuilder.VoxelMeshResult r, string path)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < r.VertsXyz.Length / 3; i++)
+            sb.Append("v ").Append(r.VertsXyz[i * 3].ToString("F3")).Append(' ')
+              .Append(r.VertsXyz[i * 3 + 1].ToString("F3")).Append(' ')
+              .Append(r.VertsXyz[i * 3 + 2].ToString("F3")).Append('\n');
+        for (int f = 0; f < r.FaceCount; f++)
+            sb.Append("f ").Append(r.Tris[f * 3] + 1).Append(' ')
+              .Append(r.Tris[f * 3 + 1] + 1).Append(' ')
+              .Append(r.Tris[f * 3 + 2] + 1).Append('\n');
+        System.IO.File.WriteAllText(path, sb.ToString());
     }
 
     // ---- Test 26: a ladder whose top leads through a NARROW doorway ("barely fits a person").

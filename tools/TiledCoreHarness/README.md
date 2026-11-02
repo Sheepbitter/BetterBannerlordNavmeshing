@@ -35,6 +35,7 @@ TiledCoreHarness.exe > suite.txt
 | *(no args)* | Full 29-test acceptance suite + doorway sweep |
 | `--test11` | Test 11 only (multi-level assets). For triage after a tile/contour change |
 | `--test25` | Test 25 only (ladder slope exemption). The suite's one known red - see *Known documented failure* |
+| `--extractstair <terrain.bin> <assets.bin> [--hassteps] [--minimal]` | Real-prop CC_20 staircase extraction: pulls the six props around (1119,1079), adds ground at z=112.98 and a top landing, builds, prints component/slope stats and writes `%TEMP%\stair_extract_nav.obj` |
 | `--quadtest` | Test 27 only (quad merge + NMG8 writer round trip). Seconds; good smoke test |
 | `--barriers` | Barrier honour-mask rule check (`BarrierBlocksAgents` over the four engine masks) |
 | `--barriercase` | The CC_20_siege barrier regression case: builds the snapshot twice, barriers off vs on, and compares the mesh at the user's crossing |
