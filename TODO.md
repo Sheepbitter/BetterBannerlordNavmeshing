@@ -479,6 +479,9 @@ Working list for BetterBannerlordNavmeshing. Newest/current items first.
   - So radius is a cliff, not a dial, at cs=0.25: anything above 0 erodes the same one cell. Only
     radius 0 helps, and it removes the agent inset from the entire map (navmesh tight to walls and
     ledges), which is not acceptable as a global default.
+  - Birtu check: `--ramps on --radius 0 --coverage civilian_ladder` moves `civilian_ladder_5m` from
+    0% to **40%** coverage, but the probe 0.4 m beyond the ladder top still has no face (gap 0.25 m at
+    (303.043,316.126)). Radius 0 alone does not cross the doorway; it only removes the erosion loss.
 - Next: a doorway connector strip (or a locally exempt throat) remains the right fix. Radius tuning
   alone cannot open a ~1 m doorway without setting the global radius to 0.
 - Next: detect doorway throats geometrically (a short, narrow gap between walls with a floor through it)
