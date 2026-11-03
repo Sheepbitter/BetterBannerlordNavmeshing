@@ -46,7 +46,7 @@ namespace BetterBannerlordNavmeshing
         public const bool VoxelGateConnectors = true;
         public const bool VoxelWriteSoupObj = false;
         public const bool VoxelTerrainHoleAudit = false;
-        public const bool CullBelowWaterLevel = false;
+        public const bool CullBelowWaterLevel = true;
         public const bool ConsoleMessages = true;
     }
 
