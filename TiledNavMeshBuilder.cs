@@ -1484,113 +1484,6 @@ namespace BetterBannerlordNavmeshing
                     + " (symbolic ladder links exempted from FilterWalkableLowHeightSpans and erosion)");
             }
 
-            // V3.70 stair-side removal, scoped to flagged (HasSteps/Ladder) props. Cells covered by a stepped
-            // prop's own (ledge-exempt, non-forced) triangles carry the prop's horizontal RUN direction (unit
-            // XZ vector), from a PCA of the group's flat tread triangles. A sloped face whose horizontal
-            // normal is perpendicular to the run is a stringer/rail hanging off the side of the flight; a
-            // legitimate ramp runs ALONG the run. Triangles are grouped by shared XZ cells, not shared
-            // vertices: a collision prop's treads are often vertex-disjoint from its rails.
-            Dictionary<long, float[]> steppedPropCells = null;
-            if (ledgeExemptTriangles != null)
-            {
-                float scs = s.VoxelCellSizeMeters;
-                int stepTris = tris.Length / 3;
-                var ok = new bool[stepTris];
-                for (int t = 0; t < stepTris; t++)
-                    ok[t] = t < ledgeExemptTriangles.Length && ledgeExemptTriangles[t]
-                        && !(forceWalkableTriangles != null && t < forceWalkableTriangles.Length
-                            && forceWalkableTriangles[t]);
-                var uf = new int[stepTris];
-                for (int t = 0; t < stepTris; t++) uf[t] = t;
-                var cellOwner = new Dictionary<long, int>();
-                for (int t = 0; t < stepTris; t++)
-                {
-                    if (!ok[t]) continue;
-                    int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
-                    int x0 = (int)Math.Floor(Math.Min(vertsXyz[a * 3], Math.Min(vertsXyz[b * 3], vertsXyz[c * 3])) / scs) - 1;
-                    int x1 = (int)Math.Floor(Math.Max(vertsXyz[a * 3], Math.Max(vertsXyz[b * 3], vertsXyz[c * 3])) / scs) + 1;
-                    int z0 = (int)Math.Floor(Math.Min(vertsXyz[a * 3 + 2], Math.Min(vertsXyz[b * 3 + 2], vertsXyz[c * 3 + 2])) / scs) - 1;
-                    int z1 = (int)Math.Floor(Math.Max(vertsXyz[a * 3 + 2], Math.Max(vertsXyz[b * 3 + 2], vertsXyz[c * 3 + 2])) / scs) + 1;
-                    for (int zz = z0; zz <= z1; zz++)
-                        for (int xx = x0; xx <= x1; xx++)
-                        {
-                            long key = CellKey((xx + 0.5f) * scs, (zz + 0.5f) * scs, scs);
-                            int other;
-                            if (cellOwner.TryGetValue(key, out other))
-                            {
-                                int ra = other, rb = t;
-                                while (uf[ra] != ra) ra = uf[ra];
-                                while (uf[rb] != rb) rb = uf[rb];
-                                if (ra != rb) uf[rb] = ra;
-                            }
-                            else cellOwner[key] = t;
-                        }
-                }
-                // PCA of each group's flat (tread) triangles gives the flight's horizontal run.
-                var gcx = new Dictionary<int, double>();
-                var gcz = new Dictionary<int, double>();
-                var gxx = new Dictionary<int, double>();
-                var gzz = new Dictionary<int, double>();
-                var gxz = new Dictionary<int, double>();
-                var gcount = new Dictionary<int, int>();
-                for (int t = 0; t < stepTris; t++)
-                {
-                    if (!ok[t]) continue;
-                    int r = t; while (uf[r] != r) r = uf[r];
-                    int da = tris[t * 3], db = tris[t * 3 + 1], dc = tris[t * 3 + 2];
-                    double dux = vertsXyz[db * 3] - vertsXyz[da * 3];
-                    double duy = vertsXyz[db * 3 + 1] - vertsXyz[da * 3 + 1];
-                    double duz = vertsXyz[db * 3 + 2] - vertsXyz[da * 3 + 2];
-                    double dvx = vertsXyz[dc * 3] - vertsXyz[da * 3];
-                    double dvy = vertsXyz[dc * 3 + 1] - vertsXyz[da * 3 + 1];
-                    double dvz = vertsXyz[dc * 3 + 2] - vertsXyz[da * 3 + 2];
-                    double dnx = duy * dvz - duz * dvy, dny = duz * dvx - dux * dvz, dnz = dux * dvy - duy * dvx;
-                    double dlen = Math.Sqrt(dnx * dnx + dny * dny + dnz * dnz);
-                    if (dlen < 1e-12) continue;
-                    double ddeg = Math.Acos(Math.Min(1.0, Math.Abs(dny) / dlen)) * 180.0 / Math.PI;
-                    if (ddeg > 15.0) continue;
-                    double tcx = (vertsXyz[da * 3] + vertsXyz[db * 3] + vertsXyz[dc * 3]) / 3.0;
-                    double tcz = (vertsXyz[da * 3 + 2] + vertsXyz[db * 3 + 2] + vertsXyz[dc * 3 + 2]) / 3.0;
-                    double v0, v1, v2; int c0;
-                    gcx.TryGetValue(r, out v0); gcx[r] = v0 + tcx;
-                    gcz.TryGetValue(r, out v1); gcz[r] = v1 + tcz;
-                    gxx.TryGetValue(r, out v0); gxx[r] = v0 + tcx * tcx;
-                    gzz.TryGetValue(r, out v1); gzz[r] = v1 + tcz * tcz;
-                    gxz.TryGetValue(r, out v2); gxz[r] = v2 + tcx * tcz;
-                    gcount.TryGetValue(r, out c0); gcount[r] = c0 + 1;
-                }
-                var runOf = new Dictionary<int, float[]>();
-                foreach (var kv in gcount)
-                {
-                    int r = kv.Key, k = kv.Value;
-                    if (k < 2) continue;
-                    double mcx = gcx[r] / k, mcz = gcz[r] / k;
-                    double vxx = gxx[r] / k - mcx * mcx;
-                    double vzz = gzz[r] / k - mcz * mcz;
-                    double vxz = gxz[r] / k - mcx * mcz;
-                    if (vxx + vzz < 0.25) continue;                  // not a flight
-                    double theta = 0.5 * Math.Atan2(2.0 * vxz, vxx - vzz);
-                    runOf[r] = new float[] { (float)Math.Cos(theta), (float)Math.Sin(theta) };
-                }
-                for (int t = 0; t < stepTris; t++)
-                {
-                    if (!ok[t]) continue;
-                    int r = t; while (uf[r] != r) r = uf[r];
-                    float[] run;
-                    if (!runOf.TryGetValue(r, out run)) continue;
-                    if (steppedPropCells == null)
-                        steppedPropCells = new Dictionary<long, float[]>();
-                    int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
-                    int x0 = (int)Math.Floor(Math.Min(vertsXyz[a * 3], Math.Min(vertsXyz[b * 3], vertsXyz[c * 3])) / scs);
-                    int x1 = (int)Math.Floor(Math.Max(vertsXyz[a * 3], Math.Max(vertsXyz[b * 3], vertsXyz[c * 3])) / scs);
-                    int z0 = (int)Math.Floor(Math.Min(vertsXyz[a * 3 + 2], Math.Min(vertsXyz[b * 3 + 2], vertsXyz[c * 3 + 2])) / scs);
-                    int z1 = (int)Math.Floor(Math.Max(vertsXyz[a * 3 + 2], Math.Max(vertsXyz[b * 3 + 2], vertsXyz[c * 3 + 2])) / scs);
-                    for (int zz = z0; zz <= z1; zz++)
-                        for (int xx = x0; xx <= x1; xx++)
-                            steppedPropCells[CellKey((xx + 0.5f) * scs, (zz + 0.5f) * scs, scs)] = run;
-                }
-            }
-
             // --- merge in sorted order (deterministic) ---
             var mergeWatch = Stopwatch.StartNew();
             MergeOutput merged = s.UseDetailMesh
@@ -1744,16 +1637,6 @@ namespace BetterBannerlordNavmeshing
                         }
                     }
                 }
-            }
-
-            if (steppedPropCells != null && steppedPropCells.Count > 0)
-            {
-                int sideDropped = RemoveSteppedSideFaces(merged, steppedPropCells, forcedRampCells,
-                    s.VoxelCellSizeMeters);
-                if (sideDropped > 0)
-                    Log(log, "v2: stair sides: removed " + sideDropped
-                        + " sloped face(s) perpendicular to the run inside stepped-prop footprints"
-                        + " (rails/stringers; forced ramps/connectors kept)");
             }
 
             HashSet<long> steppedCells = null;
@@ -2577,78 +2460,6 @@ namespace BetterBannerlordNavmeshing
             // took it. BarrierPrunedLargest exists so a suspiciously large casualty is visible.
             public int BarrierAboveCapIslands, BarrierAboveCapFaces, BarrierAboveCapLargest;
             public int BarrierPrunedIslands, BarrierPrunedFaces, BarrierPrunedLargest;
-        }
-
-        // Valve-style stair-side removal. A stepped prop's stringer/rail is a NARROW sloped face inside
-        // the prop's own footprint. Treads are near-horizontal and survive; wide ramps (>= ~1.1 m) and
-        // forced connectors are kept, so a legitimate ramp is never removed.
-        private static bool CellOrNeighbor(HashSet<long> cells, float x, float z, float cs)
-        {
-            if (cells == null || cells.Count == 0) return false;
-            for (int dz = -2; dz <= 2; dz++)
-                for (int dx = -2; dx <= 2; dx++)
-                    if (cells.Contains(CellKey(x + dx * cs, z + dz * cs, cs))) return true;
-            return false;
-        }
-
-        // V3.70: Valve-style removal of the navmesh areas that hang off the side of a flight. Inside a
-        // flagged prop's footprint, a sloped face whose horizontal normal is perpendicular to the flight's
-        // run is a stringer/rail: it is not walkable stair surface and lets the agent shortcut beside the
-        // stairs. Treads (near-horizontal) and ramps/connectors (normal ALONG the run) survive; a forced
-        // ramp or connector within two cells of the face always survives.
-        private static int RemoveSteppedSideFaces(MergeOutput o, Dictionary<long, float[]> steppedCells,
-            HashSet<long> forcedCells, float cs)
-        {
-            int nf = o.Tris.Count / 3;
-            if (nf == 0) return 0;
-            var drop = new bool[nf];
-            int n = 0;
-            for (int f = 0; f < nf; f++)
-            {
-                int a = o.Tris[f * 3], b = o.Tris[f * 3 + 1], c = o.Tris[f * 3 + 2];
-                double ux = o.X[b] - o.X[a], uy = o.Y[b] - o.Y[a], uz = o.Z[b] - o.Z[a];
-                double vx = o.X[c] - o.X[a], vy = o.Y[c] - o.Y[a], vz = o.Z[c] - o.Z[a];
-                double nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-                double len = Math.Sqrt(nx * nx + ny * ny + nz * nz);
-                if (len < 1e-12) continue;
-                double slope = Math.Acos(Math.Min(1.0, Math.Abs(ny) / len)) * 180.0 / Math.PI;
-                if (slope < 20.0 || slope > 60.0) continue;
-                float ylo = Math.Min(o.Y[a], Math.Min(o.Y[b], o.Y[c]));
-                float yhi = Math.Max(o.Y[a], Math.Max(o.Y[b], o.Y[c]));
-                if (yhi - ylo <= 0.2f) continue;
-
-                float[] run = null;
-                for (int k = 0; k < 3 && run == null; k++)
-                {
-                    int v = o.Tris[f * 3 + k];
-                    steppedCells.TryGetValue(CellKey(o.X[v], o.Z[v], cs), out run);
-                }
-                if (run == null)
-                    steppedCells.TryGetValue(CellKey((o.X[a] + o.X[b] + o.X[c]) / 3f,
-                        (o.Z[a] + o.Z[b] + o.Z[c]) / 3f, cs), out run);
-                if (run == null) continue;                       // not a stepped-prop face
-                double hlen = Math.Sqrt(nx * nx + nz * nz);
-                if (hlen < 1e-9) continue;
-                double dot = Math.Abs(nx / hlen * run[0] + nz / hlen * run[1]);
-                if (dot >= 0.6) continue;                        // a ramp runs ALONG the flight
-
-                bool forced = false;
-                for (int k = 0; k < 3 && !forced; k++)
-                {
-                    int v = o.Tris[f * 3 + k];
-                    if (forcedCells != null && CellOrNeighbor(forcedCells, o.X[v], o.Z[v], cs)) forced = true;
-                }
-                if (!forced && forcedCells != null)
-                    forced = CellOrNeighbor(forcedCells, (o.X[a] + o.X[b] + o.X[c]) / 3f,
-                        (o.Z[a] + o.Z[b] + o.Z[c]) / 3f, cs);
-                if (!forced)
-                {
-                    drop[f] = true;
-                    n++;
-                }
-            }
-            if (n > 0) CompactFaces(o, drop);
-            return n;
         }
 
         private static int[] PruneSmallIslands(MergeOutput o, int maxFaces, HashSet<long> steppedCells,

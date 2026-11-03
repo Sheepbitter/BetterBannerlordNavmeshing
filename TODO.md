@@ -2,31 +2,6 @@
 
 Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
-## Stair-side navmesh removal, V3.70 (2026-11-02)
-
-- Reproduced the user's staircase from CC_20 headlessly: six props around (1119.57, 1079.10)
-  (`european_castle_ladder` + wall/heaps) with the courtyard ground at y=112.98 and a top landing at
-  123.56. `--extractstair <terrain> <assets> [--hassteps] [--minimal] [--filter]` writes
-  `%TEMP%\stair_extract_nav.obj` / `stair_extract_soup.obj`; the offline renderer
-  `%TEMP%\render_nav.ps1` draws slope-coloured iso/top views.
-- The defect is the **sloped navmesh strip hanging off the side of the flight**, not a height/radius
-  problem. Fix follows Valve's "remove areas hanging off the side of stairs/ramps" rule and is scoped to
-  props that carry `HasSteps`/`Ladder` (unflagged staircases are explicitly out of scope).
-- Implementation: `RemoveSteppedSideFaces` (called before the steep-face repair and island prune). The
-  cells covered by a stepped prop's own, non-forced triangles carry the flight's horizontal RUN direction
-  from a PCA of the group's flat tread triangles; groups are joined by shared XZ cells (a prop's treads
-  are often vertex-disjoint from its rails). A face is dropped when it is sloped 20-60 deg, spans > 0.2 m
-  vertically, sits in the footprint, and its horizontal normal is perpendicular to the run
-  (`|dot| < 0.6`). Treads are near-horizontal and ramps/connectors run ALONG the run, so both survive; any
-  face within two cells of a forced ramp/connector is protected.
-- Results: CC_20 removes 725 faces (blanket footprint removal removed 2004 and broke PROP-RAMP /
-  DOORWAY-LADDER), islands stay 14, the census at (1120.5, 1077) keeps the single accepted 60.79 deg /
-  1.665 m2 face, and the extraction render loses the orange side strip while every blue tread remains
-  (F 382 -> 371; the `--filter` prototype view clears more faces but also cuts the small step
-  transitions).
-- Suite: PROP-RAMP, DOORWAY-LADDER, NARROW-DOORWAY and all structural tests pass; LADDER-CAP (Test 25)
-  is the accepted red. Birtu/Basamu invariants pass, island counts unchanged (Birtu 5, Basamu 1).
-
 ## Doorway sizing is a MAPPING constraint, not a navmeshing bug (2026-11-02)
 
 - Measured at the shipped cs=0.25 / agent radius=0.25: a flat doorway needs **>= 2.0 m clear height
