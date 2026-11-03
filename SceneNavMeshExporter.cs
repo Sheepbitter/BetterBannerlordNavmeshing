@@ -47,6 +47,10 @@ namespace BetterBannerlordNavmeshing
         public const bool VoxelWriteSoupObj = false;
         public const bool VoxelTerrainHoleAudit = false;
         public const bool CullBelowWaterLevel = true;
+        // Steep-face repair defaults. The slope threshold is MaxSlopeDegrees + margin (0 = the cap
+        // itself); the height allowance is in agent-climb units (1.5 = 1.1 m at climb 0.6 / cell 0.2).
+        public const float SteepFaceMarginDegrees = 0f;
+        public const float SteepFaceMinHeightClimbs = 1.5f;
         public const bool ConsoleMessages = true;
     }
 
@@ -78,6 +82,11 @@ namespace BetterBannerlordNavmeshing
         public float NavMeshMaxErrorMeters = NavMeshPipelineDefaults.MaxErrorMeters;
         public float NavMeshCoarsestSpacing = NavMeshPipelineDefaults.CoarsestSpacingMeters;
         public float NavMeshMaxSlopeDegrees = NavMeshPipelineDefaults.MaxSlopeDegrees;
+        // Steep-face repair: threshold = NavMeshMaxSlopeDegrees + margin. 0 = exactly the cap (default);
+        // raise it to leave the band just above the cap untouched.
+        public float NavMeshSteepFaceMarginDegrees = NavMeshPipelineDefaults.SteepFaceMarginDegrees;
+        // Height allowance in agent-climb units: faces up to this tall are kept as step/kerb connectors.
+        public float NavMeshSteepFaceMinHeightClimbs = NavMeshPipelineDefaults.SteepFaceMinHeightClimbs;
         public bool NavMeshCullBelowHeight = false;
         public float NavMeshMinHeight = 0f;
         // Water-level mode (always active; scenes always have a water level, dry maps set it well below
@@ -918,7 +927,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
                 NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelGateConnectors, NavMeshVoxelQuadMerge,
-                NavMeshVoxelBarriers, NavMeshCullBelowWaterLevel, NavMeshConsoleMessages);
+                NavMeshVoxelBarriers, NavMeshCullBelowWaterLevel, NavMeshConsoleMessages,
+                NavMeshSteepFaceMarginDegrees, NavMeshSteepFaceMinHeightClimbs);
         }
 
         // BORDER POLYGON READ (V3.59). Runs on the MAIN THREAD and is shared by the editor button, the async
@@ -1102,7 +1112,9 @@ namespace BetterBannerlordNavmeshing
             bool voxelQuadMerge,
             bool voxelBarriers,
             bool cullBelowWaterLevel,
-            bool consoleMessages)
+            bool consoleMessages,
+            float steepFaceMarginDegrees = NavMeshPipelineDefaults.SteepFaceMarginDegrees,
+            float steepFaceMinHeightClimbs = NavMeshPipelineDefaults.SteepFaceMinHeightClimbs)
         {
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(writeLogFile, logFolder);
@@ -1242,6 +1254,8 @@ namespace BetterBannerlordNavmeshing
                     voxel.PruneIsolatedIslands = voxelPruneIsolatedIslands;
                     voxel.PruneMaxIslandFaces = voxelPruneMaxIslandFaces;
                     voxel.QuadMerge = voxelQuadMerge;
+                    voxel.SteepFaceMarginDegrees = steepFaceMarginDegrees;
+                    voxel.SteepFaceMinHeightClimbs = steepFaceMinHeightClimbs;
                     voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
                     voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
                     voxel.WaterLevelMeters = waterLevel;
@@ -1526,6 +1540,8 @@ namespace BetterBannerlordNavmeshing
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
                 voxel.QuadMerge = NavMeshVoxelQuadMerge;
                 voxel.GatePlateBlend = NavMeshVoxelGatePlateBlend;
+                voxel.SteepFaceMarginDegrees = NavMeshSteepFaceMarginDegrees;
+                voxel.SteepFaceMinHeightClimbs = NavMeshSteepFaceMinHeightClimbs;
                 voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
                 voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
                 voxel.WaterLevelMeters = waterLevel;
