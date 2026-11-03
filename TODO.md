@@ -2,6 +2,24 @@
 
 Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
+## Stair-side navmesh removal: tried in V3.70, REVERTED (2026-11-02)
+
+- V3.70 added `RemoveSteppedSideFaces`: for flagged (`HasSteps`/`Ladder`) props only, it derived the
+  flight's horizontal run from a PCA of the prop's flat tread triangles, then dropped sloped faces
+  (20-60 deg) whose horizontal normal was perpendicular to that run, keeping treads, ramps/connectors
+  along the run and any forced cell within two cells.
+- Headlessly it looked correct: the CC_20 extraction lost the side strip while the treads stayed
+  (F 382 -> 371), the CC_20 census was unchanged (single accepted 60.79 deg / 1.665 m2 face, 14
+  islands) and the suite passed except the accepted Test 25.
+- **In game it "sort of worked, sort of didn't" and introduced new issues**, so the commit was reverted
+  (`83da09f`) and the V3.70 tag deleted. **V3.69 is the current build.**
+- New direction (same shape as the doorway-sizing conclusion): handle weird props **under/inside
+  staircases as a placement/mapping rule** - don't put collidable clutter under a flight - instead of
+  removing navmesh after the fact. Do not re-add geometric side-face removal unless a placement rule
+  cannot cover a concrete case.
+- The headless extraction/render tooling from `deb37ee`/`d923105` is kept; it is still the fastest way to
+  judge a staircase case without the editor.
+
 ## Doorway sizing is a MAPPING constraint, not a navmeshing bug (2026-11-02)
 
 - Measured at the shipped cs=0.25 / agent radius=0.25: a flat doorway needs **>= 2.0 m clear height
