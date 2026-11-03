@@ -915,6 +915,7 @@ internal static class Program
             var defectSpots = new List<string>();
             var censusSpots = new List<string>();
             string dumpNear = null;
+            string objDump = null;
             int routingPairs = 0;
             float band = 1.0f;
             TiledNavMeshBuilder.TiledNavMeshSettings s = SnapshotSettings();
@@ -977,6 +978,12 @@ internal static class Program
                         s.SteepFaceMarginDegrees = (float)ParseFloat(v); i++; break;
                     case "--steeptall":
                         s.SteepFaceMinHeightClimbs = (float)ParseFloat(v); i++; break;
+                    case "--contour":
+                        s.ContourMaxErrorVoxels = (float)ParseFloat(v); i++; break;
+                    case "--detsample":
+                        s.DetailSampleDistMeters = (float)ParseFloat(v); i++; break;
+                    case "--maxedge":
+                        s.MaxEdgeLenVoxels = (int)ParseFloat(v); i++; break;
                     case "--connect":
                         connectOnly = true; break;
                     case "--quality":
@@ -1017,6 +1024,8 @@ internal static class Program
                         defectSpots.Add(v); i++; break;
                     case "--census":
                         censusSpots.Add(v); i++; break;
+                    case "--objdump":
+                        objDump = v; i++; break;
                     case "--dumpnear":
                         dumpNear = v; i++; break;
                     case "--leveltol":
@@ -1302,6 +1311,11 @@ internal static class Program
                 + " invariants=" + (r.InvariantsPassed ? "PASS" : "FAIL") + " ms=" + watch.ElapsedMilliseconds);
             if (s.CullBelowWaterLevel || s.RaiseBelowWaterLevel)
                 WaterShorelineReport(r, s.WaterLevelMeters, s.MaxSlopeDegrees);
+            if (objDump != null)
+            {
+                WriteObj(r, objDump);
+                Console.WriteLine("obj: " + objDump);
+            }
             if (goldenHash)
             {
                 // --goldenhash: build once, print the three hashes in a copy-pasteable form, exit.
