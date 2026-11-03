@@ -420,6 +420,14 @@ namespace BetterBannerlordNavmeshing
             //   20+ = conservative: only the unmistakable walls (>= 70 deg) go.   100+ = disabled.
             public float SteepFaceMarginDegrees = SteepFaceMarginDegreesDefault;
 
+            // How tall (in agent-climb units) a steep face may be before it counts as a jump instead of a
+            // step/kerb/riser. Shipped default 1.5 climbs (1.5*0.6 + cell = 1.1 m); it was 2 climbs
+            // (1.4 m), and the lower value removes the short wall/crenellation climb triangles that are
+            // common enough to notice. Lowering it further marks more wall faces; the connectivity guard
+            // still restores any face whose removal would split the walkable network, so this trades
+            // "short climb triangles" against nothing walkable.
+            public float SteepFaceMinHeightClimbs = 1.5f;
+
             // GATE/DOOR PLATE BLEND (default on). A prop that carries a rigid, dead-flat floor slab
             // (a castle gate's floor colliders are the reported case) projects into the voxel grid as a
             // perfectly horizontal plate that ignores the ground it is dropped onto. On sloping terrain one
@@ -1053,6 +1061,8 @@ namespace BetterBannerlordNavmeshing
                 + " ledgeFilter=" + s.UseLedgeFilter
                 + " detail=" + s.UseDetailMesh
                 + " detSampleDist=" + F(EffectiveDetailSampleDist(s)) + "m"
+                + " steepTall=" + F(SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters,
+                    s.SteepFaceMinHeightClimbs)) + "m"
                 + " contourSimpErr=" + F(EffectiveContourMaxError(s)) + "vox");
             Log(log, "v2: contour maxError=" + F(maxSimplificationError) + "vox (= " + F(maxSimplificationError * cs)
                 + "m at cs=" + F(cs) + "m; NavMeshVoxelContourMaxError, 0=auto=MaxErrorMeters/cs)");
@@ -1606,7 +1616,8 @@ namespace BetterBannerlordNavmeshing
                     string _preDetail;
                     MarkSteepFaces(merged, _preDrop, _preSpike, forcedRampCells, s.VoxelCellSizeMeters,
                         s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
-                        SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), out _preDetail);
+                        SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters,
+                            s.SteepFaceMinHeightClimbs), out _preDetail);
                     int _fanDropped = 0;
                     // V3.50's own guard first, on the full marked set: restore the minimum needed to
                     // keep the island count (measured: the pristine V3.50 drop set keeps 15).  Only
@@ -1778,7 +1789,8 @@ namespace BetterBannerlordNavmeshing
             }
             quadPairs = RepairSteepFaces(merged, forcedRampCells, s.VoxelCellSizeMeters,
                 s.MaxSlopeDegrees, s.SteepFaceMarginDegrees,
-                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters), quadPairs,
+                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters,
+                    s.SteepFaceMinHeightClimbs), quadPairs,
                 ref preSteepComponents, log);
 
             // V3.46: the last pass that rewrites faces, so the face-quality repairs run HERE - after the
@@ -1871,7 +1883,8 @@ namespace BetterBannerlordNavmeshing
             // --- topology + invariants (gate) ---
             ComputeInvariants(result, result.Tris, result.FaceCount, quadPairs,
                 SteepFaceThresholdDegrees(s.MaxSlopeDegrees, s.SteepFaceMarginDegrees),
-                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters));
+                SteepFaceMinHeightMeters(s.AgentMaxClimbMeters, s.CellHeightMeters,
+                    s.SteepFaceMinHeightClimbs));
 
             Log(log, "v2: weld verts=" + tileVertexSum + " -> " + mergedVertices
                 + " faces=" + result.FaceCount + " edges=" + result.EdgeCount
@@ -5644,12 +5657,14 @@ namespace BetterBannerlordNavmeshing
         // intercept solved around the plate centroid) explode while still "explaining" the band.
         public const double GatePlateMinCorrelation1 = 1e-3;
 
-        // The face's own height range has to exceed this to count as a jump. Two agent climbs plus one
-        // cell height (1.4 m at climb 0.6 / ch 0.2), which clears the lab stair's 1.20 m connector with
-        // room to spare and still cuts the 3.2 m+ faces at the reported spot.
-        public static float SteepFaceMinHeightMeters(float agentClimbMeters, float cellHeightMeters)
+        // The face's own height range has to exceed this to count as a jump. The shipped value is 1.5
+        // climbs + one cell height (1.1 m at climb 0.6 / ch 0.2): it clears a normal kerb/riser and the
+        // suite's 0.8-1.0 m step lab, while the connectivity guard restores the 1.20 m lab stair connector
+        // if the shorter allowance would split it. `climbs` is SteepFaceMinHeightClimbs.
+        public static float SteepFaceMinHeightMeters(float agentClimbMeters, float cellHeightMeters,
+            float climbs = 1.5f)
         {
-            return 2f * agentClimbMeters + cellHeightMeters;
+            return climbs * agentClimbMeters + cellHeightMeters;
         }
 
         // fixC: only contour-spike fan faces taller than this are dropped before the cleanup.  The

@@ -2,6 +2,23 @@
 
 Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
+## Steep-face allowance lowered to 1.5 climbs (2026-11-02)
+
+- The steep-face repair keeps faces steeper than `maxSlope + margin` (60 deg at the shipped 50 + 10) when
+  their own vertical span is small: a short steep face is a kerb/riser connector, not a jump. The span
+  threshold was `2 * climb + cellHeight` (1.4 m); it is now a setting,
+  `SteepFaceMinHeightClimbs = 1.5` (1.1 m at climb 0.6 / ch 0.2). Harness: `--steeptall <climbs>`.
+- Why not lower further: `RestoreSplitComponents` restores the minimum marked faces needed to keep the
+  island count, so most wall-top faces are put back. Measured on Birtu: 2 climbs -> 1.25 -> 1.0 marks
+  34 -> 81 -> 135 faces but drops only 1 -> 5 -> 7. The setting is safe at all three (suite green
+  including CONNECTIVITY LAB, because the lab's 1.20 m / 71.5 deg stair connector is restored), it just
+  has little visible effect at the low end.
+- At the shipped 1.5: CC_20 drops 24 steep faces (was 14), totalFaces 246209 -> 246192, islands stay 14,
+  and the accepted 60.79 deg / 1.665 m2 census face is untouched; Birtu loses 1 face, islands 5.
+- To actually remove the crenellation caps rather than the side faces, the next lever is the connectivity
+  guard: let a drop that only isolates a fragment smaller than the island cap through, so the prune
+  removes it instead of the guard restoring it.
+
 ## Stair-side navmesh removal: tried in V3.70, REVERTED (2026-11-02)
 
 - V3.70 added `RemoveSteppedSideFaces`: for flagged (`HasSteps`/`Ladder`) props only, it derived the

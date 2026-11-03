@@ -975,6 +975,8 @@ internal static class Program
                         TiledNavMeshBuilder.SteepFaceConnectivityGuard = ParseFloat(v) != 0; i++; break;
                     case "--steepmargin":
                         s.SteepFaceMarginDegrees = (float)ParseFloat(v); i++; break;
+                    case "--steeptall":
+                        s.SteepFaceMinHeightClimbs = (float)ParseFloat(v); i++; break;
                     case "--connect":
                         connectOnly = true; break;
                     case "--quality":
