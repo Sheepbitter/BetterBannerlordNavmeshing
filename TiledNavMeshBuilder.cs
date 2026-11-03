@@ -416,10 +416,10 @@ namespace BetterBannerlordNavmeshing
 
             // STEEP-FACE REPAIR (slope threshold relative to MaxSlopeDegrees). Slope alone is not the
             // discriminator (see RepairSteepFaces); this is the margin and SteepFaceMinHeightMeters
-            // supplies the height test.   0 (default) = exactly the walkable cap: every face the agent
-            // cannot stand on is a candidate, and only short connectors survive the height test. The old
-            // default was 10, which left a 50-60 deg band completely untouched even though the navmesh cap
-            // is 50 deg.   20+ = conservative: only the unmistakable walls (>= 70 deg) go.   100+ = disabled.
+            // supplies the height test.   10 (default) = 60 deg at the shipped 50 deg cap: the band just
+            // above the cap is left untouched. 0 = exactly the cap (more aggressive; measured to remove
+            // 2,371 faces and 4 islands on CC_20, so it is opt-in).   20+ = conservative: only the
+            // unmistakable walls (>= 70 deg) go.   100+ = disabled.
             public float SteepFaceMarginDegrees = SteepFaceMarginDegreesDefault;
 
             // How tall (in agent-climb units) a steep face may be before it counts as a jump instead of a
@@ -5626,9 +5626,9 @@ namespace BetterBannerlordNavmeshing
         // connector is deliberately steeper than the walkable cap (a ladder chain runs steeper than the cap)
         // and is the mechanism that makes a ladder traversable, so its cells are the ONLY ones allowed to
         // carry a face above it.
-        // 0 = the walkable cap itself (the shipped default since the 50-60 deg band was a bug: the cap is
-        // 50). A positive margin leaves that band untouched; >= 100 disables the repair.
-        public const float SteepFaceMarginDegreesDefault = 0f;
+        // 10 = the shipped default (60 deg at the 50 deg cap): the band just above the cap is left
+        // untouched. 0 = exactly the cap (opt-in; aggressive and map-changing); >= 100 disables the repair.
+        public const float SteepFaceMarginDegreesDefault = 10f;
 
         // ------------------------------------------------------------------
         // GATE/DOOR PLATE BLEND - tolerances (see BlendGatePlates for the full rule)

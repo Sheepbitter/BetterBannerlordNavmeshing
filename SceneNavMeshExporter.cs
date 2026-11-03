@@ -49,7 +49,7 @@ namespace BetterBannerlordNavmeshing
         public const bool CullBelowWaterLevel = true;
         // Steep-face repair defaults. The slope threshold is MaxSlopeDegrees + margin (0 = the cap
         // itself); the height allowance is in agent-climb units (1.5 = 1.1 m at climb 0.6 / cell 0.2).
-        public const float SteepFaceMarginDegrees = 0f;
+        public const float SteepFaceMarginDegrees = 10f;
         public const float SteepFaceMinHeightClimbs = 1.5f;
         public const bool ConsoleMessages = true;
     }
@@ -82,8 +82,8 @@ namespace BetterBannerlordNavmeshing
         public float NavMeshMaxErrorMeters = NavMeshPipelineDefaults.MaxErrorMeters;
         public float NavMeshCoarsestSpacing = NavMeshPipelineDefaults.CoarsestSpacingMeters;
         public float NavMeshMaxSlopeDegrees = NavMeshPipelineDefaults.MaxSlopeDegrees;
-        // Steep-face repair: threshold = NavMeshMaxSlopeDegrees + margin. 0 = exactly the cap (default);
-        // raise it to leave the band just above the cap untouched.
+        // Steep-face repair: threshold = NavMeshMaxSlopeDegrees + margin. 10 (default) = 60 deg at the
+        // shipped 50 deg cap; 0 = exactly the cap (more aggressive, map-changing).
         public float NavMeshSteepFaceMarginDegrees = NavMeshPipelineDefaults.SteepFaceMarginDegrees;
         // Height allowance in agent-climb units: faces up to this tall are kept as step/kerb connectors.
         public float NavMeshSteepFaceMinHeightClimbs = NavMeshPipelineDefaults.SteepFaceMinHeightClimbs;
