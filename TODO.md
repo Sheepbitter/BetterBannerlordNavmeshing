@@ -2,22 +2,29 @@
 
 Working list for BetterBannerlordNavmeshing. Newest/current items first.
 
-## Steep-face allowance lowered to 1.5 climbs (2026-11-02)
+## Steep-face threshold is now the walkable cap (50 deg), allowance 1.5 climbs (2026-11-02)
 
-- The steep-face repair keeps faces steeper than `maxSlope + margin` (60 deg at the shipped 50 + 10) when
-  their own vertical span is small: a short steep face is a kerb/riser connector, not a jump. The span
-  threshold was `2 * climb + cellHeight` (1.4 m); it is now a setting,
-  `SteepFaceMinHeightClimbs = 1.5` (1.1 m at climb 0.6 / ch 0.2). Harness: `--steeptall <climbs>`.
-- Why not lower further: `RestoreSplitComponents` restores the minimum marked faces needed to keep the
-  island count, so most wall-top faces are put back. Measured on Birtu: 2 climbs -> 1.25 -> 1.0 marks
-  34 -> 81 -> 135 faces but drops only 1 -> 5 -> 7. The setting is safe at all three (suite green
-  including CONNECTIVITY LAB, because the lab's 1.20 m / 71.5 deg stair connector is restored), it just
-  has little visible effect at the low end.
-- At the shipped 1.5: CC_20 drops 24 steep faces (was 14), totalFaces 246209 -> 246192, islands stay 14,
-  and the accepted 60.79 deg / 1.665 m2 census face is untouched; Birtu loses 1 face, islands 5.
-- To actually remove the crenellation caps rather than the side faces, the next lever is the connectivity
-  guard: let a drop that only isolates a fragment smaller than the island cap through, so the prune
-  removes it instead of the guard restoring it.
+- The steep-face repair keeps faces steeper than `MaxSlopeDegrees + SteepFaceMarginDegrees` when their own
+  vertical span is small: a short steep face is a kerb/riser connector, not a jump.
+- **Slope margin: 10 -> 0.** The old 60 deg threshold left the whole 50-60 deg band untouched even though
+  the navmesh cap is 50 deg, so faces the agent cannot stand on were never even candidates. The threshold
+  is now exactly `MaxSlopeDegrees` (50). `SteepFaceMarginDegrees` still accepts a positive margin for
+  conservative builds; >= 100 disables the repair.
+- **Height allowance: `2 * climb + cellHeight` (1.4 m) -> `SteepFaceMinHeightClimbs = 1.5` (1.1 m).**
+  Harness: `--steeptall <climbs>`.
+- Ladders and stepped props are unaffected in practice: their synthesized ramps are forced cells and are
+  skipped whatever the slope/height; stair treads are flat and risers are shorter than the allowance. The
+  connectivity guard restores the suite's 1.20 m / 71.5 deg staircase connector, and CONNECTIVITY LAB
+  still passes.
+- Measured at the shipped 50 deg / 1.1 m: CC_20 drops 2,371 steep faces (was 24 at 60 deg), islands
+  **14 -> 10**, totalFaces 246192 -> 236324, main-island area -0.7%; the accepted 60.79 deg / 1.665 m2
+  census face at (1120.5,1077) is unchanged. Birtu drops 216 faces, islands stay 5, totalFaces
+  43829 -> 43393. The CC_20 extraction (unflagged ladder) is unchanged at F=382, so this does not replace
+  the reverted stair-side rule.
+- The connectivity guard restores most marked faces: at 50 deg CC_20 marks 5,830 and drops 2,371 (1,283
+  kept as short + forced + restored); `tallSteep` in the invariants is a warning and is high by design
+  now. To remove the remaining wall-top fragments, let a drop that only isolates a fragment below the
+  island cap through the guard so the prune takes it.
 
 ## Stair-side navmesh removal: tried in V3.70, REVERTED (2026-11-02)
 
