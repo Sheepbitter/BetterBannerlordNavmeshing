@@ -27,6 +27,18 @@ Advanced options are available, but the tool has been tuned on a wide variety of
 Users are unlikely to get a better output outside of very specific scenarios. See the Settings section
 below for more detail.
 
+## Limitations
+- Can do civil ladders, but not spawned ladders.
+- As mentioned above, does not have some engine functions, so one must make a small map, save and restart the editor 
+  if it doesn't have one already or if the module doesn't have a NavMeshPrefabs folder.
+- Small doorways can screw it up. From testing, I've learned that this is actually a blessing in disguise.
+  If a doorway is too small for the navmesher to handle, a tall agent will clip through it.
+  Increase the size of the prop, don't try to manually navmesh or adjust the settings.
+  Commonly an issue with gatehouses, they're just undersized.
+- Sometimes will screw up a little on staircases and switchbacks. Plan to refine this in the future.
+- Likes to throw an occasional extra triangle between merlons or climb a small prop like arrow barrels.
+  Has no effect on the actual in-game behavior of the AI, so I left this as-is. Low priority.
+  
 ## Settings
 
 ### Simple view - `NavMeshGenerator`
