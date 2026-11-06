@@ -66,7 +66,7 @@ namespace BetterBannerlordNavmeshing
         private const string Prefix = "NavMesh: ";
 
         // Terminal-line markers, shared so nothing has to re-type them. The viewport
-        // overlay tints on these (see SceneNavMeshExporter), so the wording stays in
+        // overlay tints on these (see NavMeshGenerator), so the wording stays in
         // exactly one place.
         public const string FailPrefix = "FAILED: ";
         public const string SkipPrefix = "import skipped: ";
@@ -107,7 +107,7 @@ namespace BetterBannerlordNavmeshing
         private static bool _playerChannelBroken;
 
         // The one-line build status shown in the editor's script-variables panel
-        // (SceneNavMeshExporter.NavMeshBuildStatus). It is written from the SAME
+        // (NavMeshGenerator_DebugOptions.NavMeshBuildStatus). It is written from the SAME
         // Emit/Pump path that produces the visible lines, so the panel row and the
         // console wording cannot drift apart. Written under Sync; read via
         // StatusText, which locks.

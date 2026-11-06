@@ -78,6 +78,77 @@ namespace BetterBannerlordNavmeshing
         // Per-prop dedupe rounding.
         private const float DedupeQuantum = 0.05f;
 
+        // ---- geometry-only staircase detection (props whose BodyFlags carry no HasSteps/Ladder) ----
+        // Some staircases are authored as plain collision (a castle's switchback flight can ship with
+        // flags=0), so the flag alone leaves them with no ramp. The detector is deliberately narrow: a
+        // staircase is mostly AIR - a run of narrow, walkable strips (treads, rungs, stringers) climbing
+        // through a footprint that is otherwise empty. That is what separates it from a roof or a solid
+        // crate stack, whose walkable faces cover most of their footprint. It never fires on a flagged
+        // prop (the flag path is unchanged) and is off unless GeometryDetection is enabled by the
+        // caller, so the shipped suite stays byte-identical until this is validated.
+        public static bool GeometryDetection = false;
+        // Band-walk flight splitting. A switchback (or any staircase whose flights reverse direction)
+        // cannot be synthesized from ONE run direction: the ordinary pass samples along the whole prop
+        // and its stations end up unsupported. When this is on, a stepped prop that produced no ramp is
+        // split into flights by walking the 0.5 m height bands (nearest node band to band) and cut where
+        // the horizontal direction reverses; each flight is then synthesized on its own. OFF until the
+        // in-game cases are validated: enabling it changed every failed flagged stair's ramps and
+        // disconnected flights in game (2026-11-03). Set true only for experiments.
+        public static bool MultiFlightSplit = false;
+        // Triangles whose XZ extents are this close inside one height band are one tread/landing.
+        private const float BandLinkMeters = 0.6f;
+        // A chain step may not jump further than this between adjacent bands.
+        private const float BandChainReachMeters = 3.0f;
+        // Directions shorter than this do not update the flight direction (a riser / landing).
+        private const float BandTurnMinMoveMeters = 0.10f;
+        // Split a flight when the horizontal direction turns by more than ~60 degrees (dot < 0.5).
+        private const float BandTurnSplitDot = 0.5f;
+        private const int BandMaxBands = 200;
+        // Optional diagnostic sink (harness only): describes the band-walk flights. Never used by the
+        // geometry and null in the shipped build.
+        public static Action<string> DebugLog;
+        private static void Dbg(string m)
+        {
+            if (DebugLog != null) DebugLog(m);
+        }
+        // Steepest strip that still counts as a walking surface (a leaning ladder's rungs sit near 45).
+        public const float DetectPlankMaxSlopeDegrees = 55f;
+        // A tread/rung/stringer is NARROW across its run; a roof or a floor slab is broad in both
+        // directions and is rejected here.
+        public const float DetectPlankMaxWidthMeters = 0.6f;
+        public const float DetectPlankMaxLengthMeters = 6f;
+        public const float DetectPlankMinAreaSqm = 0.0015f;
+        // Enough separate strips, and a real climb through them.
+        public const int DetectMinPlanks = 6;
+        // A real flight is at least this tall. Crenellations, carts and rubble heaps top out well below
+        // it; a single-storey flight is typically 2.5 m or more.
+        public const float DetectMinRiseMeters = 2.0f;
+        public const float DetectMaxRiseMeters = 25f;
+        // Walkable strips must cover no more than this fraction of the prop's footprint (sparse = stair).
+        public const float DetectMaxCoverage = 0.55f;
+        // Heights within this of one another are the same tread/rung row (the level tolerance).
+        public const float DetectLevelTolerance = 0.15f;
+        // Strips are first split into spatially connected pieces: two strips belong to the same piece
+        // when their XZ extents are at most DetectLinkXZ apart AND their heights differ by at most
+        // DetectLinkZ. A multi-flight asset (a switchback, or a ladder lying beside another) otherwise
+        // mixes unrelated pieces at the same height into one bogus level chain.
+        public const float DetectLinkXZ = 2.6f;
+        public const float DetectLinkZ = 1.2f;
+        // Inside one piece the strips are clustered into levels, and a climb is a run of consecutive
+        // levels (bottom to top) with a small height step and a small horizontal step. The first
+        // support bombproofs against a flat top face being broken into narrow triangles: such a face
+        // yields 1-2 levels, never a chain.
+        public const float DetectMaxLevelRise = 1.2f;
+        public const float DetectMaxLevelRun = 3.0f;
+        public const int DetectMinChainLevels = 4;
+        // A staircase starts at the floor: its climb may begin at most this far above the prop's own
+        // lowest vertex. A rubble slope part-way up a ruined wall fails this, a flight does not.
+        public const float DetectMaxBaseGapMeters = 1.0f;
+        // The chain must have a plausible implied slope (a wrapped staircase's path is long). Too shallow
+        // is a ramp/rubble field; too steep is a brace.
+        public const float DetectMinImpliedSlopeDegrees = 18f;
+        public const float DetectMaxImpliedSlopeDegrees = 75f;
+
         // ---- offset symbolic connector (ladders only) ----------------------------------------------
         // A ladder that cannot be connected within its own footprint (a true vertical ladder has no
         // run at all) still has to be navmeshed or bots never traverse it. The connector is a SYMBOLIC
@@ -139,6 +210,8 @@ namespace BetterBannerlordNavmeshing
             public int SkippedSteep;   // no chunk could obey the slope rule
             public int SkippedLong;    // no chunk could obey the run rule
             public int Capped;         // the flight needed more than MaxRampsPerProp chunks
+            public int Detected;       // unflagged props that geometry detection accepted
+            public int DetectedRamps;  // detected props that produced at least one ramp
             public float SlopeCapDegrees;   // the steepest ramp the Recast build can keep walkable
             public readonly List<RampInfo> Infos = new List<RampInfo>();
             // Indices into Tris of the offset symbolic connector's triangles (ladder-flag only). The
@@ -591,6 +664,265 @@ namespace BetterBannerlordNavmeshing
             return (flags & (FlagHasSteps | FlagLadder)) != 0;
         }
 
+        // Geometry-only staircase detection, used only when GeometryDetection is on and the prop carries
+        // neither HasSteps nor Ladder. Returns true when the prop contains enough NARROW walkable strips
+        // (treads, rungs, stringers) at a range of heights, climbing through a mostly-empty footprint.
+        // `why` always describes the decision (counts and the reason for a refusal) so a run can log it.
+        public static bool LooksStepped(Prop p, float cellSizeMeters, float climbMeters, out string why)
+        {
+            List<int[]> ignored;
+            return LooksStepped(p, cellSizeMeters, climbMeters, out why, out ignored);
+        }
+
+        // Same, but also returns one entry per detected FLIGHT: the triangle indices of the spatially
+        // connected piece that forms the climb. A multi-flight prop (a switchback) therefore produces
+        // several flights, each synthesized on its own instead of one ramp cutting across the void.
+        public static bool LooksStepped(Prop p, float cellSizeMeters, float climbMeters, out string why,
+            out List<int[]> flights)
+        {
+            flights = new List<int[]>();
+            why = "no-geometry";
+            if (p == null || p.VertsXyz == null || p.Tris == null) return false;
+            int triCount = p.Tris.Length / 3;
+            int vertCount = p.VertsXyz.Length / 3;
+            if (triCount < DetectMinPlanks || triCount > 20000)
+            {
+                why = "tris=" + triCount;
+                return false;
+            }
+
+            // The prop's whole footprint, for the sparsity test.
+            float ax0 = float.MaxValue, ax1 = float.MinValue;
+            float ay0 = float.MaxValue, ay1 = float.MinValue;
+            float az0 = float.MaxValue;
+            for (int v = 0; v < vertCount; v++)
+            {
+                float x = p.VertsXyz[v * 3 + 0], y = p.VertsXyz[v * 3 + 1], z = p.VertsXyz[v * 3 + 2];
+                if (x < ax0) ax0 = x;
+                if (x > ax1) ax1 = x;
+                if (y < ay0) ay0 = y;
+                if (y > ay1) ay1 = y;
+                if (z < az0) az0 = z;
+            }
+
+            float cosWalk = (float)Math.Cos(DetectPlankMaxSlopeDegrees * Math.PI / 180.0);
+            var h = new List<float>();
+            var px = new List<float>();
+            var py = new List<float>();
+            var bx0 = new List<float>();
+            var bx1 = new List<float>();
+            var by0 = new List<float>();
+            var by1 = new List<float>();
+            var triOf = new List<int>();
+            float areaSum = 0f;
+            for (int t = 0; t < triCount; t++)
+            {
+                int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
+                    continue;
+                float aX = p.VertsXyz[i0 * 3 + 0], aY = p.VertsXyz[i0 * 3 + 1], aZ = p.VertsXyz[i0 * 3 + 2];
+                float bX = p.VertsXyz[i1 * 3 + 0], bY = p.VertsXyz[i1 * 3 + 1], bZ = p.VertsXyz[i1 * 3 + 2];
+                float cX = p.VertsXyz[i2 * 3 + 0], cY = p.VertsXyz[i2 * 3 + 1], cZ = p.VertsXyz[i2 * 3 + 2];
+                float uX = bX - aX, uY = bY - aY, uZ = bZ - aZ;
+                float vX = cX - aX, vY = cY - aY, vZ = cZ - aZ;
+                float nX = uY * vZ - uZ * vY;
+                float nY = uZ * vX - uX * vZ;
+                float nZ = uX * vY - uY * vX;
+                float nLen = (float)Math.Sqrt((double)nX * nX + (double)nY * nY + (double)nZ * nZ);
+                if (nLen < 1e-9f) continue;
+                // Walkable inclination, either winding (the builder normalises winding).
+                if (Math.Abs(nZ) / nLen < cosWalk) continue;
+                float area = 0.5f * nLen;
+                if (area < DetectPlankMinAreaSqm) continue;
+
+                float e0 = (float)Math.Sqrt((double)uX * uX + (double)uY * uY + (double)uZ * uZ);
+                float wX = cX - bX, wY = cY - bY, wZ = cZ - bZ;
+                float e1 = (float)Math.Sqrt((double)wX * wX + (double)wY * wY + (double)wZ * wZ);
+                float fX = aX - cX, fY = aY - cY, fZ = aZ - cZ;
+                float e2 = (float)Math.Sqrt((double)fX * fX + (double)fY * fY + (double)fZ * fZ);
+                float longest = Math.Max(e0, Math.Max(e1, e2));
+                if (longest > DetectPlankMaxLengthMeters) continue;
+                // Altitude to the longest edge = the strip's width. A tread/rung/stringer is narrow; a
+                // floor slab or roof face is broad in both directions and fails here.
+                float width = 2f * area / longest;
+                if (width > DetectPlankMaxWidthMeters) continue;
+
+                h.Add((aZ + bZ + cZ) / 3f);
+                px.Add((aX + bX + cX) / 3f);
+                py.Add((aY + bY + cY) / 3f);
+                bx0.Add(Math.Min(aX, Math.Min(bX, cX)));
+                bx1.Add(Math.Max(aX, Math.Max(bX, cX)));
+                by0.Add(Math.Min(aY, Math.Min(bY, cY)));
+                by1.Add(Math.Max(aY, Math.Max(bY, cY)));
+                triOf.Add(t);
+                areaSum += area;
+            }
+
+            if (h.Count < DetectMinPlanks)
+            {
+                why = "planks=" + h.Count + "/" + DetectMinPlanks + " tris=" + triCount;
+                return false;
+            }
+
+            float hMin = float.MaxValue, hMax = float.MinValue;
+            for (int k = 0; k < h.Count; k++)
+            {
+                if (h[k] < hMin) hMin = h[k];
+                if (h[k] > hMax) hMax = h[k];
+            }
+            float rise = hMax - hMin;
+            if (rise < DetectMinRiseMeters || rise > DetectMaxRiseMeters)
+            {
+                why = "planks=" + h.Count + " rise=" + Round(rise) + "m";
+                return false;
+            }
+
+            // ---- split the strips into spatially connected pieces (union-find over XZ extent + height)
+            int n = h.Count;
+            var parent = new int[n];
+            for (int k = 0; k < n; k++) parent[k] = k;
+            float linkXZ2 = DetectLinkXZ * DetectLinkXZ;
+            for (int a = 0; a < n; a++)
+            {
+                for (int b = a + 1; b < n; b++)
+                {
+                    if (Math.Abs(h[a] - h[b]) > DetectLinkZ) continue;
+                    float dX = Math.Max(0f, Math.Max(bx0[a] - bx1[b], bx0[b] - bx1[a]));
+                    float dY = Math.Max(0f, Math.Max(by0[a] - by1[b], by0[b] - by1[a]));
+                    if (dX * dX + dY * dY > linkXZ2) continue;
+                    int ra = a, rb = b;
+                    while (parent[ra] != ra) { parent[ra] = parent[parent[ra]]; ra = parent[ra]; }
+                    while (parent[rb] != rb) { parent[rb] = parent[parent[rb]]; rb = parent[rb]; }
+                    if (ra != rb) parent[rb] = ra;
+                }
+            }
+            var compOfRoot = new Dictionary<int, int>();
+            var comps = new List<List<int>>();
+            for (int k = 0; k < n; k++)
+            {
+                int r = k;
+                while (parent[r] != r) { parent[r] = parent[parent[r]]; r = parent[r]; }
+                int c;
+                if (!compOfRoot.TryGetValue(r, out c))
+                {
+                    c = comps.Count;
+                    compOfRoot[r] = c;
+                    comps.Add(new List<int>());
+                }
+                comps[c].Add(k);
+            }
+
+            // ---- inside each piece: cluster levels by height, then find the longest consecutive climb
+            int bestLevels = 0, bestPieces = comps.Count, accepted = 0;
+            float bestChainRise = 0f, bestChainPath = 0f;
+            for (int c = 0; c < comps.Count; c++)
+            {
+                List<int> piece = comps[c];
+                if (piece.Count < DetectMinChainLevels) continue;
+                piece.Sort(delegate (int a, int b)
+                {
+                    int cmp = h[a].CompareTo(h[b]);
+                    return cmp != 0 ? cmp : a.CompareTo(b);
+                });
+                var lz = new List<float>();
+                var lx = new List<float>();
+                var ly = new List<float>();
+                var ln = new List<int>();
+                for (int q = 0; q < piece.Count; q++)
+                {
+                    int idx = piece[q];
+                    if (lz.Count == 0 || h[idx] - lz[lz.Count - 1] > DetectLevelTolerance)
+                    {
+                        lz.Add(h[idx]);
+                        lx.Add(px[idx]);
+                        ly.Add(py[idx]);
+                        ln.Add(1);
+                    }
+                    else
+                    {
+                        int b = lz.Count - 1;
+                        int cnt = ln[b] + 1;
+                        lz[b] += (h[idx] - lz[b]) / cnt;
+                        lx[b] += (px[idx] - lx[b]) / cnt;
+                        ly[b] += (py[idx] - ly[b]) / cnt;
+                        ln[b] = cnt;
+                    }
+                }
+                // Every start, extended while the level step stays small: a flat top cut into slivers
+                // produces only 1-2 levels, while a flight produces a long chain of small steps.
+                int compLevels = 0;
+                float compRise = 0f, compPath = 0f;
+                int compStart = 0;
+                for (int s = 0; s < lz.Count; s++)
+                {
+                    int e = s;
+                    float path = 0f;
+                    for (int k = s + 1; k < lz.Count; k++)
+                    {
+                        if (lz[k] - lz[k - 1] > DetectMaxLevelRise) break;
+                        float dX = lx[k] - lx[k - 1];
+                        float dY = ly[k] - ly[k - 1];
+                        float d = (float)Math.Sqrt((double)dX * dX + (double)dY * dY);
+                        if (d > DetectMaxLevelRun) break;
+                        path += d;
+                        e = k;
+                    }
+                    int levels = e - s + 1;
+                    float chainRise = lz[e] - lz[s];
+                    if (levels > compLevels || (levels == compLevels && chainRise > compRise))
+                    {
+                        compLevels = levels;
+                        compRise = chainRise;
+                        compPath = path;
+                        compStart = s;
+                    }
+                }
+                if (compLevels > bestLevels || (compLevels == bestLevels && compRise > bestChainRise))
+                {
+                    bestLevels = compLevels;
+                    bestChainRise = compRise;
+                    bestChainPath = compPath;
+                }
+                if (compLevels < DetectMinChainLevels || compRise < DetectMinRiseMeters) continue;
+                if (compPath < 1e-3f) continue;
+                // The climb must start at the prop's base and have a staircase-like slope; this is what
+                // separates a flight from a rubble slope part-way up a ruined wall.
+                if (lz[compStart] - az0 > DetectMaxBaseGapMeters) continue;
+                float compImplied = (float)(Math.Atan2(compRise, compPath) * 180.0 / Math.PI);
+                if (compImplied < DetectMinImpliedSlopeDegrees) continue;
+                if (compImplied > DetectMaxImpliedSlopeDegrees) continue;
+                // This piece is a flight: emit its ramp from its own triangles alone, so a switchback
+                // does not mix two arms (its void would be cut by a diagonal ramp).
+                var tris = new int[piece.Count];
+                for (int q = 0; q < piece.Count; q++) tris[q] = triOf[piece[q]];
+                flights.Add(tris);
+                accepted++;
+            }
+            if (accepted == 0)
+            {
+                why = "planks=" + n + " pieces=" + bestPieces + " chain=" + bestLevels
+                    + " levels rise=" + Round(bestChainRise) + "m";
+                return false;
+            }
+
+            float implied = bestChainPath > 1e-3f
+                ? (float)(Math.Atan2(bestChainRise, bestChainPath) * 180.0 / Math.PI) : 0f;
+            float foot = (ax1 - ax0) * (ay1 - ay0);
+            float coverage = foot > 1e-4f ? areaSum / foot : 1f;
+            if (coverage > DetectMaxCoverage)
+            {
+                why = "planks=" + n + " coverage=" + Round(coverage * 100f) + "% dense";
+                flights.Clear();
+                return false;
+            }
+
+            why = "planks=" + n + " pieces=" + bestPieces + " flights=" + accepted + " best="
+                + bestLevels + " levels rise=" + Round(bestChainRise) + "m path="
+                + Round(bestChainPath) + "m implied=" + Round(implied) + "deg coverage="
+                + Round(coverage * 100f) + "%";
+            return true;
+        }
+
         public static string Describe()
         {
             return "band=" + LayerHeightMeters + "m envTol=" + EnvelopeTolerance + "m station="
@@ -601,7 +933,8 @@ namespace BetterBannerlordNavmeshing
                 + "m maxRunPerRamp=" + MaxRunPerRampMeters + "m (navigable cap applied per build);"
                 + " ladder offset connector slope=" + ConnectorSlopeDegrees + "deg width="
                 + ConnectorWidthMeters + "m footPad=" + ConnectorFootPadMeters + "m topPad="
-                + ConnectorTopPadMeters + "m";
+                + ConnectorTopPadMeters + "m; geometry detection="
+                + (GeometryDetection ? "on" : "off") + " multiflight=" + (MultiFlightSplit ? "on" : "off");
         }
 
         // Deterministic: no dictionary iteration order reaches the output.
@@ -639,8 +972,53 @@ namespace BetterBannerlordNavmeshing
         {
             int rampsBefore = r.Ramps;
             int skipsBefore = r.Skips.Count;
-            AppendPropCore(p, r, slopeCapDegrees, climbMeters, cellSizeMeters);
+            // An unflagged prop can still be a staircase (see LooksStepped). Detection is off by
+            // default; a flagged prop never takes this path, so the shipped behaviour is unchanged.
+            if (p != null && !IsSteppedOrLadder(p.Flags) && GeometryDetection)
+            {
+                string why;
+                List<int[]> flights;
+                if (LooksStepped(p, cellSizeMeters, climbMeters, out why, out flights))
+                {
+                    r.Detected++;
+                    // Synthesize each detected flight from its own triangles. A subset is a real Prop,
+                    // so the ordinary envelope / hole / chunk machinery runs unchanged; the only
+                    // difference is that a multi-flight asset cannot cut a ramp between two arms.
+                    int emitted = 0;
+                    for (int f = 0; f < flights.Count; f++)
+                    {
+                        Prop sub = SubProp(p, flights[f]);
+                        var part = new Result();
+                        AppendPropCore(sub, part, slopeCapDegrees, climbMeters, cellSizeMeters, true);
+                        if (part.Ramps > 0)
+                        {
+                            Merge(r, part);
+                            emitted++;
+                        }
+                    }
+                    if (emitted > 0)
+                    {
+                        r.DetectedRamps++;
+                    }
+                    else
+                    {
+                        Skip sk = new Skip();
+                        sk.Prop = p.Name;
+                        sk.Reason = "geometry-no-ramp";
+                        sk.Tris = flights.Count > 0 ? flights[0].Length : 0;
+                        r.Skips.Add(sk);
+                    }
+                    return;
+                }
+            }
+            AppendPropCore(p, r, slopeCapDegrees, climbMeters, cellSizeMeters, false);
             if (r.Ramps > rampsBefore) return;                 // the ordinary path emitted
+            // The ordinary pass samples the whole prop along one horizontal direction. A switchback
+            // reverses direction at its landing, so that direction is meaningless and no ramp is made.
+            // Walk the height bands instead, cut the walk at its turns, and synthesize each flight.
+            if (MultiFlightSplit && p != null && IsSteppedOrLadder(p.Flags)
+                && TryMultiFlight(p, r, slopeCapDegrees, climbMeters, cellSizeMeters))
+                return;
             if (p == null || (p.Flags & FlagLadder) == 0) return;   // connectors are ladder-flag only
             Skip skip = r.Skips.Count > skipsBefore ? r.Skips[r.Skips.Count - 1] : null;
             string refuse = null;
@@ -648,11 +1026,305 @@ namespace BetterBannerlordNavmeshing
             if (refuse != null && skip != null) skip.Reason = refuse;
         }
 
-        private static void AppendPropCore(Prop p, Result r, float slopeCapDegrees, float climbMeters,
+        // A Prop containing only the listed triangles (copied, one vertex triple per corner so the
+        // indices are trivial). Used to synthesize one detected flight on its own.
+        private static Prop SubProp(Prop p, int[] tris)
+        {
+            var sp = new Prop();
+            sp.Name = p.Name;
+            sp.Flags = p.Flags;
+            sp.IsFreeAt = p.IsFreeAt;
+            sp.SeekSurface = p.SeekSurface;
+            int n = tris.Length;
+            var verts = new float[n * 9];
+            var idx = new int[n * 3];
+            for (int k = 0; k < n; k++)
+            {
+                int t = tris[k];
+                for (int q = 0; q < 3; q++)
+                {
+                    int src = p.Tris[t * 3 + q];
+                    int dst = k * 3 + q;
+                    verts[dst * 3 + 0] = p.VertsXyz[src * 3 + 0];
+                    verts[dst * 3 + 1] = p.VertsXyz[src * 3 + 1];
+                    verts[dst * 3 + 2] = p.VertsXyz[src * 3 + 2];
+                    idx[dst] = dst;
+                }
+            }
+            sp.VertsXyz = verts;
+            sp.Tris = idx;
+            return sp;
+        }
+
+        // Append a sub-result into the prop's result, shifting its vertex / triangle indices.
+        private static void Merge(Result dst, Result src)
+        {
+            int vBase = dst.VertsXyz.Count / 3;
+            int tBase = dst.Tris.Count;
+            dst.VertsXyz.AddRange(src.VertsXyz);
+            for (int i = 0; i < src.Tris.Count; i++) dst.Tris.Add(src.Tris[i] + vBase);
+            for (int i = 0; i < src.ConnectorTris.Count; i++) dst.ConnectorTris.Add(src.ConnectorTris[i] + tBase);
+            dst.Ramps += src.Ramps;
+            dst.Stairs += src.Stairs;
+            dst.Ladders += src.Ladders;
+            dst.Holes += src.Holes;
+            dst.NoHoles += src.NoHoles;
+            dst.SkippedFlat += src.SkippedFlat;
+            dst.SkippedSteep += src.SkippedSteep;
+            dst.SkippedLong += src.SkippedLong;
+            dst.Capped += src.Capped;
+            for (int i = 0; i < src.Infos.Count; i++) dst.Infos.Add(src.Infos[i]);
+            for (int i = 0; i < src.Skips.Count; i++) dst.Skips.Add(src.Skips[i]);
+        }
+
+        // One XZ cluster of triangles inside a single height band: a tread, a landing, or a stretch of
+        // a flight. The band walk chains these bottom to top.
+        private sealed class BandNode
+        {
+            public float X, Y, Z;
+            public readonly List<int> Tris = new List<int>();
+        }
+
+        // Band-walk flight splitting for a stepped prop whose ordinary single-direction pass emitted
+        // nothing. Returns true when at least one flight produced a ramp.
+        private static bool TryMultiFlight(Prop p, Result r, float slopeCapDegrees, float climbMeters,
             float cellSizeMeters)
         {
+            int triCount = p.Tris.Length / 3;
+            int vertCount = p.VertsXyz.Length / 3;
+            if (triCount < 2 || triCount > 8000 || vertCount <= 0) return false;
+
+            var cx = new float[triCount];
+            var cy = new float[triCount];
+            var cz = new float[triCount];
+            var topZ = new float[triCount];
+            var bx0 = new float[triCount];
+            var bx1 = new float[triCount];
+            var by0 = new float[triCount];
+            var by1 = new float[triCount];
+            float zMin = float.MaxValue, zMax = float.MinValue;
+            int used = 0;
+            for (int t = 0; t < triCount; t++)
+            {
+                int i0 = p.Tris[t * 3 + 0], i1 = p.Tris[t * 3 + 1], i2 = p.Tris[t * 3 + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertCount || i1 >= vertCount || i2 >= vertCount)
+                    continue;
+                float ax = p.VertsXyz[i0 * 3], ay = p.VertsXyz[i0 * 3 + 1], az = p.VertsXyz[i0 * 3 + 2];
+                float bx = p.VertsXyz[i1 * 3], by = p.VertsXyz[i1 * 3 + 1], bz = p.VertsXyz[i1 * 3 + 2];
+                float dx = p.VertsXyz[i2 * 3], dy = p.VertsXyz[i2 * 3 + 1], dz = p.VertsXyz[i2 * 3 + 2];
+                cx[used] = (ax + bx + dx) / 3f;
+                cy[used] = (ay + by + dy) / 3f;
+                cz[used] = (az + bz + dz) / 3f;
+                topZ[used] = Math.Max(az, Math.Max(bz, dz));
+                bx0[used] = Math.Min(ax, Math.Min(bx, dx));
+                bx1[used] = Math.Max(ax, Math.Max(bx, dx));
+                by0[used] = Math.Min(ay, Math.Min(by, dy));
+                by1[used] = Math.Max(ay, Math.Max(by, dy));
+                if (az < zMin) zMin = az;
+                if (bz < zMin) zMin = bz;
+                if (dz < zMin) zMin = dz;
+                if (az > zMax) zMax = az;
+                if (bz > zMax) zMax = bz;
+                if (dz > zMax) zMax = dz;
+                used++;
+            }
+            if (used == 0 || zMax - zMin < MinRiseMeters) return false;
+
+            int bandCount = (int)Math.Floor((zMax - zMin) / LayerHeightMeters) + 1;
+            if (bandCount < 2) return false;
+            if (bandCount > BandMaxBands) bandCount = BandMaxBands;
+            var bandTris = new List<int>[bandCount];
+            for (int k = 0; k < used; k++)
+            {
+                int b = BandOf(cz[k], zMin, bandCount);
+                if (bandTris[b] == null) bandTris[b] = new List<int>();
+                bandTris[b].Add(k);
+            }
+
+            // One cluster per tread/landing inside each band; a narrow band may hold both arms of a
+            // switchback, in which case there are two.
+            var nodes = new List<BandNode>[bandCount];
+            for (int b = 0; b < bandCount; b++)
+            {
+                if (bandTris[b] == null) continue;
+                nodes[b] = ClusterBand(bandTris[b], cx, cy, topZ, bx0, bx1, by0, by1);
+            }
+            int firstBand = -1;
+            for (int b = 0; b < bandCount; b++) if (nodes[b] != null) { firstBand = b; break; }
+            if (firstBand < 0) return false;
+
+            // Greedy bottom-to-top walk: the nearest cluster in the next occupied band continues the
+            // chain. A switchback simply turns at its landing and keeps climbing.
+            var chain = new List<BandNode>();
+            BandNode cur = null;
+            for (int n = 0; n < nodes[firstBand].Count; n++)
+                if (cur == null || nodes[firstBand][n].Tris.Count > cur.Tris.Count) cur = nodes[firstBand][n];
+            if (cur == null) return false;
+            chain.Add(cur);
+            for (int b = firstBand + 1; b < bandCount; b++)
+            {
+                if (nodes[b] == null) continue;
+                BandNode next = null;
+                float best = float.MaxValue;
+                for (int n = 0; n < nodes[b].Count; n++)
+                {
+                    BandNode c = nodes[b][n];
+                    float dx = c.X - cur.X, dy = c.Y - cur.Y;
+                    float d = (float)Math.Sqrt((double)dx * dx + (double)dy * dy);
+                    if (d < best) { best = d; next = c; }
+                }
+                if (next == null || best > BandChainReachMeters)
+                {
+                    Dbg("  chain stops at band " + b + " (nearest=" + Round(best) + "m, reach="
+                        + Round(BandChainReachMeters) + "m)");
+                    break;
+                }
+                chain.Add(next);
+                cur = next;
+            }
+            if (chain.Count < 2)
+            {
+                Dbg("  chain=" + chain.Count + " bands=" + bandCount + " firstBand=" + firstBand
+                    + " - too short");
+                return false;
+            }
+
+            // Cut the chain where its horizontal direction reverses / turns sharply.
+            var flights = new List<List<BandNode>>();
+            var joints = new List<BandNode>();
+            int start = 0;
+            float lastX = 0f, lastY = 0f;
+            bool haveDir = false;
+            for (int i = 1; i < chain.Count; i++)
+            {
+                float dx = chain[i].X - chain[i - 1].X;
+                float dy = chain[i].Y - chain[i - 1].Y;
+                float len = (float)Math.Sqrt((double)dx * dx + (double)dy * dy);
+                if (len < BandTurnMinMoveMeters) continue;
+                float nx = dx / len, ny = dy / len;
+                if (haveDir && nx * lastX + ny * lastY < BandTurnSplitDot)
+                {
+                    // The joint (landing) node belongs to BOTH flights: each ramp then reaches the
+                    // landing level, so the two ramps meet instead of leaving a vertical step at the turn.
+                    var flight = new List<BandNode>();
+                    for (int k = start; k <= i; k++) flight.Add(chain[k]);
+                    if (flight.Count >= 2) flights.Add(flight);
+                    joints.Add(chain[i]);
+                    start = i;
+                }
+                lastX = nx; lastY = ny;
+                haveDir = true;
+            }
+            if (start < chain.Count)
+            {
+                var flight = new List<BandNode>();
+                for (int k = start; k < chain.Count; k++) flight.Add(chain[k]);
+                if (flight.Count >= 2) flights.Add(flight);
+            }
+            if (flights.Count == 0) return false;
+
+            if (DebugLog != null)
+            {
+                DebugLog("multiflight '" + p.Name + "': bands=" + bandCount + " chain=" + chain.Count
+                    + " flights=" + flights.Count + " z=[" + Round(zMin) + ".." + Round(zMax) + "]");
+                for (int f = 0; f < flights.Count; f++)
+                {
+                    List<BandNode> fl = flights[f];
+                    DebugLog("  flight " + f + ": nodes=" + fl.Count + " z=["
+                        + Round(fl[0].Z) + ".." + Round(fl[fl.Count - 1].Z) + "] at ("
+                        + Round(fl[0].X) + "," + Round(fl[0].Y) + ")->("
+                        + Round(fl[fl.Count - 1].X) + "," + Round(fl[fl.Count - 1].Y) + ")");
+                }
+            }
+
+            // Synthesize each flight from its own triangles through the ordinary core, with the
+            // no-hole full-run fallback enabled (a switchback's treads are present; the ramp is what
+            // gives the contour one continuous surface to follow).
+            int emitted = 0;
+            for (int f = 0; f < flights.Count; f++)
+            {
+                List<BandNode> flight = flights[f];
+                var tris = new List<int>();
+                for (int k = 0; k < flight.Count; k++) tris.AddRange(flight[k].Tris);
+                if (tris.Count < 2) continue;
+                Prop sub = SubProp(p, tris.ToArray());
+                var part = new Result();
+                AppendPropCore(sub, part, slopeCapDegrees, climbMeters, cellSizeMeters, true);
+                if (part.Ramps > 0)
+                {
+                    Merge(r, part);
+                    emitted++;
+                }
+            }
+            // A flat pad at each turn joins the two ramps. Without it, two rectangular ramps meet at
+            // one narrow corner (their widths are perpendicular to different directions), which erosion
+            // eats, leaving a vertical face between the flights.
+            if (emitted > 0)
+            {
+                for (int j = 0; j < joints.Count; j++)
+                {
+                    BandNode jn = joints[j];
+                    AppendQuad(r, jn.X - 0.6f, jn.Y, jn.Z, jn.X + 0.6f, jn.Y, jn.Z, 0f, 1.2f);
+                }
+            }
+            return emitted > 0;
+        }
+
+        // Cluster one band's triangles by XZ extent adjacency.
+        private static List<BandNode> ClusterBand(List<int> tris, float[] cx, float[] cy, float[] topZ,
+            float[] bx0, float[] bx1, float[] by0, float[] by1)
+        {
+            int n = tris.Count;
+            var parent = new int[n];
+            for (int k = 0; k < n; k++) parent[k] = k;
+            float link2 = BandLinkMeters * BandLinkMeters;
+            for (int a = 0; a < n; a++)
+            {
+                for (int b = a + 1; b < n; b++)
+                {
+                    int ia = tris[a], ib = tris[b];
+                    float dx = Math.Max(0f, Math.Max(bx0[ia] - bx1[ib], bx0[ib] - bx1[ia]));
+                    float dy = Math.Max(0f, Math.Max(by0[ia] - by1[ib], by0[ib] - by1[ia]));
+                    if (dx * dx + dy * dy > link2) continue;
+                    int ra = a, rb = b;
+                    while (parent[ra] != ra) { parent[ra] = parent[parent[ra]]; ra = parent[ra]; }
+                    while (parent[rb] != rb) { parent[rb] = parent[parent[rb]]; rb = parent[rb]; }
+                    if (ra != rb) parent[rb] = ra;
+                }
+            }
+            var rootOf = new Dictionary<int, int>();
+            var result = new List<BandNode>();
+            for (int k = 0; k < n; k++)
+            {
+                int root = k;
+                while (parent[root] != root) { parent[root] = parent[parent[root]]; root = parent[root]; }
+                int idx;
+                if (!rootOf.TryGetValue(root, out idx))
+                {
+                    idx = result.Count;
+                    rootOf[root] = idx;
+                    result.Add(new BandNode());
+                }
+                BandNode node = result[idx];
+                int t = tris[k];
+                node.X += cx[t];
+                node.Y += cy[t];
+                if (topZ[t] > node.Z) node.Z = topZ[t];
+                node.Tris.Add(t);
+            }
+            for (int k = 0; k < result.Count; k++)
+            {
+                int c = result[k].Tris.Count;
+                if (c > 0) { result[k].X /= c; result[k].Y /= c; }
+            }
+            return result;
+        }
+
+        private static void AppendPropCore(Prop p, Result r, float slopeCapDegrees, float climbMeters,
+            float cellSizeMeters, bool geometryDetected)
+        {
             if (p == null || p.VertsXyz == null || p.Tris == null) return;
-            if (!IsSteppedOrLadder(p.Flags)) return;
+            if (!geometryDetected && !IsSteppedOrLadder(p.Flags)) return;
             int triCount = p.Tris.Length / 3;
             if (triCount <= 0) return;
             int vertCount = p.VertsXyz.Length / 3;
@@ -916,6 +1588,19 @@ namespace BetterBannerlordNavmeshing
             skip.Holes = holes;
             if (starts.Count == 0)
             {
+                // A detection-driven staircase has no hole to bridge: its own treads are solid enough
+                // that the rasteriser sees them, and the artifact is in how the contour joins them. Try
+                // the full-run envelope chain before giving up. Refused for a switchback (the chain
+                // would cut across the void), which is what band-walk segmentation will handle.
+                if (geometryDetected)
+                {
+                    float gb, gt;
+                    ApronReaches(winLo, winHi, topZ, used, zMin, zMax, runMin, runMax, step,
+                        stationCount, sup[0], sup[sup.Count - 1], cellSizeMeters, out gb, out gt);
+                    if (TryFullRunChain(r, p, perp, winLo, winHi, stX, stY, stZ, stOk, stationCount,
+                            runMin, runMax, step, zMin, zMax, gb, gt, slopeCapDegrees, skip))
+                        return;
+                }
                 // No hole to bridge (or every hole was refused): the prop's own, now ledge-exempt treads
                 // are the path. This is NOT a skip - reporting it as one hid whole flights in V3.11.
                 r.NoHoles++;
@@ -965,25 +1650,9 @@ namespace BetterBannerlordNavmeshing
             // footprint at the bottom / top bands is what bounds it; half a cell of overshoot is kept
             // so a cell straddling the footprint edge still receives a span (the merge is by cell
             // adjacency within walkableClimb, so no bigger overlap is needed).
-            float botFootprint = float.MaxValue, topFootprint = float.MinValue;
-            for (int k = 0; k < used; k++)
-            {
-                if (topZ[k] <= zMin + EnvelopeTolerance && winLo[k] < botFootprint) botFootprint = winLo[k];
-                if (topZ[k] >= zMax - EnvelopeTolerance && winHi[k] > topFootprint) topFootprint = winHi[k];
-            }
-            if (botFootprint == float.MaxValue) botFootprint = runMin;
-            if (topFootprint == float.MinValue) topFootprint = runMax;
-            float halfCell = 0.5f * cellSizeMeters;
-
-            float botReach = starts[0] * step + ApronMeters;
-            float botAllowed = Math.Max(0f, runMin - botFootprint) + halfCell;
-            if (botReach > starts[0] * step + botAllowed) botReach = starts[0] * step + botAllowed;
-
-            float runEnd = runMin + (stationCount - 1) * step;
-            float topGap = (stationCount - 1 - ends[ends.Count - 1]) * step;
-            float topReach = topGap + ApronMeters;
-            float topAllowed = Math.Max(0f, topFootprint - runEnd) + halfCell;
-            if (topReach > topGap + topAllowed) topReach = topGap + topAllowed;
+            float botReach, topReach;
+            ApronReaches(winLo, winHi, topZ, used, zMin, zMax, runMin, runMax, step, stationCount,
+                starts[0], ends[ends.Count - 1], cellSizeMeters, out botReach, out topReach);
 
             var keys = new List<string>();
             int emitted = 0;
@@ -1011,6 +1680,105 @@ namespace BetterBannerlordNavmeshing
                 skip.HoleCount = starts.Count;
                 r.Skips.Add(skip);
             }
+        }
+
+        // Reach of the two flat end aprons, from the flight's own footprint (see the call site's
+        // comment). Shared by the hole bridges and the detection-driven full-run chain.
+        private static void ApronReaches(float[] winLo, float[] winHi, float[] topZ, int used,
+            float zMin, float zMax, float runMin, float runMax, float step, int stationCount,
+            int firstStation, int lastStation, float cellSizeMeters,
+            out float botReach, out float topReach)
+        {
+            float botFootprint = float.MaxValue, topFootprint = float.MinValue;
+            for (int k = 0; k < used; k++)
+            {
+                if (topZ[k] <= zMin + EnvelopeTolerance && winLo[k] < botFootprint) botFootprint = winLo[k];
+                if (topZ[k] >= zMax - EnvelopeTolerance && winHi[k] > topFootprint) topFootprint = winHi[k];
+            }
+            if (botFootprint == float.MaxValue) botFootprint = runMin;
+            if (topFootprint == float.MinValue) topFootprint = runMax;
+            float halfCell = 0.5f * cellSizeMeters;
+
+            botReach = firstStation * step + ApronMeters;
+            float botAllowed = Math.Max(0f, runMin - botFootprint) + halfCell;
+            if (botReach > firstStation * step + botAllowed) botReach = firstStation * step + botAllowed;
+
+            float runEnd = runMin + (stationCount - 1) * step;
+            float topGap = (stationCount - 1 - lastStation) * step;
+            topReach = topGap + ApronMeters;
+            float topAllowed = Math.Max(0f, topFootprint - runEnd) + halfCell;
+            if (topReach > topGap + topAllowed) topReach = topGap + topAllowed;
+        }
+
+        // Detection-driven fallback for an unflagged staircase whose own treads already supply collision:
+        // there is no raster hole to bridge, so the hole pass emits nothing. Ride the station envelope
+        // instead, one continuous chain from the lowest to the highest supported station. This is for a
+        // SINGLE flight: a significant reversal in the envelope (a switchback or a landing that doubles
+        // back) is refused, because a chain across it would cut a ramp diagonally through the air between
+        // the two arms. (Band-walk segmentation is the follow-up that handles those.)
+        private static bool TryFullRunChain(Result r, Prop p, float[] perp, float[] winLo, float[] winHi,
+            float[] stX, float[] stY, float[] stZ, bool[] stOk, int stationCount,
+            float runMin, float runMax, float step, float zMin, float zMax,
+            float botReach, float topReach, float slopeCapDegrees, Skip skip)
+        {
+            var run = new List<int>();
+            for (int i = 0; i < stationCount; i++) if (stOk[i]) run.Add(i);
+            if (run.Count < 2) return false;
+
+            // Single-flight guard.
+            for (int c = 1; c < run.Count; c++)
+                if (stZ[run[c]] - stZ[run[c - 1]] < -0.30f) return false;
+            float netRise = stZ[run[run.Count - 1]] - stZ[run[0]];
+            if (netRise < MinRiseMeters) return false;
+
+            // Plan the chunks first: a flat stretch is absorbed into the next rising chunk; the chain is
+            // refused (nothing emitted) when one chunk would break the run or slope bound.
+            var cs = new List<int>();
+            var ce = new List<int>();
+            int last = run[0];
+            for (int c = 1; c < run.Count; c++)
+            {
+                int i = run[c];
+                float rise = stZ[i] - stZ[last];
+                if (rise < MinChunkRiseMeters) continue;   // a flat tread / landing: bridge it with the next chunk
+                float dX = stX[i] - stX[last], dY = stY[i] - stY[last];
+                float runLen = (float)Math.Sqrt((double)dX * dX + (double)dY * dY);
+                if (runLen < 1e-3f || runLen > MaxRunPerRampMeters + 1e-3f) return false;
+                if (Math.Atan2(rise, runLen) * 180.0 / Math.PI > slopeCapDegrees) return false;
+                cs.Add(last);
+                ce.Add(i);
+                last = i;
+            }
+            if (cs.Count == 0) return false;
+
+            int v0 = r.VertsXyz.Count, t0 = r.Tris.Count, info0 = r.Infos.Count;
+            int ramps0 = r.Ramps, steep0 = r.SkippedSteep, long0 = r.SkippedLong;
+            var keys = new List<string>();
+            for (int c = 0; c < cs.Count; c++)
+            {
+                bool first = c == 0;
+                bool isLast = c == cs.Count - 1;
+                if (!EmitChunk(r, p.Name, perp, winLo, winHi, stX, stY, stZ, cs[c], ce[c],
+                        runMin, step, zMin, zMax, first ? botReach : 0f, isLast ? topReach : 0f,
+                        first, isLast, keys, slopeCapDegrees))
+                {
+                    r.VertsXyz.RemoveRange(v0, r.VertsXyz.Count - v0);
+                    r.Tris.RemoveRange(t0, r.Tris.Count - t0);
+                    r.Infos.RemoveRange(info0, r.Infos.Count - info0);
+                    r.Ramps = ramps0;
+                    r.SkippedSteep = steep0;
+                    r.SkippedLong = long0;
+                    return false;
+                }
+            }
+            if ((p.Flags & FlagHasSteps) != 0) r.Stairs++;
+            if ((p.Flags & FlagLadder) != 0) r.Ladders++;
+            if (skip != null)
+            {
+                skip.Reason = "geometry-ramp";
+                skip.HoleCount = cs.Count;
+            }
+            return true;
         }
 
         // The flight's horizontal direction, from the band envelope centres of its lowest and highest

@@ -67,7 +67,7 @@ namespace BetterBannerlordNavmeshing
             settings.MinHeight = 0f;
             settings.WriteObj = false;
 
-            SceneNavMeshExporter.RunPipeline(scene, "mission-hotkey (~)", settings, "", "", true, true, true, "");
+            NavMeshGenerator.RunPipeline(scene, "mission-hotkey (~)", settings, "", "", true, true, true, "");
         }
     }
 }

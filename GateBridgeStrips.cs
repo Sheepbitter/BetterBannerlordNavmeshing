@@ -37,12 +37,32 @@ namespace BetterBannerlordNavmeshing
         public const string GateNameSuffix = "#gate";
 
         // ---- tunables (documented in the README under "Gate bridge strips") -----------------------
+        // Gate-tagged geometry is the gate mechanism, not the floor. Exclude the whole gate PREFAB
+        // (all its child colliders, including the untagged collider_agent_* siblings) from the
+        // walkable soup. The editor-cube floors / walls and the terrain are not gate-prefab children
+        // and stay, so the ordinary navmesh follows the slope under the gate.
+        public static bool IgnoreGateGeometry = true;
+        // Synthesize the gate bridge strip? Off by default now: the gate plate is removed and the
+        // ordinary navmesh over the underlying slope is the path. Keep the strip code for comparison.
+        public static bool EmitStrips = false;
+        // When on (default), the crossing strip is emitted as a station chain that rides the collision
+        // surface under the gate instead of one straight quad from the plate edge to the target. On a
+        // slope the chain follows the ground through the opening; the straight bridge is only used
+        // across a genuine void. Set false to reproduce the old flat-ramp behaviour.
+        public static bool ConformToGround = true;
         // Longest void a strip may bridge (a raster hole). Anything wider is open air, not a doorway.
         public const float MaxBridgeRunMeters = 2.0f;
         // How far BELOW the plate the target surface may be and still be bridged (a gentle ramp).
+        // Conforming mode rides the ground, so it may follow a longer slope down; the straight-line
+        // slope cap still applies.
         public const float MaxDropMeters = 1.30f;
+        public const float MaxDropConformMeters = 4.0f;
         // How far ABOVE the plate the target may sit (a landing a hair higher).
         public const float MaxRiseMeters = 0.3f;
+        // A gate sits at or just above the surface people walk on, so the conforming sampler only
+        // looks DOWN from the plate (plus a hair for a threshold lip). It must never pick a wall top,
+        // a ceiling, or an upper floor above the gate.
+        public const float MaxRiseConformMeters = 0.3f;
         // A surface closer than this below the plate is already reachable by the ordinary rasteriser.
         public const float MinDropMeters = 0.5f;
         // The target is only accepted this far out, so the strip spans the whole void and lands on the
@@ -333,11 +353,19 @@ namespace BetterBannerlordNavmeshing
             for (int i = 0; i < plateTop.Length; i++)
                 if (!float.IsNaN(plateTop[i]) && plateTop[i] > clusterPlateTopMax)
                     clusterPlateTopMax = plateTop[i];
-            float floorLo = clusterPlateTopMax - (MaxDropMeters + 0.5f);
-            float floorHi = clusterPlateTopMax + 1.0f;
+            float floorLo = clusterPlateTopMax
+                - ((ConformToGround ? MaxDropConformMeters : MaxDropMeters) + 0.5f);
+            float floorHi = clusterPlateTopMax + (ConformToGround ? 0.5f : 1.0f);
             var assetTop = new float[nx * nz];
             var assetUp = new float[nx * nz];
-            for (int i = 0; i < assetTop.Length; i++) { assetTop[i] = float.NaN; assetUp[i] = float.NaN; }
+            // Highest up-facing surface at least 0.5 m BELOW the gate plate stack. This is the floor /
+            // threshold the gate is placed over. A gate's own horizontal bar can be a thin "plate" too,
+            // but it is not the floor; the crossing must start on the floor under it.
+            var assetFloor = new float[nx * nz];
+            for (int i = 0; i < assetTop.Length; i++)
+            {
+                assetTop[i] = float.NaN; assetUp[i] = float.NaN; assetFloor[i] = float.NaN;
+            }
             if (sceneVerts != null && sceneTris != null)
             {
                 int svc = sceneVerts.Length / 3;
@@ -371,6 +399,9 @@ namespace BetterBannerlordNavmeshing
                             int ci = ix + iz * nx;
                             if (float.IsNaN(assetTop[ci]) || top > assetTop[ci]) assetTop[ci] = top;
                             if (up && (float.IsNaN(assetUp[ci]) || top > assetUp[ci])) assetUp[ci] = top;
+                            if (up && top <= clusterPlateTopMax - 0.1f
+                                && (float.IsNaN(assetFloor[ci]) || top > assetFloor[ci]))
+                                assetFloor[ci] = top;
                         }
                 }
             }
@@ -469,30 +500,46 @@ namespace BetterBannerlordNavmeshing
                     if (plateTop[ci] > plateTopMax) plateTopMax = plateTop[ci];
                 }
                 if (clusterCells.Count == 0 || plateTopMax == float.MinValue) continue;
-                // The plate's walkable level is the highest surface in its own columns that is a
-                // plausible floor: within a metre of the gate-flagged slab tops. That is not always a
-                // gate-flagged slab (the gate prop's own floor is not gate-tagged) but it must never be
-                // the gate's tall overhead structure - anchoring below the real floor would drop a span
-                // under the walkable plate and let the clearance filter null the plate itself.
+                // A gate sits on the floor below it. Always use the highest up-facing surface at or
+                // below the gate member as the strip's level; the plate's own top is only a fallback
+                // when there is no floor at all. The 1.5 m bar must never become the walkable level.
                 float hp = plateTopMax;
+                float floorH = float.MinValue;
                 for (int q = 0; q < clusterCells.Count; q++)
                 {
-                    float au = assetUp[clusterCells[q]];
-                    if (float.IsNaN(au)) continue;
-                    if (au >= plateTopMax - 0.3f && au <= plateTopMax + 0.6f && au > hp) hp = au;
+                    int ci = clusterCells[q];
+                    float f = assetFloor[ci];
+                    if (!float.IsNaN(f) && f > floorH) floorH = f;
+                    if (terrainAt != null)
+                    {
+                        float tx = ox + (ci % nx) * g + 0.5f * g;
+                        float tz = oz + (ci / nx) * g + 0.5f * g;
+                        float t = terrainAt(tx, tz);
+                        if (!float.IsNaN(t) && t <= clusterPlateTopMax - 0.1f && t > floorH) floorH = t;
+                    }
                 }
+                if (floorH > float.MinValue) hp = floorH;
                 if (clusterCells.Count == 0) continue;
+                int bx0 = nx, bx1 = -1, bz0 = nz, bz1 = -1;
+                for (int q = 0; q < clusterCells.Count; q++)
+                {
+                    int ix = clusterCells[q] % nx, iz = clusterCells[q] / nx;
+                    if (ix < bx0) bx0 = ix; if (ix > bx1) bx1 = ix;
+                    if (iz < bz0) bz0 = iz; if (iz > bz1) bz1 = iz;
+                }
+                // The plate is no longer in the soup, so the strip must cover its footprint itself:
+                // a flat central section at the floor level, joining the two crossing runs.
+                if (ConformToGround && bx1 >= bx0 && bz1 >= bz0)
+                {
+                    float qx0 = ox + bx0 * g, qx1 = ox + (bx1 + 1) * g;
+                    float qz0 = oz + bz0 * g, qz1 = oz + (bz1 + 1) * g;
+                    AppendQuad(r, qx0, qz0, hp, qx1, qz0, hp, qx1, qz1, hp, qx0, qz1, hp);
+                }
                 r.Plates++;
                 if (Trace != null)
                 {
-                    int bx0 = nx, bx1 = -1, bz0 = nz, bz1 = -1;
-                    for (int q = 0; q < clusterCells.Count; q++)
-                    {
-                        int ix = clusterCells[q] % nx, iz = clusterCells[q] / nx;
-                        if (ix < bx0) bx0 = ix; if (ix > bx1) bx1 = ix;
-                        if (iz < bz0) bz0 = iz; if (iz > bz1) bz1 = iz;
-                    }
-                    Trace("cluster cells=" + clusterCells.Count + " hp=" + Num(hp) + " ncomp=" + ncomp
+                    Trace("cluster cells=" + clusterCells.Count + " hp=" + Num(hp) + " plateTop="
+                        + Num(plateTopMax) + " floorH=" + Num(floorH) + " ncomp=" + ncomp
                         + " x=[" + Num(ox + bx0 * g) + ".." + Num(ox + (bx1 + 1) * g) + "] z=["
                         + Num(oz + bz0 * g) + ".." + Num(oz + (bz1 + 1) * g) + "]");
                     if (ox + bx0 * g < 1135 && ox + (bx1 + 1) * g > 1126
@@ -508,8 +555,21 @@ namespace BetterBannerlordNavmeshing
                     }
                 }
                 int stripsBefore = r.Strips;
+                // A gate threshold slab is a rectangle: the LONG footprint axis is the opening (the
+                // gate's width), the SHORT axis is the passage through the wall. Only the two boundary
+                // runs on the long edges are crossings; the short-edge runs face the jambs and, if
+                // emitted, punch a strip sideways through the gatehouse wall into whatever room/island
+                // happens to be behind it.
+                float extentX = maxX - minX;
+                float extentZ = maxZ - minZ;
+                bool crossingAlongZ = extentX >= extentZ;
+                if (Trace != null)
+                    Trace("  crossing axis=" + (crossingAlongZ ? "Z" : "X") + " extents=("
+                        + Num(extentX) + "," + Num(extentZ) + ")");
                 for (int dir = 0; dir < 4; dir++)
                 {
+                    if (crossingAlongZ && dir < 2) continue;    // skip the jamb runs (±X)
+                    if (!crossingAlongZ && dir >= 2) continue;  // skip the jamb runs (±Z)
                     int dx = dir == 0 ? 1 : dir == 1 ? -1 : 0;
                     int dz = dir == 2 ? 1 : dir == 3 ? -1 : 0;
                     // Boundary cells in this direction, as (perp, along) pairs. Runs are grouped by
@@ -587,12 +647,14 @@ namespace BetterBannerlordNavmeshing
                     + Num(ex1) + "," + Num(ez1) + ") hp=" + Num(hp));
 
             float step = 0.5f * g;
+            float bandLo = hp - (ConformToGround ? MaxDropConformMeters : MaxDropMeters);
+            float bandHi = hp + (ConformToGround ? MaxRiseConformMeters : MaxRiseMeters);
             for (float t = step; t <= MaxBridgeRunMeters + 1e-4f; t += step)
             {
                 float px = mx + dirX * t, pz = mz + dirZ * t;
-                float top = topInBand(px, pz, hp - MaxDropMeters, hp + MaxRiseMeters);
+                float top = topInBand(px, pz, bandLo, bandHi);
                 if (float.IsNaN(top)) { if (Trace != null) Trace("    t=" + Num(t) + " void"); continue; }
-                if (t < MinGapMeters) { if (Trace != null) Trace("    t=" + Num(t) + " top=" + Num(top) + " (too close)"); continue; }
+                if (t < MinGapMeters && !ConformToGround) { if (Trace != null) Trace("    t=" + Num(t) + " top=" + Num(top) + " (too close)"); continue; }
                 float drop = hp - top;
                 if (drop < MinDropMeters) { if (Trace != null) Trace("    t=" + Num(t) + " top=" + Num(top) + " drop=" + Num(drop) + " (too near)"); continue; }
                 float run = t + PlateInsetMeters;
@@ -617,9 +679,9 @@ namespace BetterBannerlordNavmeshing
                 float cX = ex0 + dirX * reach, cZ = ez0 + dirZ * reach;
                 float dX = ex1 + dirX * reach, dZ = ez1 + dirZ * reach;
                 float hc = top, hd = top;
-                float tc = topInBand(cX, cZ, hp - MaxDropMeters, hp + MaxRiseMeters);
+                float tc = topInBand(cX, cZ, bandLo, bandHi);
                 if (!float.IsNaN(tc)) hc = tc;
-                float td = topInBand(dX, dZ, hp - MaxDropMeters, hp + MaxRiseMeters);
+                float td = topInBand(dX, dZ, bandLo, bandHi);
                 if (!float.IsNaN(td)) hd = td;
 
                 string key = Round(aX) + "," + Round(aZ) + "," + Round(cX) + "," + Round(cZ);
@@ -627,6 +689,16 @@ namespace BetterBannerlordNavmeshing
                 for (int i = 0; i < keys.Count; i++) if (keys[i] == key) { dup = true; break; }
                 if (dup) return;
                 keys.Add(key);
+
+                // Conforming mode: ride the collision surface under the gate instead of one straight
+                // quad. The chain starts inside the plate (inset), follows the sampled ground through
+                // the opening, and continues onto the approach at the far end.
+                if (ConformToGround)
+                {
+                    EmitConformingRun(r, plates, ex0, ez0, ex1, ez1, dirX, dirZ, hp, top, t,
+                        inset, OverlapMeters + TargetApronMeters, g, topInBand);
+                    return;
+                }
 
                 // Flat plate-level apron, the ramp (ending AT the found target), then a flat target-level
                 // apron. Ending the ramp at the target keeps the target's own level, so a walk point on
@@ -660,8 +732,79 @@ namespace BetterBannerlordNavmeshing
             r.Skips++;
         }
 
-        // A quad (2 triangles) from edge (x0,z0)-(x1,z1) at hA to edge (x2,z2)-(x3,z3) at the given
-        // heights. Engine soup layout: (x, z, h) with h last. The Recast mixer normalises winding.
+        // A station chain from the plate edge through the gate to the approach beyond it. Each station
+        // samples the walkable surface in the floor band (asset + terrain) at both edges of the run, so
+        // the ribbon follows the ground under the gate - including a slope - instead of cutting one
+        // straight quad. Where the surface is genuinely absent (a void), the height interpolates
+        // linearly from the plate level to the found target (the old bridge), so an open gate over a
+        // hole still gets its straight crossing.
+        private static void EmitConformingRun(Result r, IReadOnlyList<Prop> plates,
+            float ex0, float ez0, float ex1, float ez1, float dirX, float dirZ,
+            float hp, float top, float t, float inset, float tail, float g,
+            Func<float, float, float, float, float> topInBand)
+        {
+            float start = -inset;
+            float end = t + tail;
+            if (end - start < 1e-3f) return;
+            int n = (int)Math.Ceiling((end - start) / Math.Max(0.15f, g));
+            if (n < 2) n = 2;
+            if (n > 64) n = 64;
+            var hL = new float[n + 1];
+            var hR = new float[n + 1];
+            float lo = hp - MaxDropConformMeters;
+            float hi = hp + MaxRiseConformMeters;
+            for (int i = 0; i <= n; i++)
+            {
+                float d = start + (end - start) * i / n;
+                float px0 = ex0 + dirX * d, pz0 = ez0 + dirZ * d;
+                float px1 = ex1 + dirX * d, pz1 = ez1 + dirZ * d;
+                if (d <= 1e-4f)
+                {
+                    // Inside the plate: hold the gate's own walkable level.
+                    hL[i] = hp; hR[i] = hp;
+                    continue;
+                }
+                float gl = topInBand(px0, pz0, lo, hi);
+                float gr = topInBand(px1, pz1, lo, hi);
+                if (d >= t - 1e-3f)
+                {
+                    if (float.IsNaN(gl)) gl = top;
+                    if (float.IsNaN(gr)) gr = top;
+                }
+                float fallback = d <= t ? hp + (top - hp) * (d / Math.Max(1e-4f, t)) : top;
+                if (float.IsNaN(gl)) gl = fallback;
+                if (float.IsNaN(gr)) gr = fallback;
+                if (gl > hi) gl = hi; if (gl < lo) gl = lo;
+                if (gr > hi) gr = hi; if (gr < lo) gr = lo;
+                hL[i] = gl; hR[i] = gr;
+            }
+            hL[0] = hp; hR[0] = hp;
+            for (int i = 0; i < n; i++)
+            {
+                float d0 = start + (end - start) * i / n;
+                float d1 = start + (end - start) * (i + 1) / n;
+                float a0x = ex0 + dirX * d0, a0z = ez0 + dirZ * d0;
+                float b0x = ex1 + dirX * d0, b0z = ez1 + dirZ * d0;
+                float a1x = ex0 + dirX * d1, a1z = ez0 + dirZ * d1;
+                float b1x = ex1 + dirX * d1, b1z = ez1 + dirZ * d1;
+                AppendQuad(r, a0x, a0z, hL[i], b0x, b0z, hR[i], b1x, b1z, hR[i + 1], a1x, a1z, hL[i + 1]);
+            }
+            var info = new Info();
+            info.Prop = plates.Count > 0 ? plates[0].Name : "";
+            info.Gap = t + inset;
+            info.Drop = hp - top;
+            info.SlopeDeg = (float)(Math.Atan2(hp - top, Math.Max(1e-4f, t + inset)) * 180.0 / Math.PI);
+            info.Width = Math.Max(0f, (ex1 - ex0) + (ez1 - ez0));
+            info.Hp = hp; info.Ht = top;
+            info.Ex = 0.5f * (ex0 + ex1); info.Ez = 0.5f * (ez0 + ez1);
+            info.Tx = ex0 + dirX * t; info.Tz = ez0 + dirZ * t;
+            r.Infos.Add(info);
+            r.Strips++;
+            if (Trace != null)
+                Trace("    EMIT-CONFORM gap=" + Num(t + inset) + " drop=" + Num(hp - top)
+                    + " stations=" + n + " width=" + Num(info.Width));
+        }
+
         private static void AppendQuad(Result r, float x0, float z0, float h0, float x1, float z1, float h1,
             float x2, float z2, float h2, float x3, float z3, float h3)
         {

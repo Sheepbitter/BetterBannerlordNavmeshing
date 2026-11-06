@@ -1,6 +1,8 @@
 using System;
 using System.Globalization;
 using System.Linq;
+using System.Reflection;
+using TaleWorlds.DotNet;
 using TaleWorlds.Engine;
 using TaleWorlds.Library;
 using TaleWorlds.MountAndBlade;
@@ -33,7 +35,6 @@ namespace BetterBannerlordNavmeshing
         public const int VoxelPruneMaxIslandFaces = 400;
         public const bool VoxelCleanup = true;
         public const bool VoxelQuadMerge = true;
-        public const bool VoxelGatePlateBlend = true;
         public const bool VoxelBarriers = true;
         public const bool VoxelDetailMesh = true;
         public const float VoxelDetailSampleDistMeters = 2f;
@@ -43,10 +44,12 @@ namespace BetterBannerlordNavmeshing
         public const bool VoxelIncludeFlora = false;
         public const bool VoxelAssetTrace = false;
         public const bool VoxelSteppedProps = true;
-        public const bool VoxelGateConnectors = true;
         public const bool VoxelWriteSoupObj = false;
         public const bool VoxelTerrainHoleAudit = false;
-        public const bool CullBelowWaterLevel = true;
+        public const TiledNavMeshBuilder.WaterMode WaterMode = TiledNavMeshBuilder.WaterMode.Wadable;
+        // Water depth an agent can still wade through. 1.3 m, rounded from the human monster's swimming
+        // threshold (Monster.StandingChestHeight = 1.31 m in Native\ModuleData\monsters.xml).
+        public const float WaterWadeDepthMeters = 1.3f;
         // Steep-face repair defaults. The slope threshold is MaxSlopeDegrees + margin (0 = the cap
         // itself); the height allowance is in agent-climb units (1.5 = 1.1 m at climb 0.6 / cell 0.2).
         public const float SteepFaceMarginDegrees = 10f;
@@ -58,7 +61,7 @@ namespace BetterBannerlordNavmeshing
     // terrain; the "Export NavMesh" button reads the scene's live in-memory
     // terrain, builds a navmesh prefab and imports its faces into the scene.
     // Also hosts the shared pipeline used by the in-game mission logic.
-    public class SceneNavMeshExporter : ScriptComponentBehavior
+    public class NavMeshGenerator : ScriptComponentBehavior
     {
         private const string BuildTag = "Build 3 (adaptive navmesh)";
 
@@ -72,101 +75,121 @@ namespace BetterBannerlordNavmeshing
         // ---------------- Settings (same names as the terrain script) ----------------
         public SimpleButton ExportNavMesh;
         public SimpleButton ImportNavMeshOnly;
+        [EditableScriptComponentVariable(false)]
         public SimpleButton ProbeGeometry;
 
         // Offline test case: write the export's main-thread inputs (terrain grid + per-entity collision
         // triangles) plus a human-readable header, so the standalone harness can rebuild the exact soup
         // for this scene without the editor. See SceneSnapshot / README.
+        [EditableScriptComponentVariable(false)]
         public SimpleButton DumpSceneSnapshot;
+        [EditableScriptComponentVariable(false)]
         public int NavMeshSampleStride = NavMeshPipelineDefaults.SampleStride;
+        [EditableScriptComponentVariable(false)]
         public float NavMeshMaxErrorMeters = NavMeshPipelineDefaults.MaxErrorMeters;
+        [EditableScriptComponentVariable(false)]
         public float NavMeshCoarsestSpacing = NavMeshPipelineDefaults.CoarsestSpacingMeters;
         public float NavMeshMaxSlopeDegrees = NavMeshPipelineDefaults.MaxSlopeDegrees;
         // Steep-face repair: threshold = NavMeshMaxSlopeDegrees + margin. 10 (default) = 60 deg at the
         // shipped 50 deg cap; 0 = exactly the cap (more aggressive, map-changing).
+        [EditableScriptComponentVariable(false)]
         public float NavMeshSteepFaceMarginDegrees = NavMeshPipelineDefaults.SteepFaceMarginDegrees;
         // Height allowance in agent-climb units: faces up to this tall are kept as step/kerb connectors.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshSteepFaceMinHeightClimbs = NavMeshPipelineDefaults.SteepFaceMinHeightClimbs;
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshCullBelowHeight = false;
+        [EditableScriptComponentVariable(false)]
         public float NavMeshMinHeight = 0f;
         // Water-level mode (always active; scenes always have a water level, dry maps set it well below
-        // the terrain so this is a natural no-op). ON = CULL: drop every FLOOR-LIKE soup triangle whose
-        // lifted lowest corner is below the level. OFF = RAISE (v2 only): clamp every FLOOR-LIKE soup
-        // vertex whose lifted height is below the level up to exactly the level, so the mesh never sits
-        // under the surface. Floor-like = Recast-space upward normal >= cos(NavMeshMaxSlopeDegrees): wall
-        // and obstacle geometry is NEVER culled or clamped, so walls keep standing and keep blocking. The
-        // comparison is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher supports
-        // the cull only; a v1 raise is a documented no-op.
-        public bool NavMeshCullBelowWaterLevel = NavMeshPipelineDefaults.CullBelowWaterLevel;
+        // the terrain so this is a natural no-op). Dropdown, one of:
+        //   Raise   - non-culling: clamp every FLOOR-LIKE soup vertex below the level up to exactly the
+        //             level, so the mesh never sits under the surface.
+        //   Cull    - drop every FLOOR-LIKE soup triangle whose lifted lowest corner is below the level.
+        //   Wadable - Cull, except ground no deeper than NavMeshWaterWadeDepthMeters is raised to the
+        //             surface instead of dropped (the base game starts swimming at chest height).
+        // Floor-like = Recast-space upward normal >= cos(NavMeshMaxSlopeDegrees): wall and obstacle
+        // geometry is NEVER culled or clamped, so walls keep standing and keep blocking. The comparison
+        // is on the lifted height (soupY + NavMeshHeightOffsetMeters). The v1 mesher supports the cull
+        // only; a v1 raise is a documented no-op.
+        public TiledNavMeshBuilder.WaterMode NavMeshWaterMode = NavMeshPipelineDefaults.WaterMode;
+        // Water depth an agent can still wade through (Wadable mode). 1.3 m: the base game starts
+        // swimming at the human monster's standing chest height (1.31 m in Native monsters.xml).
+        [EditableScriptComponentVariable(true, "WaterWadeDepthMeters")]
+        public float NavMeshWaterWadeDepthMeters = NavMeshPipelineDefaults.WaterWadeDepthMeters;
         public float NavMeshHeightOffsetMeters = NavMeshPipelineDefaults.HeightOffsetMeters;
+        [EditableScriptComponentVariable(false)]
         public string NavMeshPrefabName = "";
+        [EditableScriptComponentVariable(false)]
         public string NavMeshExportFolder = "";
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshClearExistingFaces = true;
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshImportIntoScene = true;
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshWriteObj = false;
 
         // Voxel core (navmesh v2, the default since 2026-09-29). The Export button runs the tiled
         // voxel pipeline (TiledNavMeshBuilder) instead of the v1 adaptive terrain mesher.
         // Terrain-only for now; set false to use the v1 mesher.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshUseVoxelCore = NavMeshPipelineDefaults.UseVoxelCore;
         // Voxel cell size (m). Default 0.25 m since 2026-09-29: the connectivity lab shows 1.0-1.2 m
         // doorways, walkways and stair treads systematically vanish at 0.5 m (erosion + quantization
         // leave 0 cells regardless of the radius setting). 0.25 costs ~4x build time and ~2-4x faces;
         // raise it to 0.5 for fast iteration on open terrain.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshVoxelCellSize = NavMeshPipelineDefaults.VoxelCellSizeMeters;
 
         // Agent max climb (m) for the v2 voxel core. 0 = auto-derive so that
         // NavMeshMaxSlopeDegrees is actually traversable (Recast's ledge filter
         // needs walkableClimb >= 2*cs*tan(slope)/ch). See the README.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshVoxelAgentClimbMeters = NavMeshPipelineDefaults.VoxelAgentClimbMeters;
 
         // Agent radius (m) for the v2 voxel core. Erosion = ceil(radius/cellSize) cells each side and
         // the tile border is 3 + ceil(radius/cellSize). Default 0.25 m: at cellSize 0.5 this is still
         // erosion 1, but at cellSize 0.25 it stays 1 instead of 2, which is what keeps 1.0-1.2 m
         // doorways / walkways / stair treads connected. See the connectivity lab in the README.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshVoxelAgentRadius = NavMeshPipelineDefaults.VoxelAgentRadiusMeters;
 
         // Recast ledge filter (default true = Recast behaviour). It trims spans within walkableClimb of
         // a drop, which keeps the mesh off real cliff edges but also eats the border cells of narrow
         // walkways/bridges that have drops on both sides. Turn off if narrow structures keep losing
         // their edges (or if a level is connected on one side but not the other).
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelLedgeFilter = NavMeshPipelineDefaults.VoxelLedgeFilter;
 
         // Gap fill (cells, default 2, 0 = off). Before erosion, fills a column with no walkable span
         // when walkable spans flank it on opposite sides along one axis with an empty run of at most
         // this many cells and a floor difference within the agent climb. Closes abutting-prefab /
         // paved-terrace seams (a hairline collision gap that erosion would widen into a break).
+        [EditableScriptComponentVariable(false)]
         public int NavMeshVoxelGapFillCells = NavMeshPipelineDefaults.VoxelGapFillCells;
 
         // Stitch (cells, default 4 = 1.0 m at cellSize 0.25, 0 = off). Per tile: reconnects two mesh
         // components whose nearest boundary edges are within this many cells and within the agent climb,
         // by adding a small quad that reuses existing vertices. Refused across walls/doors/ceilings.
+        [EditableScriptComponentVariable(false)]
         public int NavMeshVoxelStitchMaxGapCells = NavMeshPipelineDefaults.VoxelStitchMaxGapCells;
 
         // Prune small isolated islands after the merge (sealed-void lids, stray fragments).
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelPruneIsolatedIslands = NavMeshPipelineDefaults.VoxelPruneIsolatedIslands;
+        [EditableScriptComponentVariable(false)]
         public int NavMeshVoxelPruneMaxIslandFaces = NavMeshPipelineDefaults.VoxelPruneMaxIslandFaces;
 
         // Final-mesh sliver cleanup (thin/tiny triangles). Default ON, documented in the README.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelCleanup = NavMeshPipelineDefaults.VoxelCleanup;
 
         // Final quad merge, part of the cleanup (default ON). Thin faces are combined with a
         // near-coplanar neighbour into one emitted 4-vertex face; geometry is unchanged (only the
         // shared interior edge disappears). Switch OFF instantly if the engine's importer ever
         // dislikes n-gon faces.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelQuadMerge = NavMeshPipelineDefaults.VoxelQuadMerge;
-
-        // Gate / door PLATE BLEND (v2 voxel core, default ON). A prop that carries a rigid, dead-flat
-        // floor slab - a castle gate's floor colliders are the reported case - projects into the voxel
-        // grid as a perfectly horizontal plate that ignores the ground it is dropped onto. On sloping
-        // terrain one end of that plate then ends up more than an agent climb above its neighbour and
-        // stops stitching (measured on CC_20: the plate at y=86.30 across a passage whose terrain falls
-        // 87.1 -> 82.8 m, so the far end met faces 1.2 m below it). With this on, such a plate is
-        // ROTATED - by at most NavMeshMaxSlopeDegrees, and by at most its own rise budget - onto a plane
-        // least-squares fitted to the built mesh around it, so both ends meet the surroundings inside the
-        // agent climb. Only the plate's own vertices move, so no face is added or removed and no edge is
-        // touched. See TiledNavMeshBuilder.BlendGatePlates and the README.
-        public bool NavMeshVoxelGatePlateBlend = NavMeshPipelineDefaults.VoxelGatePlateBlend;
 
         // BARRIERS (default ON). When on, every barrier body whose blocking mask stops agents is
         // collected and carved out of the navmesh as a solid wall, so an agent can no longer path
@@ -178,21 +201,25 @@ namespace BetterBannerlordNavmeshing
         // One-way is NOT reproduced: the barrier's Flip flag is a physics-normal direction, and a
         // navmesh has no directed edges, so the carved wall blocks both ways. That is strictly more
         // restrictive than the runtime rule and is documented in README.md.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelBarriers = NavMeshPipelineDefaults.VoxelBarriers;
 
         // Extra probe points for the scene snapshot (format "x,y;x,y;...", default empty). The harness
         // asserts each point is covered by a face on the largest island after the build.
+        [EditableScriptComponentVariable(false)]
         public string NavMeshSnapshotAssertPoints = "";
 
         // Detail mesh for the v2 voxel core (default true). Adds interior vertices so faces follow
         // the terrain surface instead of chording under hills/knolls; bounded by
         // NavMeshMaxErrorMeters. Disable for a leaner bin (flat/plateau scenes only).
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelDetailMesh = NavMeshPipelineDefaults.VoxelDetailMesh;
 
         // v2 detail-mesh sampling distance (m). 0 = auto (max(0.9, cellSize)). Default 2.0 m: the
         // harness sweep shows it removes the tight/sliver faces Recast's detail edge tessellation
         // makes along walkable boundaries, with no fidelity loss. Lower it for more surface detail
         // (more faces); raise it (up to ~2*minPolyExtent) for fewer faces.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshVoxelDetailSampleDist = NavMeshPipelineDefaults.VoxelDetailSampleDistMeters;
 
         // v2 contour simplification error (voxels). 0 = auto (NavMeshMaxErrorMeters / cellSize).
@@ -200,19 +227,24 @@ namespace BetterBannerlordNavmeshing
         // falling -43% / -24% / -34% on CC_20 / Birtu / Basamu versus 1.3 vox, and the 0.50 m
         // boundary budget at cs 0.25 m equals the cleanup's own SurfaceToleranceMeters. 1.3 vox was
         // the pre-census default.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshVoxelContourMaxError = NavMeshPipelineDefaults.VoxelContourMaxErrorVoxels;
 
         // Phase 3: ingest static asset collision geometry (interiors, stairs, decks, bridges over
         // terrain) into the v2 voxel core. NavMeshHeightOffsetMeters lifts the whole merged mesh
         // (terrain and structures alike) so it never intersects either. Dynamic props (e.g. merlons)
         // and flora are toggled separately.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelIncludeAssets = NavMeshPipelineDefaults.VoxelIncludeAssets;
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelIncludeDynamic = NavMeshPipelineDefaults.VoxelIncludeDynamic;
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelIncludeFlora = NavMeshPipelineDefaults.VoxelIncludeFlora;
 
         // Diagnostic (default off): log one line per included entity immediately before its native
         // PhysicsShape.GetTriangle read. If that native call ever read-AVs the process, the last line
         // in the log names the culprit entity/body. Cheap enough to leave off in normal runs.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelAssetTrace = NavMeshPipelineDefaults.VoxelAssetTrace;
 
         // Stepped-prop handling (v2 voxel core only, DEFAULT OFF until the acceptance bar holds).
@@ -225,20 +257,13 @@ namespace BetterBannerlordNavmeshing
         //    no collision (a hole up to MaxBridgeRunMeters), with true-level end aprons, so a ramp can
         //    never hover above an existing tread.
         // See SteppedPropRamps and the README "Stairs & ladders".
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelSteppedProps = NavMeshPipelineDefaults.VoxelSteppedProps;
-
-        // Gate / door BRIDGE STRIPS (v2 voxel core, default ON). A gate's passage floor is a stack of
-        // separate rigid collider slabs whose edge stops short of the ground beyond the doorway; the
-        // voxel core projects them as a proud plate and the ledge trim eats the crossing, so the direct
-        // path through the gate is a hole. With this on, GateBridgeStrips finds the gate-flagged
-        // thin-slab passage plate and emits a force-walkable bridge strip from its edge to the first
-        // surface beyond the gap (within the agent climb). Name-free (the fixE gate tag + geometry). See
-        // GateBridgeStrips and the README "Gate bridge strips".
-        public bool NavMeshVoxelGateConnectors = NavMeshPipelineDefaults.VoxelGateConnectors;
 
         // Diagnostic (default off): also write <prefab>_soup_terrain.obj and <prefab>_soup_assets.obj
         // next to the bin (engine space). Lets a failing spot be inspected with geometry provenance
         // (terrain soup vs asset triangles) in the editor or Blender.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelWriteSoupObj = NavMeshPipelineDefaults.VoxelWriteSoupObj;
 
         // Terrain-hole audit (default off). The engine's bulk node arrays carry no hole information, so
@@ -246,6 +271,7 @@ namespace BetterBannerlordNavmeshing
         // against the hole-aware point query Scene.GetTerrainHeight(pos, checkHoles: true) and any
         // vertex that disagrees by more than 1 m is treated as a hole: its terrain cells are dropped
         // from the soup. Costs one native point query per vertex (see the README for the measured cost).
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshVoxelTerrainHoleAudit = NavMeshPipelineDefaults.VoxelTerrainHoleAudit;
 
         // Run the v2 voxel build on a background thread so the editor UI stays alive during the
@@ -255,36 +281,22 @@ namespace BetterBannerlordNavmeshing
         // .TickComponentsEditor -> ScriptComponentBehavior.OnEditorTick, called for every script
         // component in the open scene). Ignored for the v1 mesher (NavMeshUseVoxelCore=false), which
         // stays synchronous. See the README ("Async build").
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshAsyncBuild = true;
 
         // Mirror the important run lines (start / stage / progress / finish-or-failure) to the
         // editor console (Debug.Print) and, in game, to the player (InformationManager). The
         // verbose per-session log FILE is unaffected - it stays exactly as detailed as it was.
         // Without this, a 30 s - 5 min build is a silent wait. See NavMeshVisibleLog + README.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshConsoleMessages = NavMeshPipelineDefaults.ConsoleMessages;
-
-        // LIVE build status, shown as its own row in the editor's script-variables
-        // panel for this entity - the panel that already carries the Export NavMesh
-        // button and the settings above. It is what answers "what stage is it at?"
-        // during a multi-minute build; the editor's own Console panels cannot be
-        // written to from a mod (see NavMeshVisibleLog for the whole story).
-        //
-        // A public instance field is all that is needed: ScriptComponentBehavior
-        // .CollectEditableFields() gives every public non-static field a widget, so
-        // no [EditableScriptComponentVariable] is required. The value is owned here
-        // (it is a saved script variable, so it survives a scene reload); the editor
-        // tick additionally asks the engine to repaint the row.
-        //
-        // Driven by NavMeshVisibleLog.StatusText, i.e. by the same line the visible
-        // log produces - the wording is shared, never duplicated. Advances whatever
-        // NavMeshConsoleMessages is set to.
-        public string NavMeshBuildStatus = NavMeshVisibleLog.IdleStatus;
 
         // Draw the same status line as floating text in the editor viewport, on top of
         // the panel row. Off by default because the engine gates the debug-text overlay
         // on the ini/CVar option `show_debug_text`, which the shipped
         // Modules\Native\engine_module.ini does not set (so it is off). Turn this on
         // AND add `show_debug_text = 1` to that file, then restart the editor.
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshOverlayText = false;
 
         // Where the overlay line is drawn, in the engine's own screen coordinates.
@@ -293,14 +305,19 @@ namespace BetterBannerlordNavmeshing
         // the text somewhere else - no rebuild needed, and the values save with the
         // scene. NavMeshOverlaySeconds is how long the DONE / import-skipped / FAILED
         // line lingers before the overlay goes away again.
+        [EditableScriptComponentVariable(false)]
         public float NavMeshOverlayX = 0f;
+        [EditableScriptComponentVariable(false)]
         public float NavMeshOverlayY = 0f;
+        [EditableScriptComponentVariable(false)]
         public float NavMeshOverlaySeconds = 5f;
 
         // ---------------- Logging ----------------
         // In-editor Console.WriteLine is invisible, so every run is also written
         // to a per-session log file (see NavMeshLog).
+        [EditableScriptComponentVariable(false)]
         public bool NavMeshWriteLogFile = true;
+        [EditableScriptComponentVariable(false)]
         public string NavMeshLogFolder = "";
 
         // ---------------- Async build state ----------------
@@ -405,8 +422,8 @@ namespace BetterBannerlordNavmeshing
             DrawStatusOverlay();
         }
 
-        // Mirrors NavMeshVisibleLog.StatusText into NavMeshBuildStatus and asks the
-        // engine to repaint that row. Main thread only (this is called from
+        // Mirrors NavMeshVisibleLog.StatusText into the debug component's NavMeshBuildStatus row and asks
+        // the engine to repaint it. Main thread only (this is called from
         // OnEditorTick); never throws.
         //
         // SetVariableEditorWidgetValue is the engine's own "update this variable's
@@ -415,6 +432,59 @@ namespace BetterBannerlordNavmeshing
         // by design: if the editor does not act on it the row still holds the right
         // text and is correct whenever the panel is rebuilt or reselected, and the
         // authoritative value is the managed field either way.
+        // Copies the optional companion components' values into this component's own fields.
+        // The three scripts are expected on the same entity (the exporter prefab). If a companion
+        // is absent - an older scene that only has this component - the serialized values here are
+        // used unchanged, so existing scenes keep working.
+        public void ApplyOptionsFromComponents()
+        {
+            if (GameEntity == null)
+                return;
+
+            NavMeshGenerator_AdvancedOptions advanced =
+                GameEntity.GetFirstScriptOfType<NavMeshGenerator_AdvancedOptions>();
+            if (advanced != null)
+                CopyPublicFields(advanced);
+
+            NavMeshGenerator_DebugOptions debug =
+                GameEntity.GetFirstScriptOfType<NavMeshGenerator_DebugOptions>();
+            if (debug != null)
+                CopyPublicFields(debug);
+        }
+
+        // Copies every public instance field whose name and type also exist on this component.
+        // This keeps the companion components as pure UI mirrors while the pipeline continues to
+        // read one set of fields here.
+        private void CopyPublicFields(object source)
+        {
+            FieldInfo[] fields = source.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                // Buttons are widgets, not settings; never copy a widget reference across components.
+                if (fields[i].FieldType == typeof(SimpleButton))
+                    continue;
+
+                FieldInfo target = GetType().GetField(fields[i].Name,
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (target == null || target.FieldType != fields[i].FieldType)
+                    continue;
+                target.SetValue(this, fields[i].GetValue(source));
+            }
+        }
+
+        // The overlay settings are debug options and are read every editor tick, so refresh just
+        // those fields before drawing. (Advanced settings only matter at export time.)
+        private void ApplyDebugOptions()
+        {
+            if (GameEntity == null)
+                return;
+
+            NavMeshGenerator_DebugOptions debug =
+                GameEntity.GetFirstScriptOfType<NavMeshGenerator_DebugOptions>();
+            if (debug != null)
+                CopyPublicFields(debug);
+        }
+
         private void PushBuildStatusToPanel()
         {
             string status = NavMeshVisibleLog.StatusText;
@@ -422,25 +492,13 @@ namespace BetterBannerlordNavmeshing
                 return;
 
             _pushedStatus = status;
-            NavMeshBuildStatus = status;
+            if (GameEntity == null)
+                return;
 
-            try
-            {
-                ManagedScriptComponent component = ScriptComponent;
-                if (component == null)
-                    return;
-
-                component.SetVariableEditorWidgetValue(
-                    nameof(NavMeshBuildStatus), RglScriptFieldType.RglSftString, 0.0);
-            }
-            catch (Exception)
-            {
-                // The engine logs "Field name %s can not be found for script component %s."
-                // and does nothing when the name is unknown, and an older engine may not
-                // have the method at all. Never let this break the editor tick: the row
-                // still carries NavMeshBuildStatus.
-                _pushedStatus = NavMeshBuildStatus;
-            }
+            NavMeshGenerator_DebugOptions debug =
+                GameEntity.GetFirstScriptOfType<NavMeshGenerator_DebugOptions>();
+            if (debug != null)
+                debug.SetBuildStatus(status);
         }
 
         // Draws the same status line as floating text in the editor viewport, using the
@@ -461,6 +519,7 @@ namespace BetterBannerlordNavmeshing
         // Main thread only (called from OnEditorTick); never throws.
         private void DrawStatusOverlay()
         {
+            ApplyDebugOptions();
             if (!NavMeshOverlayText)
                 return;
 
@@ -555,6 +614,7 @@ namespace BetterBannerlordNavmeshing
         // (writes the bin), restart the editor, then press Import Only.
         private void ImportOnlyFromEditor()
         {
+            ApplyOptionsFromComponents();
             try
             {
                 NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
@@ -608,13 +668,8 @@ namespace BetterBannerlordNavmeshing
 
                 string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(log, analysis);
                 if (unresolvable != null)
-                {
-                    log("import SKIPPED (the engine cannot resolve this prefab name in this"
-                        + " session): " + unresolvable);
-                    log("done: importOnly=true prefab='" + prefabName + "' imported=false");
-                    NavMeshVisibleLog.Skip(unresolvable);
-                    return;
-                }
+                    log("import: prefab-index mirror says unresolvable (" + unresolvable
+                        + "); attempting the import anyway.");
 
                 int facesBeforeRun = SafeFaceCount(scene);
                 log("faces before run: " + (facesBeforeRun < 0 ? "unavailable" : facesBeforeRun.ToString()));
@@ -688,8 +743,14 @@ namespace BetterBannerlordNavmeshing
 
         // Phase 1 diagnostic: dump the scene's collision-geometry capabilities to
         // the log file. Never throws.
+        public void RunProbeFromEditor()
+        {
+            ProbeFromEditor();
+        }
+
         private void ProbeFromEditor()
         {
+            ApplyOptionsFromComponents();
             try
             {
                 NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
@@ -721,8 +782,14 @@ namespace BetterBannerlordNavmeshing
 
         // Offline test case: writes the export's main-thread inputs next to the bin so the harness can
         // rebuild the exact soup without the editor. Never throws.
+        public void RunDumpSnapshotFromEditor()
+        {
+            DumpSnapshotFromEditor();
+        }
+
         private void DumpSnapshotFromEditor()
         {
+            ApplyOptionsFromComponents();
             try
             {
                 NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
@@ -780,8 +847,7 @@ namespace BetterBannerlordNavmeshing
                 SceneCollisionGeometry.AssetGeometry assets = SceneCollisionGeometry.CollectDetailed(
                     scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora, NavMeshVoxelAssetTrace,
                     true, NavMeshVoxelSteppedProps, log, NavMeshVoxelCellSize,
-                    ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, NavMeshMaxSlopeDegrees), NavMeshVoxelLedgeFilter,
-                    NavMeshVoxelGateConnectors);
+                    ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, NavMeshMaxSlopeDegrees), NavMeshVoxelLedgeFilter);
                 assetsWatch.Stop();
 
                 var records = new System.Collections.Generic.List<SceneSnapshot.EntityRecord>();
@@ -828,7 +894,6 @@ namespace BetterBannerlordNavmeshing
                     + " prune=" + (NavMeshVoxelPruneIsolatedIslands
                         ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
-                    + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
                     + " barriers=" + NavMeshVoxelBarriers
                     + " quadMerge=" + NavMeshVoxelQuadMerge
                     + " includeAssets=" + NavMeshVoxelIncludeAssets
@@ -838,7 +903,10 @@ namespace BetterBannerlordNavmeshing
                     + "m stride=" + NavMeshSampleStride + " fallback=" + grid.UsedPointFallback
                     + " heights=" + grid.Heights.Length);
                 sb.AppendLine("water: " + (float.IsNegativeInfinity(snapshotWater)
-                    ? "unavailable" : F(snapshotWater) + "m (scene.GetWaterLevel)"));
+                    ? "unavailable"
+                    : F(snapshotWater) + "m (scene.GetWaterLevel) mode="
+                        + TiledNavMeshBuilder.WaterModeName(NavMeshWaterMode)
+                        + " wadeDepth=" + F(NavMeshWaterWadeDepthMeters) + "m"));
                 sb.AppendLine("border: source=" + TiledNavMeshBuilder.BorderPolygon.SourceName(
                         snapBorder != null ? snapBorder.Source : TiledNavMeshBuilder.BorderPolygon.SourceNone)
                     + " vertices=" + (snapBorder != null ? snapBorder.VertexCount : 0)
@@ -901,6 +969,7 @@ namespace BetterBannerlordNavmeshing
 
         private void ExportFromEditor()
         {
+            ApplyOptionsFromComponents();
             var settings = new TerrainNavMeshBuilder.Settings();
             settings.SampleStride = NavMeshSampleStride;
             settings.MaxErrorMeters = NavMeshMaxErrorMeters;
@@ -926,8 +995,8 @@ namespace BetterBannerlordNavmeshing
                 NavMeshVoxelAssetTrace, NavMeshVoxelAgentRadius, NavMeshVoxelLedgeFilter,
                 NavMeshVoxelWriteSoupObj, NavMeshVoxelTerrainHoleAudit, NavMeshVoxelGapFillCells,
                 NavMeshVoxelStitchMaxGapCells, NavMeshVoxelPruneIsolatedIslands,
-                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelGateConnectors, NavMeshVoxelQuadMerge,
-                NavMeshVoxelBarriers, NavMeshCullBelowWaterLevel, NavMeshConsoleMessages,
+                NavMeshVoxelPruneMaxIslandFaces, NavMeshVoxelSteppedProps, NavMeshVoxelQuadMerge,
+                NavMeshVoxelBarriers, NavMeshWaterMode, NavMeshWaterWadeDepthMeters, NavMeshConsoleMessages,
                 NavMeshSteepFaceMarginDegrees, NavMeshSteepFaceMinHeightClimbs);
         }
 
@@ -1069,10 +1138,10 @@ namespace BetterBannerlordNavmeshing
                 NavMeshPipelineDefaults.VoxelPruneIsolatedIslands,
                 NavMeshPipelineDefaults.VoxelPruneMaxIslandFaces,
                 NavMeshPipelineDefaults.VoxelSteppedProps,
-                NavMeshPipelineDefaults.VoxelGateConnectors,
                 NavMeshPipelineDefaults.VoxelQuadMerge,
                 NavMeshPipelineDefaults.VoxelBarriers,
-                NavMeshPipelineDefaults.CullBelowWaterLevel,
+                NavMeshPipelineDefaults.WaterMode,
+                NavMeshPipelineDefaults.WaterWadeDepthMeters,
                 NavMeshPipelineDefaults.ConsoleMessages);
         }
 
@@ -1108,10 +1177,10 @@ namespace BetterBannerlordNavmeshing
             bool voxelPruneIsolatedIslands,
             int voxelPruneMaxIslandFaces,
             bool voxelSteppedProps,
-            bool voxelGateConnectors,
             bool voxelQuadMerge,
             bool voxelBarriers,
-            bool cullBelowWaterLevel,
+            TiledNavMeshBuilder.WaterMode waterMode,
+            float waterWadeDepthMeters,
             bool consoleMessages,
             float steepFaceMarginDegrees = NavMeshPipelineDefaults.SteepFaceMarginDegrees,
             float steepFaceMinHeightClimbs = NavMeshPipelineDefaults.SteepFaceMinHeightClimbs)
@@ -1145,35 +1214,38 @@ namespace BetterBannerlordNavmeshing
                     + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
                     + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
 
-                // Water handling is always active: the NavMeshCullBelowWaterLevel toggle picks the MODE
-                // (ON = cull below the level, OFF = raise the navmesh up to it), so there is never navmesh
-                // under the surface either way. Scenes always have a water level (dry maps set it well
-                // below the terrain), so this is a natural no-op on dry maps - no has-water detection.
-                // Read on the MAIN THREAD (the only scene access it needs).
+                // Water handling is always active: NavMeshWaterMode selects Raise (clamp floor up to the
+                // level), Cull (drop floor below it), or Wadable (cull deep water, raise shallow ground).
+                // Scenes always have a water level (dry maps set it well below the terrain), so this is a
+                // natural no-op on dry maps - no has-water detection. Read on the MAIN THREAD (the only
+                // scene access it needs).
                 float waterLevel = 0f;
-                string waterMode = "off";
-                bool waterCull = cullBelowWaterLevel;
+                bool waterEnabled = false;
                 float waterReading = SafeWaterLevel(scene, log);
                 if (!float.IsNegativeInfinity(waterReading))
                 {
                     waterLevel = waterReading;
-                    if (waterCull)
+                    waterEnabled = true;
+                    // The v1 mesher only supports the cull; Wadable falls back to a pure cull there and
+                    // Raise is v2-only, so a v1 run is left unchanged.
+                    if (waterMode == TiledNavMeshBuilder.WaterMode.Cull
+                        || waterMode == TiledNavMeshBuilder.WaterMode.Wadable)
                     {
-                        waterMode = "cull";
                         settings.CullBelowHeight = true;   // v1 mechanism: true-height min-corner cull
                         settings.MinHeight = waterLevel;
-                        log("water: mode=cull (v1 cullBelowHeight=true minHeight=" + F(waterLevel) + "m)");
+                        log("water: mode=" + TiledNavMeshBuilder.WaterModeName(waterMode)
+                            + " level=" + F(waterLevel) + "m wadeDepth=" + F(waterWadeDepthMeters)
+                            + "m (v1 cullBelowHeight=true minHeight=" + F(waterLevel) + "m)");
                     }
                     else
                     {
-                        waterMode = "raise";
-                        // Mode B is v2-only: the v1 mesher has no clamp, so a v1 run is left unchanged.
-                        log("water: mode=raise level=" + F(waterLevel) + "m (v2 only; the v1 mesher has no raise)");
+                        log("water: mode=raise level=" + F(waterLevel)
+                            + "m (v2 only; the v1 mesher has no raise)");
                     }
                 }
                 else
                 {
-                    waterCull = false;   // the read failed; the feature is disabled for this run
+                    log("water: unavailable - water handling disabled for this run");
                 }
 
                 log("settings: stride=" + settings.SampleStride
@@ -1182,7 +1254,8 @@ namespace BetterBannerlordNavmeshing
                     + " coarsest=" + F(settings.CoarsestSpacingMeters) + "m"
                     + " cullBelowHeight=" + settings.CullBelowHeight
                     + " minHeight=" + F(settings.MinHeight)
-                    + " water=" + waterMode
+                    + " water=" + (waterEnabled ? TiledNavMeshBuilder.WaterModeName(waterMode) : "off")
+                    + " waterWadeDepth=" + F(waterWadeDepthMeters) + "m"
                     + " heightOffset=" + F(settings.HeightOffsetMeters) + "m"
                     + " prefabName='" + (prefabNameOverride ?? "") + "'"
                     + " exportFolder='" + (folderOverride ?? "") + "'"
@@ -1256,9 +1329,10 @@ namespace BetterBannerlordNavmeshing
                     voxel.QuadMerge = voxelQuadMerge;
                     voxel.SteepFaceMarginDegrees = steepFaceMarginDegrees;
                     voxel.SteepFaceMinHeightClimbs = steepFaceMinHeightClimbs;
-                    voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
-                    voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
+                    voxel.EnableWater = waterEnabled;
+                    voxel.Water = waterMode;
                     voxel.WaterLevelMeters = waterLevel;
+                    voxel.WaterWadeDepthMeters = waterWadeDepthMeters;
 
                     float[] assetVerts = null;
                     int[] assetTris = null;
@@ -1271,8 +1345,7 @@ namespace BetterBannerlordNavmeshing
                         SceneCollisionGeometry.AssetTriangles assets =
                             SceneCollisionGeometry.Collect(scene, voxelIncludeDynamic, voxelIncludeFlora,
                                 voxelAssetTrace, voxelSteppedProps, RunLog(log), voxelCellSizeMeters,
-                                ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter,
-                                voxelGateConnectors);
+                                ResolvedRampClimb(voxelAgentClimbMeters, voxelCellSizeMeters, voxel.MaxSlopeDegrees), voxelLedgeFilter);
                         assetVerts = assets.VertsXyz;
                         assetTris = assets.Tris;
                         assetForceWalkable = assets.ForceWalkableTris;
@@ -1383,6 +1456,7 @@ namespace BetterBannerlordNavmeshing
         // ------------------------------------------------------------------
         private void ExportVoxelAsyncFromEditor(TerrainNavMeshBuilder.Settings settings)
         {
+            ApplyOptionsFromComponents();
             var runWatch = System.Diagnostics.Stopwatch.StartNew();
             NavMeshLog.Initialize(NavMeshWriteLogFile, NavMeshLogFolder);
             System.Action<string> log = NavMeshLog.Write;
@@ -1416,21 +1490,20 @@ namespace BetterBannerlordNavmeshing
                     + " time=" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
                     + " logFile=" + (NavMeshLog.CurrentFilePath ?? "(disabled)"));
 
-                // Water handling is always active; the toggle picks cull (on) vs raise (off). Read on the
-                // MAIN THREAD before the build is handed to the background worker (the worker never
-                // touches the scene). Carried to the voxel settings.
+                // Water handling is always active; NavMeshWaterMode selects Raise, Cull, or Wadable. Read
+                // on the MAIN THREAD before the build is handed to the background worker (the worker
+                // never touches the scene). Carried to the voxel settings.
                 float waterLevel = 0f;
-                string waterMode = "off";
-                bool waterCull = NavMeshCullBelowWaterLevel;
+                bool waterEnabled = false;
                 float waterReading = SafeWaterLevel(scene, log);
                 if (!float.IsNegativeInfinity(waterReading))
                 {
                     waterLevel = waterReading;
-                    waterMode = waterCull ? "cull" : "raise";
+                    waterEnabled = true;
                 }
                 else
                 {
-                    waterCull = false;
+                    log("water: unavailable - water handling disabled for this run");
                 }
 
                 log("settings: stride=" + settings.SampleStride
@@ -1439,7 +1512,8 @@ namespace BetterBannerlordNavmeshing
                     + " coarsest=" + F(settings.CoarsestSpacingMeters) + "m"
                     + " cullBelowHeight=" + settings.CullBelowHeight
                     + " minHeight=" + F(settings.MinHeight)
-                    + " water=" + waterMode
+                    + " water=" + (waterEnabled ? TiledNavMeshBuilder.WaterModeName(NavMeshWaterMode) : "off")
+                    + " waterWadeDepth=" + F(NavMeshWaterWadeDepthMeters) + "m"
                     + " heightOffset=" + F(settings.HeightOffsetMeters) + "m"
                     + " prefabName='" + (NavMeshPrefabName ?? "") + "'"
                     + " exportFolder='" + (NavMeshExportFolder ?? "") + "'"
@@ -1455,7 +1529,6 @@ namespace BetterBannerlordNavmeshing
                     + " voxelStitchMaxGapCells=" + NavMeshVoxelStitchMaxGapCells
                     + " voxelPrune=" + (NavMeshVoxelPruneIsolatedIslands ? NavMeshVoxelPruneMaxIslandFaces.ToString(CultureInfo.InvariantCulture) : "off")
                     + " steppedProps=" + NavMeshVoxelSteppedProps
-                    + " gatePlateBlend=" + NavMeshVoxelGatePlateBlend
                     + " barriers=" + NavMeshVoxelBarriers
                     + " detail=" + NavMeshVoxelDetailMesh
                     + " voxelDetailSampleDist=" + F(NavMeshVoxelDetailSampleDist) + "m"
@@ -1506,8 +1579,7 @@ namespace BetterBannerlordNavmeshing
                     SceneCollisionGeometry.AssetTriangles assets =
                         SceneCollisionGeometry.Collect(scene, NavMeshVoxelIncludeDynamic, NavMeshVoxelIncludeFlora,
                             NavMeshVoxelAssetTrace, NavMeshVoxelSteppedProps, RunLog(log), NavMeshVoxelCellSize,
-                            ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter,
-                            NavMeshVoxelGateConnectors);
+                            ResolvedRampClimb(NavMeshVoxelAgentClimbMeters, NavMeshVoxelCellSize, settings.MaxSlopeDegrees), NavMeshVoxelLedgeFilter);
                     assetsWatch.Stop();
                     assetVerts = assets.VertsXyz;
                     assetTris = assets.Tris;
@@ -1539,12 +1611,12 @@ namespace BetterBannerlordNavmeshing
                 voxel.PruneMaxIslandFaces = NavMeshVoxelPruneMaxIslandFaces;
                 voxel.CleanupSlivers = NavMeshVoxelCleanup;
                 voxel.QuadMerge = NavMeshVoxelQuadMerge;
-                voxel.GatePlateBlend = NavMeshVoxelGatePlateBlend;
                 voxel.SteepFaceMarginDegrees = NavMeshSteepFaceMarginDegrees;
                 voxel.SteepFaceMinHeightClimbs = NavMeshSteepFaceMinHeightClimbs;
-                voxel.CullBelowWaterLevel = waterCull;                  // Mode A (toggle on)
-                voxel.RaiseBelowWaterLevel = waterMode == "raise";      // Mode B (toggle off)
+                voxel.EnableWater = waterEnabled;
+                voxel.Water = NavMeshWaterMode;
                 voxel.WaterLevelMeters = waterLevel;
+                voxel.WaterWadeDepthMeters = NavMeshWaterWadeDepthMeters;
                 voxel.Barriers = NavMeshVoxelBarriers ? assetBarriers : null;
 
                 var req = new AsyncVoxelBuild();
@@ -1570,7 +1642,11 @@ namespace BetterBannerlordNavmeshing
                 req.PrefabNameOverride = NavMeshPrefabName;
                 req.FolderOverride = NavMeshExportFolder;
                 req.ClearExisting = NavMeshClearExistingFaces;
-                req.ImportIntoScene = NavMeshImportIntoScene;
+                // The editor's Export button always attaches the prefab it just built. The setting
+                // remains for the standalone WriteAndImport callers, but an opposite saved value made
+                // Export write the bin and silently leave the scene on the old navmesh (the DONE line's
+                // "(not imported into the scene)"). Export must import.
+                req.ImportIntoScene = true;
                 req.Log = RunLog(log);
                 req.RunWatch = runWatch;
 
@@ -1899,7 +1975,13 @@ namespace BetterBannerlordNavmeshing
                 return "";
 
             if (!result.ImportAttempted)
+            {
+                if (!result.ImportRequested)
+                    return " (import not requested; Import Into Scene is off)";
+                if (!string.IsNullOrEmpty(result.ImportSkipReason))
+                    return " (not imported: " + result.ImportSkipReason + ")";
                 return " (not imported into the scene)";
+            }
 
             if (facesAfterRun < 0)
                 return " (imported; face count unavailable)";

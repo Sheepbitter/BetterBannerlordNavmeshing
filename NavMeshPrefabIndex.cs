@@ -20,8 +20,7 @@ namespace BetterBannerlordNavmeshing
     // RID 1176/1177), which TaleWorlds.Engine.Scene.ImportNavigationMeshPrefab
     // (RID 2971) calls.
     //
-    // What the native loader actually does (see NavMeshPrefabIndex.md for the
-    // full disassembly record):
+    // What the native loader actually does:
     //
     //   1. Look the requested name up in an in-memory tree. Keys are compared
     //      with a byte-wise memcmp, so the match is case-SENSITIVE and exact.

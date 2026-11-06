@@ -231,7 +231,14 @@ namespace DotRecast.Recast
             ix = RcBackport.Clamp(ix - hp.xmin, 0, hp.width - 1);
             iz = RcBackport.Clamp(iz - hp.ymin, 0, hp.height - 1);
             int h = hp.data[ix + iz * hp.width];
-            if (h == RC_UNSET_HEIGHT)
+            // The centre cell can hold a surface many steps below the one the polygon is on (a doorway
+            // threshold under a staircase, a lower floor under a ramp). Taking it unconditionally pulls
+            // the detail vertex down to that surface. Only accept the centre height when it is near the
+            // expected height; otherwise search the ring for a height that is.
+            const float maxCentreDelta = 2.0f;
+            bool needSearch = h == RC_UNSET_HEIGHT
+                || MathF.Abs(h * ch - fy) > maxCentreDelta;
+            if (needSearch)
             {
                 // Special case when data might be bad.
                 // Walk adjacent cells in a spiral up to 'radius', and look
@@ -243,7 +250,7 @@ namespace DotRecast.Recast
                 int nextRingIterStart = 8;
                 int nextRingIters = 16;
 
-                float dmin = float.MaxValue;
+                float dmin = h == RC_UNSET_HEIGHT ? float.MaxValue : MathF.Abs(h * ch - fy);
                 for (int i = 0; i < maxIter; ++i)
                 {
                     int nx = ix + x;

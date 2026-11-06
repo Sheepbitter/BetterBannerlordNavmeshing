@@ -103,7 +103,7 @@ namespace BetterBannerlordNavmeshing
             public List<string> LargestNames;
             public int Count, Physics;
             public int ExFlora, ExBarrier, ExTerrain, ExLadder, ExDynamic, ExNoShape, ExEmpty,
-                ExExceptions, ExUnsolid;
+                ExExceptions, ExUnsolid, ExGate;
             // Honour-able barrier bodies, engine Z-up world space (see TiledNavMeshBuilder.BarrierWalls).
             // Their triangles are kept OUT of VertsXyz/Tris on purpose; the builder cuts them separately.
             public TiledNavMeshBuilder.BarrierWalls Barriers = new TiledNavMeshBuilder.BarrierWalls();
@@ -142,10 +142,10 @@ namespace BetterBannerlordNavmeshing
 
         public static AssetTriangles Collect(Scene scene, bool includeDynamic, bool includeFlora, bool trace,
             bool propRamps, System.Action<string> log, float rampCellSize = 0.25f, float rampClimb = 0.6f,
-            bool rampLedge = true, bool gateConnectors = false)
+            bool rampLedge = true)
         {
             AssetGeometry g = CollectDetailed(scene, includeDynamic, includeFlora, trace, false, propRamps, log,
-                rampCellSize, rampClimb, rampLedge, gateConnectors);
+                rampCellSize, rampClimb, rampLedge);
             var r = new AssetTriangles();
             r.VertsXyz = g.VertsXyz;
             r.Tris = g.Tris;
@@ -168,8 +168,7 @@ namespace BetterBannerlordNavmeshing
         // propRamps: synthesize a walkable ramp for HasSteps/Ladder props (SteppedPropRamps).
         public static AssetGeometry CollectDetailed(Scene scene, bool includeDynamic, bool includeFlora,
             bool trace, bool recordEntities, bool propRamps, System.Action<string> log,
-            float rampCellSize = 0.25f, float rampClimb = 0.6f, bool rampLedge = true,
-            bool gateConnectors = false)
+            float rampCellSize = 0.25f, float rampClimb = 0.6f, bool rampLedge = true)
         {
             var result = new AssetGeometry();
             result.VertsXyz = new float[0];
@@ -198,6 +197,35 @@ namespace BetterBannerlordNavmeshing
             if (log != null && trace)
                 log("assets: TRACE enabled: one line per included entity is emitted before its triangle read.");
 
+            // Gate prefab roots: the scene tag is normally on one child (the gate mechanism), while
+            // sibling colliders (collider_agent_*) carry no tag of their own. Collect the tagged
+            // children's parent so every sibling of the same gate prefab can be excluded together.
+            var gateRoots = new HashSet<GameEntity>();
+            for (int i = 0; i < entities.Count; i++)
+            {
+                GameEntity ge = entities[i];
+                if (ge == null) continue;
+                try
+                {
+                    if (!ge.HasPhysicsBody()) continue;
+                    if (!SafeGateTag(ge)) continue;
+                    GameEntity gp = ge.Parent;
+                    string en = SafeRawEntityName(ge);
+                    string pn = gp != null ? SafeRawEntityName(gp) : null;
+                    bool enGate = en != null && en.IndexOf("gate", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool pnGate = pn != null && pn.IndexOf("gate", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool enBarricade = en != null
+                        && en.IndexOf("barricade", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (enBarricade) continue;
+                    // Only actual gate prefabs: the barricade carries the same scene tag but neither its
+                    // own name nor its parent prefab contains "gate", so it is not added here and is
+                    // left in the walkable soup (it is a real obstacle).
+                    if (enGate) gateRoots.Add(ge);
+                    if (pnGate && gp != null) gateRoots.Add(gp);
+                }
+                catch (Exception) { }
+            }
+
             // ---------------------------------------------------------------- pass 1
             // Classify only. No triangle is read here, so nothing in this pass can hit the
             // null-mesh-table crash. Collection is bounded by the same try/catch as before.
@@ -212,6 +240,7 @@ namespace BetterBannerlordNavmeshing
             int exDynamic = 0, exNoShape = 0, exceptions = 0;
             int preloadNamesEmpty = 0;
             int exUnsolid = 0;
+            int exGate = 0;
 
             for (int i = 0; i < entities.Count; i++)
             {
@@ -232,6 +261,39 @@ namespace BetterBannerlordNavmeshing
                     GameEntity.Mobility mobility = SafeMobility(e);
                     bool hasDynamic = SafeBool(() => e.HasDynamicRigidBody());
                     bool isGate = SafeGateTag(e);
+                    bool isBarricade = name.IndexOf("barricade", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool isGateMember = false;
+                    if (!isBarricade)
+                    {
+                        isGateMember = isGate;
+                        if (!isGateMember && gateRoots.Count > 0)
+                        {
+                            try
+                            {
+                                GameEntity gp = e.Parent;
+                                if (gp != null && gateRoots.Contains(gp)) isGateMember = true;
+                            }
+                            catch (Exception) { }
+                        }
+                        if (isGate && !isGateMember)
+                        {
+                            string en = name;
+                            bool enGate = en != null
+                                && en.IndexOf("gate", StringComparison.OrdinalIgnoreCase) >= 0;
+                            if (enGate) isGateMember = true;
+                            else
+                            {
+                                try
+                                {
+                                    GameEntity gp = e.Parent;
+                                    string pn = gp != null ? SafeRawEntityName(gp) : null;
+                                    if (pn != null && pn.IndexOf("gate", StringComparison.OrdinalIgnoreCase) >= 0)
+                                        isGateMember = true;
+                                }
+                                catch (Exception) { }
+                            }
+                        }
+                    }
 
                     bool isTerrain = (all & BodyFlags.BodyOwnerTerrain) != 0;
                     bool isFlora = (all & BodyFlags.BodyOwnerFlora) != 0;
@@ -299,6 +361,18 @@ namespace BetterBannerlordNavmeshing
                     }
 
                     string bodyName = SafeShapeName(shape, rawName);
+                    // The barricade's prefab name can live on the shape/body rather than the entity
+                    // name (some prefab instances have an empty entity name), so test both. A barricade
+                    // carries the gate tag but is a real obstacle and must stay in the walkable soup.
+                    bool isBarricadeBody = (name != null
+                            && name.IndexOf("barricade", StringComparison.OrdinalIgnoreCase) >= 0)
+                        || (bodyName != null
+                            && bodyName.IndexOf("barricade", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (isGateMember && !isBarricadeBody && GateBridgeStrips.IgnoreGateGeometry)
+                    {
+                        exGate++;
+                        continue;
+                    }
                     var c = new Candidate();
                     c.Entity = e;
                     c.Shape = shape;
@@ -378,9 +452,6 @@ namespace BetterBannerlordNavmeshing
             int rampSkippedFlat = 0, rampSkippedSteep = 0, rampSkippedLong = 0, rampCapped = 0;
             var rampSkips = new List<SteppedPropRamps.Skip>();
             var rampConnectorInfos = new List<SteppedPropRamps.RampInfo>();
-            // Gate / door passage-floor candidates (fixE gate provenance, thin-slab geometry). Collected
-            // across all candidates, then synthesized once at the end (the synthesis clusters them).
-            var gateProps = new List<GateBridgeStrips.Prop>();
             int included = 0, exEmpty = 0, shapesCapped = 0;
             int cStairs = 0, cWall = 0, cFloor = 0, cOther = 0;
 
@@ -483,7 +554,9 @@ namespace BetterBannerlordNavmeshing
                     }
 
                     // -------- synthesized ramp for a stepped / ladder prop
-                    if (propRamps && wrote > 0 && SteppedPropRamps.IsSteppedOrLadder(unchecked((int)c.Flags)))
+                    if (propRamps && wrote > 0
+                        && (SteppedPropRamps.IsSteppedOrLadder(unchecked((int)c.Flags))
+                            || SteppedPropRamps.GeometryDetection))
                     {
                         var prop = new SteppedPropRamps.Prop();
                         prop.Name = c.Name;
@@ -555,26 +628,6 @@ namespace BetterBannerlordNavmeshing
                                 result.Entities.Add(rr);
                             }
                         }
-                    }
-
-                    // -------- gate / door passage-floor candidate (thin-slab gate-flagged prop)
-                    if (gateConnectors && wrote > 0 && c.IsGate)
-                    {
-                        var gp = new GateBridgeStrips.Prop();
-                        gp.Name = c.Name;
-                        gp.Flags = unchecked((int)c.Flags);
-                        int pv = verts.Count / 3 - firstVert;
-                        gp.VertsXyz = new float[pv * 3];
-                        for (int v = 0; v < pv; v++)
-                        {
-                            gp.VertsXyz[v * 3 + 0] = verts[(firstVert + v) * 3 + 0];
-                            gp.VertsXyz[v * 3 + 1] = verts[(firstVert + v) * 3 + 1];
-                            gp.VertsXyz[v * 3 + 2] = verts[(firstVert + v) * 3 + 2];
-                        }
-                        gp.Tris = new int[wrote * 3];
-                        for (int t = 0; t < wrote * 3; t++)
-                            gp.Tris[t] = tris[firstTri * 3 + t] - firstVert;
-                        if (GateBridgeStrips.IsThinSlab(gp)) gateProps.Add(gp);
                     }
 
                     if (c.IsStairs) cStairs++;
@@ -711,54 +764,6 @@ namespace BetterBannerlordNavmeshing
             }
 
             watch.Stop();
-            // -------- gate / door bridge strips (GateBridgeStrips). Synthesized from the gate-flagged
-            // thin-slab passage-floor colliders and appended to the same force-walkable tail as the ramps.
-            int gateStripCount = 0;
-            int gateStripTris = 0;
-            if (gateConnectors && gateProps.Count > 0)
-            {
-                Func<float, float, float> terrainAt = null;
-                try
-                {
-                    terrainAt = delegate (float tx, float tz)
-                    {
-                        try { return scene.GetTerrainHeight(new Vec2(tx, tz), true); }
-                        catch (Exception) { return float.NaN; }
-                    };
-                }
-                catch (Exception) { terrainAt = null; }
-                GateBridgeStrips.Result gr = GateBridgeStrips.Synthesize(gateProps, verts.ToArray(),
-                    tris.ToArray(), terrainAt, rampCellSize, rampClimb, rampLedge);
-                gateStripCount = gr.Strips;
-                gateStripTris = gr.Tris.Count / 3;
-                if (gr.Tris.Count > 0)
-                {
-                    int gBase = rampVerts.Count / 3;
-                    for (int k = 0; k < gr.VertsXyz.Count; k++) rampVerts.Add(gr.VertsXyz[k]);
-                    for (int k = 0; k < gr.Tris.Count; k++) rampTris.Add(gr.Tris[k] + gBase);
-                    if (recordEntities)
-                    {
-                        var gr2 = new AssetEntityRecord();
-                        gr2.Name = (gateProps.Count > 0 ? gateProps[0].Name : "gate")
-                            + GateBridgeStrips.GateNameSuffix;
-                        gr2.Flags = (BodyFlags)0;
-                        gr2.Mobility = 0;
-                        gr2.TriCount = gr.Tris.Count / 3;
-                        gr2.Capped = false;
-                        gr2.Gate = 1;
-                        gr2.VertsXyz = gr.VertsXyz.ToArray();
-                        gr2.Tris = gr.Tris.ToArray();
-                        result.Entities.Add(gr2);
-                    }
-                }
-                if (log != null)
-                {
-                    log("assets: gate: plates=" + gr.Plates + " strips=" + gr.Strips + " skipped=" + gr.Skips
-                        + " (" + GateBridgeStrips.Describe() + ")");
-                    for (int k = 0; k < gr.Infos.Count && k < 20; k++)
-                        log("assets: " + GateBridgeStrips.DescribeInfo(gr.Infos[k]));
-                }
-            }
             // Ramps are appended after every real triangle, so the mask is a true-tail and a build with
             // no ramps leaves ForceWalkableTris null (the builder then takes its unchanged path).
             int realTris = tris.Count / 3;
@@ -775,18 +780,12 @@ namespace BetterBannerlordNavmeshing
             bool anyExempt = false;
             for (int k = 0; k < ledgeExempt.Count; k++)
                 if (ledgeExempt[k]) { anyExempt = true; break; }
-            if (anyExempt || gateStripCount > 0)
+            if (anyExempt)
             {
-                // A stepped prop's own triangles: the builder keeps their spans off the ledge trim. The
-                // synthesized gate bridge strips are marked too (forced AND exempt = a "connector"), so
-                // the builder also exempts them from the clearance filter - a bridge that descends to a
-                // floor below it would otherwise be treated as a ceiling.
+                // A stepped prop's own triangles: the builder keeps their spans off the ledge trim.
                 var exemptMask = new bool[realTris + rampTriCount];
                 for (int k = 0; k < realTris && k < ledgeExempt.Count; k++)
                     exemptMask[k] = ledgeExempt[k];
-                int gateTriCount = gateStripTris;
-                for (int k = exemptMask.Length - gateTriCount; k < exemptMask.Length; k++)
-                    if (k >= 0) exemptMask[k] = true;
                 result.LedgeExemptTris = exemptMask;
             }
             bool anyGate = false;
@@ -820,6 +819,7 @@ namespace BetterBannerlordNavmeshing
             result.ExEmpty = exEmpty;
             result.ExExceptions = exceptions;
             result.ExUnsolid = exUnsolid;
+            result.ExGate = exGate;
             result.LadderIncluded = ladderIncluded;
             // Honour masks: a barrier body is carved only when its mask blocks agents. Decided from
             // BodyFlags, never from the entity's name.
@@ -850,7 +850,8 @@ namespace BetterBannerlordNavmeshing
                     + (ladderIncluded > 0 ? " laddersIncluded=" + ladderIncluded : "")
                     + " excluded=[flora=" + exFlora + " barrier=" + exBarrier + " terrain=" + exTerrain
                     + " ladder=" + exLadder + " dynamic=" + exDynamic + " noShape=" + exNoShape
-                    + " empty=" + exEmpty + " exceptions=" + exceptions + " unsolid=" + exUnsolid + "]"
+                    + " empty=" + exEmpty + " exceptions=" + exceptions + " unsolid=" + exUnsolid
+                + " gate=" + exGate + "]"
                     + " tris=" + result.TriangleCount + " cappedShapes=" + shapesCapped
                     + " scanMs=" + result.ScanMs);
                 log("assets: kinds stairs=" + cStairs + " wall=" + cWall + " floor=" + cFloor

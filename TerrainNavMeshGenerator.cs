@@ -958,6 +958,9 @@ namespace BetterBannerlordNavmeshing
             public int CulledByHeight;
             public int BinByteCount;
             public bool ImportAttempted;
+            // True when the caller asked for an import at all (Import Into Scene is on). Lets the
+            // console distinguish "not requested" from "requested but the engine added nothing".
+            public bool ImportRequested;
 
             // Per-phase wall times (ms) from the write/import half; consumed by the
             // async editor path's "v2: perf:" line. Not part of the on-disk contract.
@@ -1132,6 +1135,7 @@ namespace BetterBannerlordNavmeshing
 
             var result = new ExportResult();
             result.BinPath = binPath;
+            result.ImportRequested = importIntoScene;
             result.FallbackBinPath = fallbackBinPath;
             result.ObjPath = objPath;
             result.PrefabName = prefabName;
@@ -1161,25 +1165,13 @@ namespace BetterBannerlordNavmeshing
                 // that is not loaded never becomes a key, which is what the
                 // fallback copy above works around.
                 string unresolvable = NavMeshPrefabIndex.ExplainUnresolvable(log, analysis);
-
-                if (unresolvable != null)
-                {
-                    result.ImportSkipReason = unresolvable;
-                    if (log != null)
-                    {
-                        log("import SKIPPED (the engine cannot resolve this prefab name in this"
-                            + " session): " + unresolvable);
-                        log("import SKIPPED: the .bin at " + binPath + " is correct; it becomes usable"
-                            + " once the engine's prefab index has been rebuilt.");
-                        if (fallbackBinPath != null)
-                        {
-                            log("import SKIPPED: the same bytes are at " + fallbackBinPath
-                                + "; that copy becomes resolvable after the restart (the engine indexes"
-                                + " prefabs once, while the modules load).");
-                        }
-                    }
-                }
-                else
+                // The prefab-index mirror is only a heuristic, and it has produced false negatives: the
+                // engine resolved the name for a manual Import Only in the same session. Never refuse
+                // the import on the mirror's verdict alone - try it, then report the face count. A
+                // genuine miss is harmless (the engine logs and adds no faces).
+                if (unresolvable != null && log != null)
+                    log("import: prefab-index mirror says unresolvable (" + unresolvable
+                        + "); attempting the import anyway.");
                 {
                 // Find out whether there is anything to clear first: clearing a
                 // scene that has zero navmesh faces can crash the native
