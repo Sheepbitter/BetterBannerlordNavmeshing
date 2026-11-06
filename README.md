@@ -1,5 +1,7 @@
 # BetterBannerlordNavmeshing
 
+**Version 3.73**
+
 Generates a navmesh for Mount & Blade II: Bannerlord scenes.
 
 It reads the scene's live terrain and static collision geometry, builds a walkable navmesh, writes a

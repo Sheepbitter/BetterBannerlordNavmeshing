@@ -63,7 +63,7 @@ namespace BetterBannerlordNavmeshing
     // Also hosts the shared pipeline used by the in-game mission logic.
     public class NavMeshGenerator : ScriptComponentBehavior
     {
-        private const string BuildTag = "Build 3 (adaptive navmesh)";
+        private const string BuildTag = "V3.73";
 
         // Overlay tints, matching Debug.DebugColor's palette (which is what
         // MBDebug.RenderText's `color` argument is documented to take). Only the
