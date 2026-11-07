@@ -29,7 +29,7 @@ below for more detail.
 
 ## Limitations
 - Can do civil ladders, but not spawned ladders.
-- As mentioned above, does not have some engine functions, so one must make a small map, save and restart the editor 
+- As mentioned above, does not have some engine functions, so one must make a small navmesh, save and restart the editor 
   if it doesn't have one already or if the module doesn't have a NavMeshPrefabs folder.
 - Small doorways can screw it up. From testing, I've learned that this is actually a blessing in disguise.
   If a doorway is too small for the navmesher to handle, a tall agent will clip through it.
